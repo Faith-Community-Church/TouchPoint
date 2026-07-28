@@ -181,7 +181,7 @@ def _resolve_service_and_also(service_areas_raw, also_serves_raw):
                 also.append(a)
 
     # Never list primary again under Also serves
-    also = [a for a in also ifprimary]
+    also = [a for a in also if a != primary]
     return primary, also
 
 
@@ -247,7 +247,7 @@ def _print_doc_title(view):
         if who == 'volunteers':
             return 'VBS Volunteer T-Shirts'
         if who == 'participants':
-            return 'VBSpant T-Shirts'
+            return 'VBS Participant T-Shirts'
         return 'VBS T-Shirt Report'
     label = TITLE_MAP.get(view, '')
     if label:
@@ -258,14 +258,14 @@ def _print_doc_title(view):
 # Nav label + legend description for the cover page (Assign last; Settings added for Admin).
 TAB_ITEMS = [
     ('leaders', 'Volunteers', 'Everyone on the volunteer team — see their service area, role, group, and any Also Serves (Skits / Choreography).'),
-    ('participants', 'K-5', 'K–5 kids and which Group they are in. Prinfull roster or a “Find Your Group” sheet on 11×17.'),
+    ('participants', 'K-5', 'K–5 kids and which Group they are in. Print the full roster or a “Find Your Group” sheet on 11×17.'),
     ('prek', 'Pre-K', 'Kids in the Pre-K pool (students only).'),
     ('nursery', 'Nursery', 'Kids in the Nursery / zero-to-two pool (students only).'),
-    ('tshirts', 'T-Shirts', 'Shirt sizes for volunteers or K–5/Pre-K participants — summary tiles plus a printable n list.'),
+    ('tshirts', 'T-Shirts', 'Shirt sizes for volunteers or K–5/Pre-K participants — summary tiles plus a printable two-column list.'),
     ('allergies', 'All Allergies', 'Everyone with allergy notes on file across VBS — one combined list.'),
     ('blocks', 'By Group', 'One printable sheet per Group. Toggle T-Shirt and Allergies columns on/off for the student table.'),
     ('byleader', 'Group Leaders', 'Each Group with its Leader, Co-leader, and assistants — printable staffing list on 8.5×11.'),
-    ('counts', 'Counts', 'Quick headcounts with drill-down lists (and Add to Tag): Pr Nursery, volunteer areas, and each Group — printable on 8.5×11.'),
+    ('counts', 'Counts', 'Quick headcounts with drill-down lists (and Add to Tag): Pre-K & Nursery, volunteer areas, and each Group — printable on 8.5×11.'),
     ('assign', 'Assign', 'Create Groups and place leaders and K–5 kids. Requires Admin or VBSAdmin.'),
 ]
 
@@ -294,7 +294,7 @@ NAV_SEGMENTS = [
 
 def _is_null(val):
     if val is None:
-       rn True
+        return True
     try:
         from System import DBNull
         if val is DBNull.Value:
@@ -381,7 +381,7 @@ def _person_has_allergy(med, allergy_text):
 
 
 def _dd():
-    returnodel.DynamicData()
+    return model.DynamicData()
 
 
 def _warn(msg):
@@ -612,7 +612,7 @@ def _format_money(n):
 def _default_offerings(week_start=''):
     return {
         'week_start': _s(week_start),
-    'mon': 0.0,
+        'mon': 0.0,
         'tue': 0.0,
         'wed': 0.0,
         'thu': 0.0,
@@ -659,7 +659,7 @@ WHERE Section = @section AND Id1 = @id1 AND Id2 = '' AND Id3 = '' AND Id4 = ''
         return data
     day_aliases = {
         'mon': ('Mon', 'mon', 'Monday'),
-        'tu: ('Tue', 'tue', 'Tuesday'),
+        'tue': ('Tue', 'tue', 'Tuesday'),
         'wed': ('Wed', 'wed', 'Wednesday'),
         'thu': ('Thu', 'thu', 'Thursday'),
         'fri': ('Fri', 'fri', 'Friday'),
@@ -680,7 +680,7 @@ def _persist_offerings(data):
         dd.AddValue('WeekStart', _s(data.get('week_start')))
         # Store as decimal strings for stable JsonDocumentRecords serialization
         dd.AddValue('Mon', '%.2f' % _parse_money(data.get('mon')))
-        dd.AddValue('Tue', '%.2f' % _parse_money(data.get('tu)))
+        dd.AddValue('Tue', '%.2f' % _parse_money(data.get('tue')))
         dd.AddValue('Wed', '%.2f' % _parse_money(data.get('wed')))
         dd.AddValue('Thu', '%.2f' % _parse_money(data.get('thu')))
         dd.AddValue('Fri', '%.2f' % _parse_money(data.get('fri')))
@@ -1333,7 +1333,7 @@ def _assign_role(people_id, role_name, group_name, service_area='', also_serves=
     if not model.InOrg(people_id, ORG_LEADERS):
         return False, 'Person must be enrolled in the Leaders involvement.'
 
-    # Unassigned / blank service area clears everytng
+    # Unassigned / blank service area clears everything
     if not service_area or service_area == 'Unassigned':
         _clear_leader_tags(people_id)
         return True, 'Cleared leader assignment.'
@@ -1422,7 +1422,7 @@ def _count_area_involved(people, service_area):
 
 
 # Counts day toggles: enrolled headcounts vs Mon–Fri meeting attendance
-COUNTS_DAY_KS = (
+COUNTS_DAY_KEYS = (
     ('enrolled', 'Enrolled'),
     ('mon', 'Mon'),
     ('tue', 'Tue'),
@@ -1452,7 +1452,8 @@ def _monday_ymd_default():
         today = DateTime.Today
         dow = int(today.DayOfWeek)  # Sunday=0 … Saturday=6
         delta = 6 if dow == 0 else (dow - 1)
-        mon = today.AddDays(-delta      return '%04d-%02d-%02d' % (mon.Year, mon.Month, mon.Day)
+        mon = today.AddDays(-delta)
+        return '%04d-%02d-%02d' % (mon.Year, mon.Month, mon.Day)
     except:
         return ''
 
@@ -1525,7 +1526,7 @@ def _week_attendance_buckets():
     """Mon–Fri present counts: volunteers (1894), k5 (1893), prek_nur (1895+1896).
 
     Returns list of dicts: day_key, label, ymd, volunteers, k5, prek_nur, total.
-    Uses Meetings AttendanceFlag=1 on each pool inlvement for that calendar day.
+    Uses Meetings AttendanceFlag=1 on each pool involvement for that calendar day.
     """
     mon = _vbs_week_monday_ymd()
     days = []
@@ -1562,7 +1563,7 @@ def _nice_axis_max(n):
     if n > 40:
         step = 10
     if n > 100:
-      step = 25
+        step = 25
     if n > 250:
         step = 50
     if n > 500:
@@ -1674,7 +1675,7 @@ def _people_in_group_sgl(people, gname):
 
 def _counts_drill_resolve(pools, drill):
     """
-    Resolve Counts drill key → (people, tle, tag_suggest) or None.
+    Resolve Counts drill key → (people, title, tag_suggest) or None.
     Keys: prek | nursery | area:<ServiceArea> | group:<Group N> | ua:vol | ua:k5
     """
     drill = _s(drill)
@@ -1691,7 +1692,7 @@ def _counts_drill_resolve(pools, drill):
         return (
             _sort_people_name(people),
             'Pre-K — students + leaders',
-          'VBS ' + year + ' Pre-K',
+            'VBS ' + year + ' Pre-K',
         )
     if drill == 'nursery':
         people = _merge_people(
@@ -1701,7 +1702,7 @@ def _counts_drill_resolve(pools, drill):
         return (
             _sort_people_name(people),
             'Nursery — students + leaders',
-            'VBS + year + ' Nursery',
+            'VBS ' + year + ' Nursery',
         )
     if drill == 'ua:vol':
         people = [p for p in leaders if not _s(p.get('service_area'))]
@@ -1738,7 +1739,7 @@ def _counts_drill_resolve(pools, drill):
         if not gname:
             return None
         people = _merge_people(
-            _people_in_group_sgl(leaders, gme),
+            _people_in_group_sgl(leaders, gname),
             [p for p in pools['k5']['people'] if p.get('group_raw') == gname],
         )
         return (
@@ -1754,7 +1755,7 @@ def _counts_drill_href(drill_key, day_mode=''):
         enc = model.UrlEncode(_s(drill_key)).replace('+', '%20')
     except:
         enc = _s(drill_key).replace(' ', '%20')
-    href = _script_path() + '?view=counts&dll=' + enc
+    href = _script_path() + '?view=counts&drill=' + enc
     day_mode = _s(day_mode) or _counts_day_mode()
     if day_mode and day_mode != 'enrolled':
         href += '&day=' + day_mode
@@ -1774,7 +1775,7 @@ def _counts_drill_link(label, drill_key, active_drill, day_mode=''):
 
 def _counts_day_toggles(day_mode, meet_day_ymd=''):
     """Enrolled / Mon–Fri toggle strip for Counts Pre-K and Groups sections."""
-    html = '<div class="counts-d-toggles vbs-screen-only">'
+    html = '<div class="counts-day-toggles vbs-screen-only">'
     for key, lab in COUNTS_DAY_KEYS:
         cls = 'btn-col-toggle'
         if key == day_mode:
@@ -1791,7 +1792,7 @@ def _counts_day_toggles(day_mode, meet_day_ymd=''):
 
 
 def _counts_drill_panel(pools, drill):
-    """People list + Add to Tag r an active Counts drill."""
+    """People list + Add to Tag for an active Counts drill."""
     resolved = _counts_drill_resolve(pools, drill)
     if not resolved:
         return (
@@ -1808,7 +1809,7 @@ def _counts_drill_panel(pools, drill):
     html += _tag_add_button(people, tag_suggest)
     html += '</div></div>'
     html += '<p class="meta-line"><strong>' + str(len(people)) + '</strong> people · click a column header to sort</p>'
-    html += '<div class="table-scroll"><table class="pople-table vbs-sortable"><thead><tr>'
+    html += '<div class="table-scroll"><table class="people-table vbs-sortable"><thead><tr>'
     html += _sort_th('Name', 'text')
     html += _sort_th('Service area', 'text')
     html += _sort_th('Role', 'text')
@@ -2017,7 +2018,7 @@ def _grade_short(grade):
     low = s.lower()
     if 'kinder' in low or low in ('k', 'kg'):
         return 'K'
-    y:
+    try:
         import re
         m = re.search(r'(\d+)\s*(st|nd|rd|th)?', low, re.I)
         if m:
@@ -2071,7 +2072,8 @@ def _group_block_title(bundle):
     grades = _unique_grades_slash(bundle.get('kids') or [])
     if not grades:
         grades = '—'
-    mix = _gender_mix_label(bundle.get('boys', 0), bundle.get('girls', 0)    return gname + ' - ' + grades + ', ' + mix
+    mix = _gender_mix_label(bundle.get('boys', 0), bundle.get('girls', 0))
+    return gname + ' - ' + grades + ', ' + mix
 
 
 def _tshirt_people(pools, who='all'):
@@ -2249,7 +2251,7 @@ def _home_attendance_section():
     days, mon = _week_attendance_buckets()
     max_tot = 0
     for d in days:
-        if 'total'] > max_tot:
+        if d['total'] > max_tot:
             max_tot = d['total']
     ymax = _nice_axis_max(max_tot)
 
@@ -2271,7 +2273,7 @@ def _home_attendance_section():
         html += '<p class="meta-line cover-attendance-range">Set VBS week start (Monday) in Settings for dated Meetings.</p>'
     html += '</div>'
 
-    #y tiles
+    # Day tiles
     html += '<div class="att-day-grid">'
     for d in days:
         html += '<div class="att-day-tile">'
@@ -2300,7 +2302,7 @@ def _home_attendance_section():
     n_days = len(days) or 1
     slot = float(plot_w) / float(n_days)
     bar_w = slot * 0.55
-    if baw < 28:
+    if bar_w < 28:
         bar_w = 28.0
     if bar_w > 64:
         bar_w = 64.0
@@ -2365,7 +2367,7 @@ def _home_attendance_section():
 def _home_offerings_section(can_assign=False):
     """Home: Mon–Fri cash offering totals (manual — not Contributions)."""
     data = _load_offerings()
-    mon = _s(data.get('week_st)) or _vbs_week_monday_ymd()
+    mon = _s(data.get('week_start')) or _vbs_week_monday_ymd()
     fri = _ymd_add_days(mon, 4) if mon else ''
     days = (
         ('mon', 'Mon'),
@@ -2393,7 +2395,7 @@ def _home_offerings_section(can_assign=False):
     html += '<div class="offering-week-total">'
     html += '<div class="offering-week-total-label">Week total</div>'
     html += '<div class="offering-week-total-value">' + _html(_format_money(week_total)) + '</div>'
-    html += '</d'
+    html += '</div>'
 
     if can_assign:
         html += '<form method="post" action="' + _script_path() + '" class="offering-form">'
@@ -2446,7 +2448,7 @@ def _pool_people_index(pools):
 
 
 def _people_with_subgroup(pools, tag_name):
-"""People in any VBS pool involvement who have the given SubGroup (MemberTag)."""
+    """People in any VBS pool involvement who have the given SubGroup (MemberTag)."""
     tag_name = _s(tag_name)
     if not tag_name:
         return []
@@ -2462,7 +2464,7 @@ def _people_with_subgroup(pools, tag_name):
         in_list = ','.join([str(x) for x in org_ids])
         sql = """
 SELECT DISTINCT
-    omt.OrgId AS Organization,
+    omt.OrgId AS OrganizationId,
     omt.PeopleId,
     p.FirstName,
     p.LastName,
@@ -2536,7 +2538,7 @@ def _shepherding_insights_section(pools):
 
     # No Home Church — collapsible actionable list (SubGroup: nohomechurch on each pool)
     html += '<div class="shepherd-block is-collapsed" data-shepherd-key="nhc" id="vbs-shepherd-nhc">'
-    html += '<div ass="shepherd-block-header">'
+    html += '<div class="shepherd-block-header">'
     html += '<div class="shepherd-block-heading">'
     html += '<span class="shepherd-block-name">' + _html(nhc_label) + '</span>'
     html += '<span class="shepherd-count">' + str(n) + '</span>'
@@ -2577,7 +2579,7 @@ def _shepherding_insights_section(pools):
     html += '<div class="shepherd-block-heading">'
     html += '<span class="shepherd-block-name">Decisions</span>'
     html += '<span class="shepherd-badge">Coming soon</span>'
-  html += '</div>'
+    html += '</div>'
     html += '<button type="button" class="shepherd-block-caret" '
     html += 'aria-expanded="false" title="Show Decisions" aria-label="Show Decisions">'
     html += '<i class="fa fa-caret-down" aria-hidden="true"></i></button>'
@@ -2601,7 +2603,7 @@ def _header_hero_html():
     if not hero_url:
         return ''
     k5_name = _org_name(k5_oid) or 'K-5'
-    html = '<divlass="vbs-header-hero">'
+    html = '<div class="vbs-header-hero">'
     html += '<a href="/Org/' + str(k5_oid) + '" target="_blank" rel="noopener" title="Open ' + _html(k5_name) + '">'
     html += '<img src="' + _html(hero_url) + '" alt="' + _html(k5_name) + '" />'
     html += '</a></div>'
@@ -2653,7 +2655,7 @@ def _cover_page(can_assign, pools, group_names, can_admin=False):
         _warn('Home attendance chart failed: ' + _ex_msg(ex))
 
     # Cash offerings (manual Mon–Fri totals)
- ry:
+    try:
         html += _home_offerings_section(can_assign=can_assign)
     except Exception, ex:
         _warn('Cash offerings section failed: ' + _ex_msg(ex))
@@ -2668,7 +2670,7 @@ def _cover_page(can_assign, pools, group_names, can_admin=False):
     html += '<h2 class="vbs-card-title" style="margin-bottom:8px">Welcome to ' + _html(APP_TITLE) + '</h2>'
     html += '<p class="cover-lead">Plan VBS classrooms and volunteer teams in one place. '
     html += 'Assign Small Group Leaders and K–5 kids to shared Groups, track other volunteer areas, '
-    html += 'and print rosters, Group sheets, and allergy lists. Changes sync to involvement SubGroups for che-in.</p>'
+    html += 'and print rosters, Group sheets, and allergy lists. Changes sync to involvement SubGroups for check-in.</p>'
     html += '</div>'
 
     html += '<div class="cover-legend-wrap is-collapsed" id="vbs-cover-legend">'
@@ -2701,7 +2703,7 @@ def _cover_page(can_assign, pools, group_names, can_admin=False):
 
     if can_assign:
         html += '<div class="cover-cta">'
-        html += '<a class="btn-primary" href="' + _script_path() + '?view=assign" style="display:inline-block;text-decoration:no">Go to Assign</a>'
+        html += '<a class="btn-primary" href="' + _script_path() + '?view=assign" style="display:inline-block;text-decoration:none">Go to Assign</a>'
         html += '<a class="btn-secondary" href="' + _script_path() + '?view=leaders" style="display:inline-block;text-decoration:none;margin-left:10px">View Volunteers</a>'
         if can_admin:
             html += '<a class="btn-secondary" href="' + _script_path() + '?view=settings" style="display:inline-block;text-decoration:none;margin-left:10px">Settings</a>'
@@ -2805,7 +2807,7 @@ def _roster_table(people, include_role=False, include_pool=False, include_group=
         n = 0
     html = _list_toolbar(
         people,
-        '<strong>' + str(n) + '</strong> people · clik a column header to sort',
+        '<strong>' + str(n) + '</strong> people · click a column header to sort',
         tag_suggest or ('VBS ' + VBS_YEAR),
     )
     html += '<div class="table-scroll"><table class="people-table vbs-sortable"><thead><tr>'
@@ -2859,7 +2861,7 @@ def _roster_table(people, include_role=False, include_pool=False, include_group=
                         gdisp = ''
                 html += '<td>' + _html(gdisp) + '</td>'
             html += '<td>' + _html(p.get('gender', '')) + '</td>'
-            html += '<td>' + tml(p.get('age', '')) + '</td>'
+            html += '<td>' + _html(p.get('age', '')) + '</td>'
             if include_age_band:
                 html += '<td>' + _html(p.get('age_band', 'Unknown')) + '</td>'
             if include_grade:
@@ -2897,7 +2899,7 @@ def _find_group_sorted(people):
 
 def _find_group_table(people):
     """Name + Group only — wall/posted 11x17 "Find Your Group" sheet."""
-    people = _find_grouported(people)
+    people = _find_group_sorted(people)
     n = len(people)
     html = _list_toolbar(
         people,
@@ -2920,7 +2922,7 @@ def _find_group_table(people):
 
 
 def _table_sort_script():
-    # ES5-friendly; assigned model.Script (PyScriptForm wraps in <script>).
+    # ES5-friendly; assigned to model.Script (PyScriptForm wraps in <script>).
     # Includes sortable headers + Add to Tag modal (InvolvementDashboard pattern).
     script_url = _script_path()
     return r"""
@@ -3407,12 +3409,12 @@ def _settings_panel():
     html += '</form></div>'
     html += '<div class="vbs-card">'
     html += '<div class="vbs-card-title">VBS week (Counts attendance)</div>'
-    html += '<p class="ta-line">Monday date for Mon–Fri attendance toggles on Counts. Leave blank to use the current week’s Monday. Meetings must exist on each pool involvement for those calendar days.</p>'
-    html += '<form method="post" an="' + _script_path() + '">'
+    html += '<p class="meta-line">Monday date for Mon–Fri attendance toggles on Counts. Leave blank to use the current week’s Monday. Meetings must exist on each pool involvement for those calendar days.</p>'
+    html += '<form method="post" action="' + _script_path() + '">'
     html += '<input type="hidden" name="action" value="save_settings" />'
     html += '<input type="hidden" name="view" value="settings" />'
     # Preserve org ids when saving week only — include hidden/current org fields
-    html += '<input type="hidden" name="org_leaders" value= + str(ORG_LEADERS) + '" />'
+    html += '<input type="hidden" name="org_leaders" value="' + str(ORG_LEADERS) + '" />'
     html += '<input type="hidden" name="org_k5" value="' + str(ORG_K5) + '" />'
     html += '<input type="hidden" name="org_prek" value="' + str(ORG_PREK) + '" />'
     html += '<input type="hidden" name="org_nursery" value="' + str(ORG_NURSERY) + '" />'
@@ -3661,7 +3663,7 @@ def _assign_panel(pools, group_names):
     html += '<div class="field"><label>Participant</label>'
     html += '<select name="org_pid" required>' + kid_opts + '</select></div>'
     html += '<div class="field"><label>Group</label>'
-    html += '<select name="group" required>' + opts + 'select></div>'
+    html += '<select name="group" required>' + opts + '</select></div>'
     html += '<button type="submit" class="btn-primary">Assign group</button></form>'
     html += '</div></div>'
     return html
@@ -5280,7 +5282,7 @@ hr.soft {
     }
     /* One-time in-body titles are redundant — running header repeats on every page */
     .vbs-print-sheet-title {
-      display: none !important;
+        display: none !important;
     }
     .vbs-print-header {
         display: block !important;
@@ -5294,10 +5296,12 @@ hr.soft {
         line-height: 1.25;
         color: #000 !important;
         border-bottom: 1px solid #999;
-        padding: 0 0 6px 0;
+        padding: 0 0 8px 0;
         margin: 0;
         background: #fff !important;
         text-align: left;
+        height: 22pt;
+        box-sizing: border-box;
     }
     .vbs-print-footer {
         display: block !important;
@@ -5314,10 +5318,12 @@ hr.soft {
         margin: 0;
         background: #fff !important;
         text-align: left;
+        height: 18pt;
+        box-sizing: border-box;
     }
     .vbs-root {
-        padding-top: 32px !important;
-        padding-bottom: 28px !important;
+        padding-top: 36pt !important;
+        padding-bottom: 28pt !important;
         background: #fff !important;
     }
     .vbs-find-sheet {
@@ -5340,11 +5346,17 @@ hr.soft {
         page-break-after: always;
         page-break-inside: avoid;
         box-shadow: none !important;
+        /* Clear running print header on every page (page 2+ ignores .vbs-root padding) */
+        padding-top: 36pt !important;
+        padding-bottom: 12pt !important;
+        margin-top: 0 !important;
+        box-sizing: border-box !important;
     }
     .vbs-group-heading {
         font-size: 22pt !important;
         color: #000 !important;
-        margin-bottom: 10px !important;
+        margin: 0 0 10px 0 !important;
+        padding-top: 0 !important;
     }
     .vbs-tshirt-table th, .vbs-tshirt-table td {
         font-size: 12pt !important;
@@ -5369,7 +5381,7 @@ hr.soft {
         break-inside: auto !important;
         border: none !important;
         padding: 0 !important;
-        margin: 0important;
+        margin: 0 !important;
     }
     .vbs-allergy-sheet .vbs-print-sheet-title {
         page-break-after: avoid !important;
@@ -5567,7 +5579,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '<button type="button" class="btn-print" onclick="window.print()">Print &quot;Find Your Group&quot; 11x17</button>'
         html += '</div></div>'
         html += '<h2 class="vbs-find-title">Find Your Group — K-5</h2>'
-      html += _find_group_table(pools['k5']['people'])
+        html += _find_group_table(pools['k5']['people'])
         html += '</div>'
         return html
 
@@ -5619,7 +5631,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '<div class="vbs-screen-only toolbar" style="margin-bottom:12px">'
         html += '<p class="meta-line" style="margin:0">Use portrait <strong>8.5×11</strong> (Letter). Click an Area or Group name to drill down. '
         html += 'Pre-K/Nursery and Groups use <strong>Enrolled</strong> or a weekday for Meeting attendance.</p>'
-        tml += '<div><button type="button" class="btn-print" onclick="window.print()">Print 8.5x11</button></div>'
+        html += '<div><button type="button" class="btn-print" onclick="window.print()">Print 8.5x11</button></div>'
         html += '</div>'
         html += '<h2 class="vbs-print-sheet-title">' + _html(APP_TITLE) + ' — Counts</h2>'
         if drill:
@@ -5628,7 +5640,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '<div class="stat-card"><div class="stat-value">' + str(total_groups) + '</div><div class="stat-label">Groups</div></div>'
         html += '<div class="stat-card"><div class="stat-value">' + str(total_students) + '</div><div class="stat-label">K-5 placed</div></div>'
         html += '<div class="stat-card"><div class="stat-value">' + str(total_people) + '</div><div class="stat-label">Leaders + K-5</div></div>'
-        html += '<div class="stat-card"><diclass="stat-value">' + str(prek_nur_kids) + '</div><div class="stat-label">Pre-K + Nursery kids</div></div>'
+        html += '<div class="stat-card"><div class="stat-value">' + str(prek_nur_kids) + '</div><div class="stat-label">Pre-K + Nursery kids</div></div>'
         html += '<div class="stat-card"><div class="stat-value">' + str(prek_nur_total) + '</div><div class="stat-label">Leaders + Pre-K/Nursery</div></div>'
         html += '<div class="stat-card stat-card-total"><div class="stat-value">' + str(total_enrolled) + '</div><div class="stat-label">Total Enrolled</div></div>'
         html += '</div>'
@@ -5687,7 +5699,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
             nur_lead_p = _count_people_present(
                 _people_with_service(pools['leaders']['people'], SERVICE_NURSERY), lead_ids)
             html += '<p class="meta-line vbs-screen-only">Present = marked attending on that involvement’s Meeting for <strong>' + _html(meet_day or '—') + '</strong>. '
-            html += 'Leaders = Volunteers involvement attendance that day with thatvice area.</p>'
+            html += 'Leaders = Volunteers involvement attendance that day with that service area.</p>'
             html += '<div class="table-scroll"><table class="people-table"><thead><tr>'
             html += '<th>Area</th><th>Students present</th><th>Leaders present</th><th>Total</th>'
             html += '</tr></thead><tbody>'
@@ -5774,11 +5786,11 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '</select></form>'
         html += '<p class="meta-line" style="margin:8px 0 0 0">Use portrait <strong>8.5×11</strong> (Letter). Print layout is 3 columns to fit one page'
         if selected != 'all':
-            html +=' · showing <strong>' + _html(selected) + '</strong>'
+            html += ' · showing <strong>' + _html(selected) + '</strong>'
         html += '.</p>'
         html += '<div><button type="button" class="btn-print" onclick="window.print()">Print 8.5x11</button></div>'
         html += '</div>'
-        html += '<h2 clas="vbs-print-sheet-title">' + _html(APP_TITLE) + ' — Group Leaders</h2>'
+        html += '<h2 class="vbs-print-sheet-title">' + _html(APP_TITLE) + ' — Group Leaders</h2>'
         html += '<div class="vbs-leader-grid">'
         for b in bundles:
             team = []
@@ -5791,7 +5803,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
             html += _tag_add_button(team, 'VBS ' + VBS_YEAR + ' ' + _s(b['group']) + ' Leaders')
             html += '</div>'
             html += '<div class="vbs-card-title vbs-print-only">' + _html(b['group']) + '</div>'
-            html += '<ul cls="subgroup-list">'
+            html += '<ul class="subgroup-list">'
             html += '<li class="subgroup-item"><span class="subgroup-name">Leader</span><span>' + (', '.join([_person_link_with_age_band(x) for x in b['leaders']]) or '<em>Unassigned</em>') + '</span></li>'
             if b.get('coleaders'):
                 html += '<li class="subgroup-item"><span class="subgroup-name">Co-leader</span><span>' + ', '.join([_person_link_with_age_band(x) for x in b['coleaders']]) + '</span></li>'
@@ -5822,7 +5834,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '</select></form>'
         html += '<p class="meta-line" style="margin:8px 0 0 0">Toggle extra columns, then print. Print uses one group per page'
         if selected != 'all':
-            html += ' · showing <strong>' + _html(selecte) + '</strong>'
+            html += ' · showing <strong>' + _html(selected) + '</strong>'
         html += '.</p>'
         html += '<div class="blocks-col-actions">'
         html += '<button type="button" class="btn-print" onclick="window.print()">Print 8.5x11 (one group / page)</button>'
@@ -5839,7 +5851,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html = '<div class="vbs-print-letter vbs-allergy-sheet">'
         html += '<div class="vbs-screen-only toolbar" style="margin-bottom:12px">'
         html += '<p class="meta-line" style="margin:0">Use portrait <strong>8.5×11</strong> (Letter). '
-        html += 'Unassigned group shows blank so the list stays clen.</p>'
+        html += 'Unassigned group shows blank so the list stays clean.</p>'
         html += '<div><button type="button" class="btn-print" onclick="window.print()">Print 8.5x11</button></div>'
         html += '</div>'
         html += '<h2 class="vbs-print-sheet-title">VBS All Allergies Master</h2>'
@@ -5862,7 +5874,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
                 g = ''
             html += '<tr>'
             html += '<td>' + _person_link(p) + '</td>'
-           html += '<td>' + _html(p.get('pool', '')) + '</td>'
+            html += '<td>' + _html(p.get('pool', '')) + '</td>'
             html += '<td>' + _html(g) + '</td>'
             html += '<td>' + _html(p['allergy']) + '</td>'
             html += '<td>' + _html(p['emergency']) + '</td>'
@@ -5914,7 +5926,7 @@ def _view_body(view, pools, group_names, can_assign, can_admin=False):
         html += '</tr></thead><tbody>'
         for p in people:
             size = _s(p.get('shirt_size')) or 'Unknown'
-            htm+= '<tr>'
+            html += '<tr>'
             html += '<td>' + _person_link(p) + '</td>'
             html += '<td>' + _html(size) + '</td>'
             html += '</tr>'
@@ -5969,9 +5981,9 @@ def _page(view, pools, group_names, msg, can_assign, can_admin=False):
     html += '<div class="tag-modal-options">'
     html += '<label class="option-row"><input type="radio" name="tag-mode" value="append" checked />'
     html += '<span>Append — add these people; keep anyone already on the tag</span></label>'
-    html += '<label class="option-row"><input type="dio" name="tag-mode" value="clear" />'
+    html += '<label class="option-row"><input type="radio" name="tag-mode" value="clear" />'
     html += '<span>Clear first — empty the tag, then add only this list</span></label>'
-    html += '<labellass="option-row"><input type="checkbox" id="tag-open-when-done" checked />'
+    html += '<label class="option-row"><input type="checkbox" id="tag-open-when-done" checked />'
     html += '<span>Open the tag in a new tab when done</span></label>'
     html += '</div></div>'
     html += '<div class="tag-modal-footer">'
@@ -5987,7 +5999,7 @@ def _page(view, pools, group_names, msg, can_assign, can_admin=False):
     html += alert
     html += '<div class="vbs-main">' + body + '</div>'
     # Print-only running header/footer (position:fixed → repeats on every printed page).
-    print_title = _print_doc_title(ew)
+    print_title = _print_doc_title(view)
     html += '<div class="vbs-print-header" id="vbs-print-header">' + _html(print_title) + '</div>'
     html += '<div class="vbs-print-footer" id="vbs-print-footer" '
     html += 'data-app="" data-view="" '
