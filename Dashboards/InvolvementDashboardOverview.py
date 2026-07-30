@@ -51,6 +51,13 @@ PERSON_EXTRA_TYPES = (QTYPE_EMERGENCY, QTYPE_PARENTS)
 
 SUBTYPE_MENU = 1
 
+
+def _is_hear_about_question(label):
+    """True when free-text Other answers should collapse into one Other group."""
+    lab = _s(label).lower()
+    return 'how did you hear' in lab
+
+
 # Age brackets for Overview demographics (label -> inclusive min/max; None max = no upper bound)
 AGE_BRACKETS = [
     ('0-5', 0, 5),
@@ -819,13 +826,15 @@ def _build_registration_summary(org_id):
                     else:
                         other_counts[sel] = other_counts.get(sel, 0) + 1
             opt_out = []
+            # Only "How did you hear..." collapses free-text / Other into one group.
+            # Grade and similar dropdowns list each answer as its own bar.
+            collapse_other = _is_hear_about_question(label)
             other_variants = []
             other_total = 0
             for o in options:
                 c = counts.get(o['value'], 0)
                 pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
-                # Configured "Other" option folds into the collapsed Other group
-                if o.get('other'):
+                if collapse_other and o.get('other'):
                     if c > 0:
                         other_variants.append({
                             'value': o['value'],
@@ -843,14 +852,22 @@ def _build_registration_summary(org_id):
                 })
             for ov, c in sorted(other_counts.items(), key=lambda x: (-x[1], x[0])):
                 pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
-                other_variants.append({
-                    'value': ov,
-                    'text': ov + ' (other)',
-                    'count': c,
-                    'pct': pct,
-                })
-                other_total += c
-            if other_variants:
+                if collapse_other:
+                    other_variants.append({
+                        'value': ov,
+                        'text': ov + ' (other)',
+                        'count': c,
+                        'pct': pct,
+                    })
+                    other_total += c
+                else:
+                    opt_out.append({
+                        'value': ov,
+                        'text': ov,
+                        'count': c,
+                        'pct': pct,
+                    })
+            if collapse_other and other_variants:
                 other_pct = int(round((100.0 * other_total / answered_count), 0)) if answered_count else 0
                 opt_out.append({
                     'value': '__other__',
@@ -1979,7 +1996,7 @@ else:
     }
     .btn-search {
         flex-shrink: 0;
-        background: linear-gradient(135deg, #012b58 0%, #019cff 100%);
+        background: #012b58;
         color: #fff;
         border: none;
         border-radius: 8px;
@@ -2042,7 +2059,7 @@ else:
         font-size: 14px;
     }
     .dashboard-header {
-        background: linear-gradient(135deg, #012b58 0%, #019cff 100%);
+        background: linear-gradient(135deg, #012b58 0%, #012b58 25%, #019cff 100%);
         color: white;
         padding: 0;
         border-radius: 12px;
@@ -2189,7 +2206,7 @@ else:
     }
     .chart-bar-fill {
         height: 100%;
-        background: linear-gradient(90deg, #012b58 0%, #019cff 100%);
+        background: #012b58;
         display: flex;
         align-items: center;
         justify-content: flex-end;
@@ -2243,68 +2260,81 @@ else:
     }
     .dash-tab[data-tab="overview"].active {
         border-color: #012b58;
-        background: linear-gradient(135deg, #012b58 0%, #019cff 100%);
-        color: white;
+        background: #012b58;
+        color: #f5f4e8;
     }
     .dash-tab[data-tab="registration"].active {
-        border-color: #005c3b;
-        background: #005c3b;
+        border-color: #012b58;
+        background: #012b58;
         color: #f5f4e8;
+    }
+    .dash-tab-refresh {
+        border: 2px solid #e2e8f0;
+        background: white;
+        color: #475569;
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-left: auto;
+    }
+    .dash-tab-refresh:hover {
+        border-color: #019cff;
+        color: #012b58;
+    }
+    .dash-tab-refresh:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
     }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
 
-    /* Registration tab color set: #005c3b / #f5f4e8 (accent #ff7941 on Export only) */
+    /* Registration tab: #ccebff bg, all text #012b58, Export #ff7941 */
+    #tab-registration,
+    #tab-registration .section-title,
+    #tab-registration .reg-breadcrumb,
+    #tab-registration .reg-breadcrumb a,
+    #tab-registration .reg-question-title,
+    #tab-registration .reg-meta,
+    #tab-registration .reg-preview,
+    #tab-registration .chart-label,
+    #tab-registration .chart-count,
+    #tab-registration .clickable-option:hover .chart-label,
+    #tab-registration .people-table th,
+    #tab-registration .people-table td,
+    #tab-registration .people-table a,
+    #tab-registration .btn-back,
+    #tab-registration .empty-state,
+    #tab-registration .info-banner {
+        color: #012b58;
+    }
     #tab-registration .section {
-        background: #f5f4e8;
-        border: 1px solid #d9d6c4;
-    }
-    #tab-registration .section-title {
-        color: #005c3b;
-    }
-    #tab-registration .reg-breadcrumb {
-        color: #5a6b5e;
-    }
-    #tab-registration .reg-breadcrumb a {
-        color: #005c3b;
+        background: #ccebff;
+        border: 1px solid #b3d9f5;
     }
     #tab-registration .reg-question-card {
         background: #fffef8;
-        border-color: #cfd9c8;
+        border-color: #b3d9f5;
     }
     #tab-registration .reg-question-card:hover {
-        border-color: #005c3b;
-        box-shadow: 0 2px 10px rgba(0, 92, 59, 0.15);
-    }
-    #tab-registration .reg-question-title {
-        color: #005c3b;
+        border-color: #019cff;
+        box-shadow: 0 2px 10px rgba(1, 156, 255, 0.18);
     }
     #tab-registration .chart-bar-fill {
-        background: linear-gradient(90deg, #005c3b 0%, #1a8f5c 100%);
-    }
-    #tab-registration .chart-count {
-        color: #005c3b;
-    }
-    #tab-registration .clickable-option:hover .chart-label {
-        color: #005c3b;
-    }
-    #tab-registration .people-table a {
-        color: #005c3b;
+        background: #019cff;
+        color: #fff;
     }
     #tab-registration .btn-back {
         background: #fffef8;
-        color: #005c3b;
-        border-color: #cfd9c8;
+        border-color: #b3d9f5;
     }
     #tab-registration .empty-state {
         background: #fffef8;
-        border-color: #cfd9c8;
-        color: #5a6b5e;
+        border-color: #b3d9f5;
     }
     #tab-registration .info-banner {
-        background: #e8f5ef;
-        border-left-color: #005c3b;
-        color: #005c3b;
+        background: #e8f6ff;
+        border-left-color: #012b58;
     }
     .reg-toolbar {
         display: flex;
@@ -2373,7 +2403,7 @@ else:
         margin-bottom: 16px;
     }
     .reg-breadcrumb a {
-        color: #005c3b;
+        color: #019cff;
         cursor: pointer;
         text-decoration: none;
         font-weight: 600;
@@ -2388,8 +2418,8 @@ else:
         background: #fff;
     }
     .reg-question-card:hover {
-        border-color: #005c3b;
-        box-shadow: 0 2px 10px rgba(0, 92, 59, 0.15);
+        border-color: #019cff;
+        box-shadow: 0 2px 10px rgba(1, 156, 255, 0.18);
     }
     .reg-question-title {
         font-weight: 600;
@@ -2412,7 +2442,7 @@ else:
         cursor: pointer;
     }
     .clickable-option:hover .chart-label {
-        color: #005c3b;
+        color: #019cff;
         text-decoration: underline;
     }
     .age-bar-clickable {
@@ -2519,7 +2549,7 @@ else:
         letter-spacing: 0.4px;
     }
     .people-table a {
-        color: #005c3b;
+        color: #019cff;
         font-weight: 600;
         text-decoration: none;
     }
@@ -2712,7 +2742,7 @@ else:
         animation: dash-spin 0.8s linear infinite;
     }
     .loading-overlay.reg-loading .loading-spinner {
-        border-top-color: #005c3b;
+        border-top-color: #019cff;
     }
     .loading-text {
         color: #1e293b;
@@ -2817,6 +2847,9 @@ else:
         <div class="dash-tabs" id="dash-tabs">
             <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
             <button type="button" class="dash-tab" data-tab="registration">Registration</button>
+            <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh this involvement" aria-label="Refresh">
+                <i class="fa fa-refresh"></i>
+            </button>
         </div>
 
         <div class="tab-panel active" id="tab-overview">
@@ -3095,6 +3128,11 @@ else:
             if (tab === 'registration' && currentOrgId) {
                 loadRegistrationSummary();
             }
+        });
+
+        $(document).on('click', '#btn-refresh-dashboard', function() {
+            if (!currentOrgId) return;
+            refreshCurrentInvolvement();
         });
 
         var searchTimer = null;
@@ -3534,8 +3572,16 @@ else:
             $('.finance-stat-clickable').removeClass('active');
         });
 
-        function loadOverviewDashboard(orgId) {
-            showLoading('Loading involvement dashboard...', false);
+        function refreshCurrentInvolvement() {
+            if (!currentOrgId) return;
+            var activeTab = $('.dash-tab.active').data('tab') || 'overview';
+            loadOverviewDashboard(currentOrgId, { preserveTab: activeTab });
+        }
+
+        function loadOverviewDashboard(orgId, options) {
+            options = options || {};
+            var preserveTab = options.preserveTab || null;
+            showLoading(preserveTab ? 'Refreshing involvement...' : 'Loading involvement dashboard...', false);
             ajaxPost({ action: 'get_dashboard', org_id: orgId }, function(data) {
                 if (data.error) {
                     alert('Error: ' + data.error + (data.traceback ? '\n\n' + data.traceback : ''));
@@ -3583,11 +3629,15 @@ else:
                     .addClass('selector-toggleable')
                     .html('<i class="fa fa-search"></i> Find Involvement <span id="toggle-selector" style="float:right;"><i class="fa fa-chevron-down"></i></span>');
 
-                // Reset to Overview tab
+                // Restore tab on refresh; otherwise open Overview
+                var tabToShow = preserveTab || 'overview';
+                if (tabToShow !== 'overview' && tabToShow !== 'registration') {
+                    tabToShow = 'overview';
+                }
                 $('.dash-tab').removeClass('active');
-                $('.dash-tab[data-tab="overview"]').addClass('active');
+                $('.dash-tab[data-tab="' + tabToShow + '"]').addClass('active');
                 $('.tab-panel').removeClass('active');
-                $('#tab-overview').addClass('active');
+                $('#tab-' + tabToShow).addClass('active');
 
                 var statsHtml = '';
                 statsHtml += '<div class="stat-card"><div class="stat-label">Total Members</div><div class="stat-value">' + data.total_members + '</div></div>';
@@ -3740,6 +3790,10 @@ else:
                 $('#btn-reg-excel').hide();
 
                 $('#dashboard-content').fadeIn();
+
+                if (tabToShow === 'registration') {
+                    loadRegistrationSummary();
+                }
             }, { showLoading: true });
         }
 
