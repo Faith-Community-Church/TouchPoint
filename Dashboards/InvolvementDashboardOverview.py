@@ -819,9 +819,22 @@ def _build_registration_summary(org_id):
                     else:
                         other_counts[sel] = other_counts.get(sel, 0) + 1
             opt_out = []
+            other_variants = []
+            other_total = 0
             for o in options:
                 c = counts.get(o['value'], 0)
                 pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
+                # Configured "Other" option folds into the collapsed Other group
+                if o.get('other'):
+                    if c > 0:
+                        other_variants.append({
+                            'value': o['value'],
+                            'text': o['text'],
+                            'count': c,
+                            'pct': pct,
+                        })
+                        other_total += c
+                    continue
                 opt_out.append({
                     'value': o['value'],
                     'text': o['text'],
@@ -830,11 +843,23 @@ def _build_registration_summary(org_id):
                 })
             for ov, c in sorted(other_counts.items(), key=lambda x: (-x[1], x[0])):
                 pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
-                opt_out.append({
+                other_variants.append({
                     'value': ov,
                     'text': ov + ' (other)',
                     'count': c,
                     'pct': pct,
+                })
+                other_total += c
+            if other_variants:
+                other_pct = int(round((100.0 * other_total / answered_count), 0)) if answered_count else 0
+                opt_out.append({
+                    'value': '__other__',
+                    'text': 'Other',
+                    'count': other_total,
+                    'pct': other_pct,
+                    'is_other_group': True,
+                    'variant_count': len(other_variants),
+                    'variants': other_variants,
                 })
             item['options'] = opt_out
         else:
@@ -889,6 +914,14 @@ def _get_option_people(org_id, question_id, option_value):
         ans_by_rp[_s(a.RegPeopleId)] = a
 
     target = _s(option_value)
+    configured_other = {}
+    for o in options:
+        if o.get('other'):
+            configured_other[o['value']] = True
+    known_values = {}
+    for o in options:
+        known_values[o['value']] = True
+
     people = []
     for reg in registrants:
         a = ans_by_rp.get(_s(reg.RegPeopleId))
@@ -896,7 +929,15 @@ def _get_option_people(org_id, question_id, option_value):
         if _is_blank_answer(parsed):
             continue
         selected = _choice_selected_values(parsed, options, st)
-        if target in selected:
+        match = False
+        if target == '__other__':
+            for sel in selected:
+                if sel in configured_other or sel not in known_values:
+                    match = True
+                    break
+        elif target in selected:
+            match = True
+        if match:
             people.append({
                 'people_id': _i(reg.PeopleId),
                 'name': _s(reg.PersonName),
@@ -907,6 +948,58 @@ def _get_option_people(org_id, question_id, option_value):
         'question_label': _s(qrow.Label),
         'option_value': target,
         'people': people,
+    }
+
+
+def _get_registration_excel_url(org_id):
+    """
+    Build the standard Involvement Registration Report (Excel) URL.
+    Uses OrgMembersQuery (same people set as the org toolbar export).
+    """
+    org = _org_meta(org_id)
+    if not org:
+        return {'error': 'Organization not found'}
+    if _i(org.RegistrationTypeId, 0) != REGISTRATION_FORM_TYPE:
+        return {'error': 'Registration Excel export is only for Registration Form involvements.'}
+
+    # Prog/Div for MemberTypeCodes clause
+    meta_sql = """
+SELECT o.OrganizationId, ISNULL(o.DivisionId, 0) AS DivisionId, ISNULL(d.ProgId, 0) AS ProgId
+FROM Organizations o
+LEFT JOIN Division d ON d.Id = o.DivisionId
+WHERE o.OrganizationId = @orgId
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    meta_rows = list(q.QuerySql(meta_sql, p))
+    if not meta_rows:
+        return {'error': 'Organization not found'}
+    prog_id = _i(meta_rows[0].ProgId, 0)
+    div_id = _i(meta_rows[0].DivisionId, 0)
+
+    mt_rows = list(q.QuerySql("SELECT Description FROM lookup.MemberType WHERE Description IS NOT NULL AND LTRIM(RTRIM(Description)) <> ''"))
+    mt_names = []
+    for r in mt_rows:
+        name = _s(r.Description)
+        if name:
+            mt_names.append(name)
+    if not mt_names:
+        return {'error': 'No member types found to build the registration export.'}
+    member_types = ','.join(mt_names)
+
+    try:
+        qid = model.OrgMembersQuery(prog_id, div_id, org_id, member_types)
+    except Exception, e:
+        return {'error': 'Could not build registration export query: ' + _s(e)}
+
+    qid_s = _s(qid)
+    if not qid_s:
+        return {'error': 'Could not build registration export query.'}
+
+    return {
+        'ok': True,
+        'url': '/Reports/RegistrationExcel/' + qid_s + '?oid=' + str(org_id),
+        'filename': 'Registrations.xlsx',
     }
 
 
@@ -1799,6 +1892,17 @@ ORDER BY
         except Exception, e:
             _err_out(e)
 
+    elif action == 'get_registration_excel_url':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_registration_excel_url(org_id))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'add_to_tag':
         try:
             people_ids = _s(_data('people_ids'))
@@ -2209,6 +2313,59 @@ else:
         gap: 12px;
         margin-bottom: 16px;
         flex-wrap: wrap;
+    }
+    .btn-reg-excel {
+        background: #ff7941;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 16px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-reg-excel:hover { background: #e56a35; color: #fff; }
+    .btn-reg-excel:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+    .other-group-bar {
+        border-radius: 6px;
+        padding: 4px 0;
+        margin-bottom: 4px;
+    }
+    .other-group-toggle {
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        border: none;
+        background: #f8fafc;
+        border-radius: 6px;
+        padding: 6px 8px;
+        text-align: left;
+    }
+    .other-group-toggle:hover {
+        background: #eef6ff;
+    }
+    .other-group-toggle .chart-label {
+        flex: 0 0 140px;
+        color: #012b58;
+        font-weight: 600;
+    }
+    .other-variants {
+        display: none;
+        margin: 4px 0 12px 12px;
+        padding-left: 8px;
+        border-left: 3px solid #cbd5e1;
+    }
+    .other-variants.expanded {
+        display: block;
+    }
+    .other-variant-meta {
+        font-size: 12px;
+        color: #64748b;
+        margin: 0 0 8px 0;
     }
     .reg-breadcrumb {
         font-size: 14px;
@@ -2704,6 +2861,11 @@ else:
             <div class="section">
                 <div class="reg-toolbar">
                     <h2 class="section-title" style="margin:0;"><i class="fa fa-clipboard-list"></i> Registration Questions</h2>
+                    <div>
+                        <button type="button" class="btn-reg-excel" id="btn-reg-excel" style="display:none;">
+                            <i class="fa fa-download"></i> Registration Report (Excel)
+                        </button>
+                    </div>
                 </div>
                 <div class="reg-breadcrumb" id="reg-breadcrumb"></div>
                 <div id="reg-view"></div>
@@ -3575,6 +3737,7 @@ else:
 
                 regState = { view: 'summary', question: null, option: null, person: null, summary: null };
                 $('#reg-view').html('<div class="empty-state">Open the Registration tab to load question summaries.</div>');
+                $('#btn-reg-excel').hide();
 
                 $('#dashboard-content').fadeIn();
             }, { showLoading: true });
@@ -3600,6 +3763,7 @@ else:
             $('#reg-view').html('<div class="empty-state">Loading registration questions...</div>');
             ajaxPost({ action: 'get_registration_summary', org_id: currentOrgId }, function(data) {
                 if (data.error) {
+                    $('#btn-reg-excel').hide();
                     $('#reg-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
@@ -3612,18 +3776,77 @@ else:
             }, { showLoading: true });
         }
 
+        function renderChoiceOptions(options, clickable) {
+            var html = '';
+            var maxC = 0;
+            (options || []).forEach(function(o) { if (o.count > maxC) maxC = o.count; });
+            (options || []).forEach(function(o) {
+                if (!o.count) return;
+                var barPct = maxC > 0 ? Math.round((o.count / maxC) * 100) : 0;
+                if (o.is_other_group && o.variants && o.variants.length) {
+                    html += '<div class="other-group-bar">';
+                    html += '<button type="button" class="other-group-toggle" data-expanded="0">';
+                    html += '<i class="fa fa-chevron-right other-chevron"></i>';
+                    html += '<div class="chart-label">Other</div>';
+                    html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                    html += '<div class="chart-count">' + o.count + '</div>';
+                    html += '</button>';
+                    html += '<div class="other-variants">';
+                    html += '<p class="other-variant-meta">' + (o.variant_count || o.variants.length) +
+                        ' free-text answers collapsed — expand to view, or click Other to see everyone</p>';
+                    if (clickable) {
+                        html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent('__other__') +
+                            '" data-otext="' + encodeURIComponent('Other (all)') + '">';
+                        html += '<div class="chart-label">All Other</div>';
+                        html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                        html += '<div class="chart-count">' + o.count + '</div></div>';
+                    }
+                    var maxV = 0;
+                    o.variants.forEach(function(v) { if (v.count > maxV) maxV = v.count; });
+                    o.variants.forEach(function(v) {
+                        if (!v.count) return;
+                        var vp = maxV > 0 ? Math.round((v.count / maxV) * 100) : 0;
+                        if (clickable) {
+                            html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent(v.value) +
+                                '" data-otext="' + encodeURIComponent(v.text) + '">';
+                        } else {
+                            html += '<div class="chart-bar">';
+                        }
+                        html += '<div class="chart-label">' + esc(v.text) + '</div>';
+                        html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + vp + '%;">' + (v.pct || 0) + '%</div></div>';
+                        html += '<div class="chart-count">' + v.count + '</div></div>';
+                    });
+                    html += '</div></div>';
+                    return;
+                }
+                if (clickable) {
+                    html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent(o.value) +
+                        '" data-otext="' + encodeURIComponent(o.text) + '">';
+                } else {
+                    html += '<div class="chart-bar">';
+                }
+                html += '<div class="chart-label">' + esc(o.text) + '</div>';
+                html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                html += '<div class="chart-count">' + o.count + '</div></div>';
+            });
+            return html;
+        }
+
         function renderRegistrationSummary(data) {
             renderBreadcrumb();
             if (!data.is_registration_form) {
+                $('#btn-reg-excel').hide();
                 $('#reg-view').html('<div class="info-banner">' + esc(data.message) + '</div>');
                 return;
             }
 
             if (!data.questions || data.questions.length === 0) {
+                $('#btn-reg-excel').hide();
                 $('#reg-view').html('<div class="empty-state">' + esc(data.message || 'No registration questions found.') + '</div>');
                 return;
             }
 
+            $('#btn-reg-excel').show();
             var html = '<div class="reg-meta" style="margin-bottom:14px;">Completed registrants: <strong>' + data.completed_count + '</strong></div>';
 
             if (data.message) {
@@ -3635,15 +3858,7 @@ else:
                 html += '<div class="reg-question-title">' + esc(q.label) + '</div>';
                 if (q.kind === 'choice') {
                     html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank</div>';
-                    var maxC = 0;
-                    (q.options || []).forEach(function(o) { if (o.count > maxC) maxC = o.count; });
-                    (q.options || []).forEach(function(o) {
-                        if (!o.count) return;
-                        var barPct = maxC > 0 ? Math.round((o.count / maxC) * 100) : 0;
-                        html += '<div class="chart-bar"><div class="chart-label">' + esc(o.text) + '</div>';
-                        html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + o.pct + '%</div></div>';
-                        html += '<div class="chart-count">' + o.count + '</div></div>';
-                    });
+                    html += renderChoiceOptions(q.options || [], false);
                 } else {
                     html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank</div>';
                     if (q.preview && q.preview.length) {
@@ -3670,6 +3885,44 @@ else:
             openQuestion(q);
         });
 
+        $(document).on('click', '.other-group-toggle', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var $btn = $(this);
+            var $variants = $btn.siblings('.other-variants');
+            var expanded = $btn.attr('data-expanded') === '1';
+            if (expanded) {
+                $btn.attr('data-expanded', '0');
+                $variants.removeClass('expanded');
+                $btn.find('.other-chevron').removeClass('fa-chevron-down').addClass('fa-chevron-right');
+            } else {
+                $btn.attr('data-expanded', '1');
+                $variants.addClass('expanded');
+                $btn.find('.other-chevron').removeClass('fa-chevron-right').addClass('fa-chevron-down');
+            }
+        });
+
+        $(document).on('click', '.other-variants', function(e) {
+            e.stopPropagation();
+        });
+
+        $('#btn-reg-excel').click(function() {
+            if (!currentOrgId) return;
+            var $btn = $(this);
+            $btn.prop('disabled', true);
+            showLoading('Preparing Registration Report...', true);
+            ajaxPost({ action: 'get_registration_excel_url', org_id: currentOrgId }, function(data) {
+                $btn.prop('disabled', false);
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                if (data.url) {
+                    window.open(data.url, '_blank', 'noopener');
+                }
+            }, { showLoading: true });
+        });
+
         function openQuestion(q) {
             regState.view = 'question';
             regState.question = q;
@@ -3681,15 +3934,7 @@ else:
                 var html = '<button type="button" class="btn-back" data-nav="summary"><i class="fa fa-arrow-left"></i> Back</button>';
                 html += '<h3 style="margin:16px 0 8px;">' + esc(q.label) + '</h3>';
                 html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank — click an option to see who selected it</div>';
-                var maxC = 0;
-                (q.options || []).forEach(function(o) { if (o.count > maxC) maxC = o.count; });
-                (q.options || []).forEach(function(o) {
-                    var barPct = maxC > 0 ? Math.round((o.count / maxC) * 100) : 0;
-                    html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent(o.value) + '" data-otext="' + encodeURIComponent(o.text) + '">';
-                    html += '<div class="chart-label">' + esc(o.text) + '</div>';
-                    html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + o.pct + '%</div></div>';
-                    html += '<div class="chart-count">' + o.count + '</div></div>';
-                });
+                html += renderChoiceOptions(q.options || [], true);
                 $('#reg-view').html(html);
             } else {
                 showLoading('Loading answers...', true);
