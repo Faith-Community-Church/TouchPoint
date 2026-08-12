@@ -1,13 +1,14 @@
 #Roles=Access
 # Script: InvolvementDashboard.py
-# Purpose: Involvement demographics/finance dashboard with a Registration tab that
-#   summarizes new Registration Form (type 26) question responses and supports
-#   drill-down to options/people/full Q&A.
-#   Find involvements via name search (OrgSearch-style LimitToRole + OrgLeadersOnly).
-#   Finance shows Amt>0 payment groups with paid-in-full vs remaining-balance counts.
-#   Overview demographics can vary by Program Id (see PROGRAM_OVERVIEW_PROFILES).
-# Author: Ben Swaby (base dashboard); Jake Pierson (Registration tab)
-# Date: 2026-07-20
+# Purpose: Involvement demographics/finance dashboard with Registration and Allergies
+#   tabs. Registration summarizes Registration Form (type 26) question responses
+#   with drill-down to options/people/full Q&A. Allergies lists org members with
+#   RecReg allergy notes. Find involvements via name search (OrgSearch-style
+#   LimitToRole + OrgLeadersOnly). Finance shows Amt>0 payment groups with
+#   paid-in-full vs remaining-balance counts. Overview demographics can vary by
+#   Program Id (see PROGRAM_OVERVIEW_PROFILES).
+# Author: Ben Swaby (base dashboard); Jake Pierson (Registration / Allergies tabs)
+# Date: 2026-08-07
 # Email: bswaby@fbchtn.org
 #
 # Install: Special Content -> Python Scripts -> name InvolvementDashboard
@@ -56,6 +57,27 @@ def _is_hear_about_question(label):
     """True when free-text Other answers should collapse into one Other group."""
     lab = _s(label).lower()
     return 'how did you hear' in lab
+
+
+def _allergy_text_meaningful(text):
+    """True only when MedicalDescription looks like a real allergy note."""
+    t = _s(text).lower()
+    if not t:
+        return False
+    t = ' '.join(t.split())
+    if not t:
+        return False
+    t_bare = t.rstrip('.,;:')
+    ignore = (
+        'none', 'n/a', 'na', 'n.a.', 'n.a', 'no', 'nope', '-', '--', '.',
+        'none known', 'no known', 'no known allergies', 'n/a.', 'nil',
+        'nothing', 'unknown', 'unk',
+        'nka', 'nkda', 'n.k.a', 'n.k.a.', 'n.k.d.a', 'n.k.d.a.',
+        'no allergies', 'no allergy', 'none listed', 'not applicable',
+    )
+    if t in ignore or t_bare in ignore:
+        return False
+    return True
 
 
 # Age brackets for Overview demographics (label -> inclusive min/max; None max = no upper bound)
@@ -579,12 +601,77 @@ def _parse_options(options_json):
             continue
         text = _s(o.get('text') or o.get('Text'))
         value = _s(o.get('value') or o.get('Value') or text)
+        lookup = _s(o.get('lookup') or o.get('Lookup'))
         result.append({
-            'text': text or value,
-            'value': value or text,
+            'text': text or value or lookup,
+            'value': value or text or lookup,
+            'lookup': lookup,
             'other': bool(o.get('other') or o.get('Other')),
         })
     return result
+
+
+def _option_key(o):
+    """Unique option identity for counting.
+
+    When Save as SubGroup is on, option.value is the SubGroup name and can be
+    shared (e.g. 6th/7th/8th all value=Middle School). Prefer text, then lookup.
+    """
+    return _s(o.get('text')) or _s(o.get('lookup')) or _s(o.get('value'))
+
+
+def _choice_selected_values(parsed, options, sub_type_id):
+    """Return list of option keys this answer selected (for counting)."""
+    selected = []
+    if parsed is None:
+        return selected
+    if sub_type_id == SUBTYPE_MENU and isinstance(parsed, list):
+        i = 0
+        while i < len(options) and i < len(parsed):
+            qty = _s(parsed[i])
+            if qty and qty != '0':
+                selected.append(_option_key(options[i]))
+            i += 1
+        return selected
+
+    # Shared SubGroup values must not match every grade that uses that SubGroup
+    value_uses = {}
+    for o in options:
+        v = _s(o.get('value'))
+        if v:
+            value_uses[v] = value_uses.get(v, 0) + 1
+
+    opt_by_text = {}
+    opt_by_lookup = {}
+    opt_by_value = {}
+    for o in options:
+        key = _option_key(o)
+        t = _s(o.get('text'))
+        lk = _s(o.get('lookup'))
+        v = _s(o.get('value'))
+        if t:
+            opt_by_text[t] = key
+        if lk:
+            opt_by_lookup[lk] = key
+        # Only match on value when it uniquely identifies one option
+        if v and value_uses.get(v, 0) == 1:
+            opt_by_value[v] = key
+
+    values = parsed if isinstance(parsed, list) else [parsed]
+    for v in values:
+        sv = _s(v)
+        if not sv:
+            continue
+        if sv in opt_by_text:
+            selected.append(opt_by_text[sv])
+        elif sv in opt_by_lookup:
+            selected.append(opt_by_lookup[sv])
+        elif sv in opt_by_value:
+            selected.append(opt_by_value[sv])
+        else:
+            # Free-text "Other" or unmatched — count under raw value
+            selected.append(sv)
+    return selected
 
 
 def _org_meta(org_id):
@@ -687,39 +774,6 @@ WHERE rk.rn = 1
     return list(q.QuerySql(sql, p))
 
 
-def _choice_selected_values(parsed, options, sub_type_id):
-    """Return list of option values this answer selected (for counting)."""
-    selected = []
-    if parsed is None:
-        return selected
-    if sub_type_id == SUBTYPE_MENU and isinstance(parsed, list):
-        i = 0
-        while i < len(options) and i < len(parsed):
-            qty = _s(parsed[i])
-            if qty and qty != '0':
-                selected.append(options[i]['value'])
-            i += 1
-        return selected
-    values = parsed if isinstance(parsed, list) else [parsed]
-    opt_by_text = {}
-    opt_by_value = {}
-    for o in options:
-        opt_by_text[o['text']] = o['value']
-        opt_by_value[o['value']] = o['value']
-    for v in values:
-        sv = _s(v)
-        if not sv:
-            continue
-        if sv in opt_by_value:
-            selected.append(opt_by_value[sv])
-        elif sv in opt_by_text:
-            selected.append(opt_by_text[sv])
-        else:
-            # Free-text "Other" or unmatched — count under raw value
-            selected.append(sv)
-    return selected
-
-
 def _build_registration_summary(org_id):
     org = _org_meta(org_id)
     if not org:
@@ -817,7 +871,7 @@ def _build_registration_summary(org_id):
             item['kind'] = 'choice'
             counts = {}
             for o in options:
-                counts[o['value']] = 0
+                counts[_option_key(o)] = 0
             other_counts = {}
             for row in parsed_by_person:
                 for sel in _choice_selected_values(row['parsed'], options, st):
@@ -832,12 +886,13 @@ def _build_registration_summary(org_id):
             other_variants = []
             other_total = 0
             for o in options:
-                c = counts.get(o['value'], 0)
+                key = _option_key(o)
+                c = counts.get(key, 0)
                 pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
                 if collapse_other and o.get('other'):
                     if c > 0:
                         other_variants.append({
-                            'value': o['value'],
+                            'value': key,
                             'text': o['text'],
                             'count': c,
                             'pct': pct,
@@ -845,7 +900,7 @@ def _build_registration_summary(org_id):
                         other_total += c
                     continue
                 opt_out.append({
-                    'value': o['value'],
+                    'value': key,
                     'text': o['text'],
                     'count': c,
                     'pct': pct,
@@ -932,12 +987,12 @@ def _get_option_people(org_id, question_id, option_value):
 
     target = _s(option_value)
     configured_other = {}
+    known_keys = {}
     for o in options:
+        key = _option_key(o)
+        known_keys[key] = True
         if o.get('other'):
-            configured_other[o['value']] = True
-    known_values = {}
-    for o in options:
-        known_values[o['value']] = True
+            configured_other[key] = True
 
     people = []
     for reg in registrants:
@@ -949,7 +1004,7 @@ def _get_option_people(org_id, question_id, option_value):
         match = False
         if target == '__other__':
             for sel in selected:
-                if sel in configured_other or sel not in known_values:
+                if sel in configured_other or sel not in known_keys:
                     match = True
                     break
         elif target in selected:
@@ -964,6 +1019,38 @@ def _get_option_people(org_id, question_id, option_value):
         'question_id': _s(question_id),
         'question_label': _s(qrow.Label),
         'option_value': target,
+        'people': people,
+    }
+
+
+def _get_allergy_people(org_id):
+    """Org members with a real allergy note on RecReg (default allergies list)."""
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    ISNULL(rr.MedicalDescription, '') AS AllergyText
+FROM OrganizationMembers om
+INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+LEFT JOIN RecReg rr ON rr.PeopleId = pe.PeopleId
+WHERE om.OrganizationId = @orgId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        allergy = _s(r.AllergyText)
+        if not _allergy_text_meaningful(allergy):
+            continue
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName),
+            'allergy': allergy,
+        })
+    return {
+        'count': len(people),
         'people': people,
     }
 
@@ -1800,6 +1887,17 @@ ORDER BY
         except Exception, e:
             _err_out(e)
 
+    elif action == 'get_allergy_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_allergy_people(org_id))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'get_option_people':
         try:
             org_id = _i(_data('org_id'), 0)
@@ -1933,7 +2031,27 @@ ORDER BY
         _json_out({'error': 'Unknown action'})
 
 else:
-    # Main page
+    # Main page — optional deep link: /PyScriptForm/InvolvementDashboard?org_id=123
+    _initial_org_id = 0
+    _initial_org_name = ''
+    try:
+        _initial_org_id = _i(_data('org_id'), 0)
+        if _initial_org_id <= 0:
+            _initial_org_id = _i(Data.GetValue('org_id'), 0)
+    except:
+        _initial_org_id = 0
+    if _initial_org_id > 0:
+        try:
+            _op = _dd()
+            _op.AddValue('orgId', str(_initial_org_id))
+            _orows = list(q.QuerySql(
+                'SELECT TOP 1 OrganizationName FROM dbo.Organizations WHERE OrganizationId = @orgId',
+                _op))
+            if _orows:
+                _initial_org_name = _s(_orows[0].OrganizationName)
+        except:
+            pass
+
     model.Form = r'''
 <style>
     .dashboard-container {
@@ -2264,6 +2382,11 @@ else:
         color: #f5f4e8;
     }
     .dash-tab[data-tab="registration"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab[data-tab="allergies"].active {
         border-color: #012b58;
         background: #012b58;
         color: #f5f4e8;
@@ -2847,6 +2970,7 @@ else:
         <div class="dash-tabs" id="dash-tabs">
             <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
             <button type="button" class="dash-tab" data-tab="registration">Registration</button>
+            <button type="button" class="dash-tab" data-tab="allergies">Allergies</button>
             <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh this involvement" aria-label="Refresh">
                 <i class="fa fa-refresh"></i>
             </button>
@@ -2904,6 +3028,18 @@ else:
                 <div id="reg-view"></div>
             </div>
         </div>
+
+        <div class="tab-panel" id="tab-allergies">
+            <div class="section">
+                <div class="reg-toolbar">
+                    <h2 class="section-title" style="margin:0;"><i class="fa fa-medkit"></i> Allergies</h2>
+                </div>
+                <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                    Participants with allergy notes from the default allergies list (RecReg).
+                </p>
+                <div id="allergies-view"></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -2912,6 +3048,8 @@ else:
     function initDashboard() {
         var scriptUrl = window.location.pathname;
         var currentOrgId = null;
+        var initialOrgId = __INITIAL_ORG_ID__;
+        var initialOrgName = __INITIAL_ORG_NAME__;
         var regState = { view: 'summary', question: null, option: null, person: null, summary: null };
         var gradeDrillState = { label: '', people: [], filter: 'all' };
         var currentXhr = null;
@@ -3127,6 +3265,9 @@ else:
             $('#tab-' + tab).addClass('active');
             if (tab === 'registration' && currentOrgId) {
                 loadRegistrationSummary();
+            }
+            if (tab === 'allergies' && currentOrgId) {
+                loadAllergies();
             }
         });
 
@@ -3631,7 +3772,7 @@ else:
 
                 // Restore tab on refresh; otherwise open Overview
                 var tabToShow = preserveTab || 'overview';
-                if (tabToShow !== 'overview' && tabToShow !== 'registration') {
+                if (tabToShow !== 'overview' && tabToShow !== 'registration' && tabToShow !== 'allergies') {
                     tabToShow = 'overview';
                 }
                 $('.dash-tab').removeClass('active');
@@ -3794,6 +3935,9 @@ else:
                 if (tabToShow === 'registration') {
                     loadRegistrationSummary();
                 }
+                if (tabToShow === 'allergies') {
+                    loadAllergies();
+                }
             }, { showLoading: true });
         }
 
@@ -3809,6 +3953,33 @@ else:
                 parts.push('<span>' + esc(regState.person.name) + '</span>');
             }
             $('#reg-breadcrumb').html(parts.join(' <i class="fa fa-chevron-right"></i> '));
+        }
+
+        function loadAllergies() {
+            if (!currentOrgId) return;
+            showLoading('Loading allergies...', false);
+            $('#allergies-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_allergy_people', org_id: currentOrgId }, function(data) {
+                if (data && data.error) {
+                    $('#allergies-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                var people = (data && data.people) || [];
+                if (!people.length) {
+                    $('#allergies-view').html('<div class="empty-state">No participants with allergy notes on file.</div>');
+                    return;
+                }
+                var ids = collectPeopleIds(people);
+                var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with allergies: <strong>' +
+                    people.length + '</strong></div>';
+                html += drillActionsHtml({ peopleIds: ids });
+                html += '<table class="people-table"><thead><tr><th>Person</th><th>Allergies</th></tr></thead><tbody>';
+                people.forEach(function(p) {
+                    html += '<tr><td>' + personLink(p.people_id, p.name) + '</td><td>' + esc(p.allergy) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                $('#allergies-view').html(html);
+            }, { showLoading: true });
         }
 
         function loadRegistrationSummary() {
@@ -4120,6 +4291,12 @@ else:
             }
         });
 
+        if (initialOrgId && parseInt(initialOrgId, 10) > 0) {
+            currentOrgId = String(initialOrgId);
+            $('#org-search').val(initialOrgName || ('Org #' + currentOrgId));
+            loadOverviewDashboard(currentOrgId);
+        }
+
     }
 
     if (window.jQuery) {
@@ -4135,3 +4312,10 @@ else:
 })();
 </script>
 '''
+    # Inject deep-link org (safe ints / escaped name for JS string)
+    try:
+        _safe_name = _json_quote(_initial_org_name) if _initial_org_name else '""'
+    except:
+        _safe_name = '""'
+    model.Form = model.Form.replace('__INITIAL_ORG_ID__', str(int(_initial_org_id or 0)))
+    model.Form = model.Form.replace('__INITIAL_ORG_NAME__', _safe_name)
