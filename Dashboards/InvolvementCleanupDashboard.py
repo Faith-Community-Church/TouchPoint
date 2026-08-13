@@ -14,8 +14,11 @@
 #   POST /Org/PostData          status / type
 #   POST /OrgSearch/Edit        id=amc-{orgId} mobile category
 #   POST /OrgSearch/MainDiv     main division
-#   POST /OrgSearch/ToggleTag   add/remove related division
+#   POST /OrgSearch/ToggleTag   add/remove related (non-main) division
 #   Python DropOrgMember        drop current members to Previous
+#
+# Terminology: main division = Organizations.DivisionId.
+# Related / non-main divisions = other DivOrg rows for that involvement.
 #
 # IronPython notes (TouchPoint embeds IronPython 2.7):
 #   - Use print without parentheses; except Exception, ex
@@ -508,41 +511,47 @@ def _run_tree(prog_id=0, div_id=0, include_inactive=False, created_after=''):
     return rows
 
 
-def _tree_summary(prog_id=0, div_id=0, include_inactive=False, created_after=''):
-    p = _tree_params(prog_id, div_id, created_after)
-    where_sql = _tree_where(include_inactive)
-    sql = (
-        "SELECT "
-        "COUNT(DISTINCT os.ProgId) AS ProgramCount, "
-        "COUNT(DISTINCT os.DivId) AS DivisionCount, "
-        "COUNT(DISTINCT os.OrgId) AS InvCount, "
-        "COUNT(DISTINCT CASE WHEN os.OrgStatus = 'Active' THEN os.OrgId END) AS ActiveInvs, "
-        "ISNULL(SUM(os.Members), 0) AS TotalMembers, "
-        "ISNULL(SUM(os.Previous), 0) AS TotalPrevious, "
-        "ISNULL(SUM(os.Vistors), 0) AS TotalVisitors, "
-        "ISNULL(SUM(os.Meetings), 0) AS TotalMeetings "
-        "FROM dbo.OrganizationStructure os "
-        "INNER JOIN dbo.Organizations o ON o.OrganizationId = os.OrgId "
-        "WHERE " + where_sql
-    )
-    try:
-        r = q.QuerySqlTop1(sql, p)
-    except:
-        r = None
-    if r is None:
-        return {
-            'programs': 0, 'divisions': 0, 'involvements': 0, 'active': 0,
-            'members': 0, 'previous': 0, 'visitors': 0, 'meetings': 0,
-        }
+def _summary_from_tree_rows(rows):
+    """
+    Build Structure tile totals from the same rows used for the tree.
+    Counts programs/divisions/involvements distinctly; member metrics are
+    summed once per OrgId (OrganizationStructure can repeat an org under
+    multiple divisions).
+    """
+    progs = {}
+    divs = {}
+    orgs = {}
+    for r in rows or []:
+        pid = _i(r.get('prog_id'))
+        did = _i(r.get('div_id'))
+        oid = _i(r.get('org_id'))
+        if pid > 0:
+            progs[pid] = 1
+        if did > 0:
+            divs[did] = 1
+        if oid > 0 and oid not in orgs:
+            orgs[oid] = r
+    members = 0
+    previous = 0
+    visitors = 0
+    meetings = 0
+    active = 0
+    for oid, r in orgs.items():
+        members += _i(r.get('members'))
+        previous += _i(r.get('previous'))
+        visitors += _i(r.get('visitors'))
+        meetings += _i(r.get('meetings'))
+        if _s(r.get('status')) == 'Active':
+            active += 1
     return {
-        'programs': _i(r.ProgramCount),
-        'divisions': _i(r.DivisionCount),
-        'involvements': _i(r.InvCount),
-        'active': _i(r.ActiveInvs),
-        'members': _i(r.TotalMembers),
-        'previous': _i(r.TotalPrevious),
-        'visitors': _i(r.TotalVisitors),
-        'meetings': _i(r.TotalMeetings),
+        'programs': len(progs),
+        'divisions': len(divs),
+        'involvements': len(orgs),
+        'active': active,
+        'members': members,
+        'previous': previous,
+        'visitors': visitors,
+        'meetings': meetings,
     }
 
 
@@ -653,6 +662,48 @@ WHERE o.OrganizationId IN ({0})
             'org_id': _i(r.OrgId),
             'has': _i(r.HasDiv) == 1,
         })
+    return out
+
+
+def _related_divisions(org_ids):
+    """
+    For each org, list DivOrg rows that are not the main division
+    (Organizations.DivisionId). Used to strip related/non-main divisions.
+    """
+    by_org = {}
+    safe_ids = []
+    for i in org_ids:
+        n = _i(i)
+        if n > 0 and n not in by_org:
+            by_org[n] = {'org_id': n, 'main_div_id': 0, 'related': []}
+            safe_ids.append(str(n))
+    if not safe_ids:
+        return []
+    id_list = ','.join(safe_ids)
+    sql = '''
+SELECT
+    o.OrganizationId AS OrgId,
+    ISNULL(o.DivisionId, 0) AS MainDivId,
+    d.DivId AS RelatedDivId
+FROM dbo.Organizations o
+LEFT JOIN dbo.DivOrg d
+    ON d.OrgId = o.OrganizationId
+   AND ISNULL(o.DivisionId, 0) > 0
+   AND d.DivId <> o.DivisionId
+WHERE o.OrganizationId IN ({0})
+ORDER BY o.OrganizationId, d.DivId
+'''.format(id_list)
+    for r in q.QuerySql(sql):
+        oid = _i(r.OrgId)
+        if oid not in by_org:
+            continue
+        by_org[oid]['main_div_id'] = _i(r.MainDivId)
+        rid = _i(r.RelatedDivId)
+        if rid > 0 and rid not in by_org[oid]['related']:
+            by_org[oid]['related'].append(rid)
+    out = []
+    for oid in sorted(by_org.keys()):
+        out.append(by_org[oid])
     return out
 
 
@@ -984,6 +1035,7 @@ def _page():
     html += '<button type="button" class="btn-secondary" data-action="set_main_division">Set main division</button>'
     html += '<button type="button" class="btn-secondary" data-action="add_division">Add related division</button>'
     html += '<button type="button" class="btn-secondary" data-action="remove_division">Remove related division</button>'
+    html += '<button type="button" class="btn-secondary" data-action="remove_all_related">Remove all related divisions</button>'
     html += '<button type="button" class="btn-secondary" data-action="set_type">Change type</button>'
     html += '<button type="button" class="btn-secondary" data-action="set_category">Set mobile category</button>'
     html += '<button type="button" class="btn-secondary" id="ic-select-all">Select all</button>'
@@ -1338,7 +1390,11 @@ def _page():
     html += '    } else if (action === "set_main_division" || action === "add_division" || action === "remove_division") {\n'
     html += '      title.textContent = action === "set_main_division" ? "Set main division" : (action === "add_division" ? "Add related division" : "Remove related division");\n'
     html += '      html += "<label>Division</label><br/><select id=\\"ic-modal-div\\">" + optionList(lookups.divisions) + "</select>";\n'
-    html += '      html += "<p class=\\"ic-meta\\">Program follows the selected division.</p>";\n'
+    html += '      html += "<p class=\\"ic-meta\\">Program follows the selected division. Related = non-main DivOrg links.</p>";\n'
+    html += '    } else if (action === "remove_all_related") {\n'
+    html += '      title.textContent = "Remove all related divisions";\n'
+    html += '      html += "<p>Keeps the <strong>main</strong> division on each involvement and removes every other (related / non-main) division link.</p>";\n'
+    html += '      html += "<p class=\\"ic-meta\\">Involvements with no main division set are skipped.</p>";\n'
     html += '    }\n'
     html += '    body.innerHTML = html;\n'
     html += '    document.getElementById("ic-modal").className = "ic-modal-overlay visible";\n'
@@ -1486,29 +1542,75 @@ def _page():
     html += '            cb({ org_id: oid, ok: true, message: "Not in division" });\n'
     html += '            return;\n'
     html += '          }\n'
-    html += '          jQuery.ajax({\n'
-    html += '            url: "/OrgSearch/ToggleTag", type: "POST", dataType: "text",\n'
-    html += '            data: { id: oid, tagdiv: divId }\n'
-    html += '          }).done(function(ret) {\n'
-    html += '            var s = String(ret || "").trim();\n'
-    html += '            var parsed = null;\n'
-    html += '            if (s.charAt(0) === "{") { try { parsed = JSON.parse(s); } catch (e2) { parsed = null; } }\n'
-    html += '            if (parsed && parsed.warning === "lastDivision")\n'
-    html += '              cb({ org_id: oid, ok: false, message: "Cannot remove last division" });\n'
-    html += '            else if (parsed && parsed.error)\n'
-    html += '              cb({ org_id: oid, ok: false, message: String(parsed.error) });\n'
-    html += '            else if (s === "error")\n'
-    html += '              cb({ org_id: oid, ok: false, message: "ToggleTag error" });\n'
-    html += '            else\n'
-    html += '              cb({ org_id: oid, ok: true, message: a === "add_division" ? "Related division added" : "Related division removed" });\n'
-    html += '          }).fail(function(xhr) {\n'
-    html += '            cb({ org_id: oid, ok: false, message: "ToggleTag failed (" + (xhr.status || "?") + ")" });\n'
-    html += '          });\n'
+    html += '          postToggleTag(oid, divId, function(ok, msg) {\n'
+    html += '            cb({ org_id: oid, ok: ok, message: msg || (a === "add_division" ? "Related division added" : "Related division removed") });\n'
+    html += '          }, a === "add_division" ? "Related division added" : "Related division removed");\n'
     html += '        }, showActionResults);\n'
     html += '      }).fail(function() { setResult("div_membership failed"); });\n'
     html += '      return;\n'
     html += '    }\n'
+    html += '    if (a === "remove_all_related") {\n'
+    html += '      jQuery.ajax({\n'
+    html += '        url: scriptUrl, type: "POST", dataType: "text",\n'
+    html += '        data: { ajax: "true", action: "list_related_divisions", org_ids: ids.join(",") }\n'
+    html += '      }).done(function(response) {\n'
+    html += '        var data2 = null;\n'
+    html += '        try { data2 = JSON.parse(String(response || "").trim()); } catch (e) { setResult("Bad related-divisions response"); return; }\n'
+    html += '        if (data2.error) { setResult(esc(data2.error)); return; }\n'
+    html += '        var map = {};\n'
+    html += '        var rows = data2.rows || [];\n'
+    html += '        for (var r = 0; r < rows.length; r++) map[rows[r].org_id] = rows[r];\n'
+    html += '        runEach(ids, function(oid, cb) {\n'
+    html += '          var info = map[oid] || { main_div_id: 0, related: [] };\n'
+    html += '          if (!info.main_div_id) {\n'
+    html += '            cb({ org_id: oid, ok: false, message: "No main division set" });\n'
+    html += '            return;\n'
+    html += '          }\n'
+    html += '          var related = info.related || [];\n'
+    html += '          if (!related.length) {\n'
+    html += '            cb({ org_id: oid, ok: true, message: "No related divisions" });\n'
+    html += '            return;\n'
+    html += '          }\n'
+    html += '          var ri = 0, removed = 0, failMsg = "";\n'
+    html += '          function nextRelated() {\n'
+    html += '            if (ri >= related.length) {\n'
+    html += '              if (failMsg) cb({ org_id: oid, ok: false, message: failMsg });\n'
+    html += '              else cb({ org_id: oid, ok: true, message: "Removed " + removed + " related division(s)" });\n'
+    html += '              return;\n'
+    html += '            }\n'
+    html += '            var rid = related[ri++];\n'
+    html += '            postToggleTag(oid, rid, function(ok, msg) {\n'
+    html += '              if (ok) removed++;\n'
+    html += '              else if (!failMsg) failMsg = msg || ("Failed on div " + rid);\n'
+    html += '              nextRelated();\n'
+    html += '            }, "ok");\n'
+    html += '          }\n'
+    html += '          nextRelated();\n'
+    html += '        }, showActionResults);\n'
+    html += '      }).fail(function() { setResult("list_related_divisions failed"); });\n'
+    html += '      return;\n'
+    html += '    }\n'
     html += '    setResult("Unknown action");\n'
+    html += '  }\n'
+    html += '  function postToggleTag(oid, tagdiv, cb, okMsg) {\n'
+    html += '    jQuery.ajax({\n'
+    html += '      url: "/OrgSearch/ToggleTag", type: "POST", dataType: "text",\n'
+    html += '      data: { id: oid, tagdiv: tagdiv }\n'
+    html += '    }).done(function(ret) {\n'
+    html += '      var s = String(ret || "").trim();\n'
+    html += '      var parsed = null;\n'
+    html += '      if (s.charAt(0) === "{") { try { parsed = JSON.parse(s); } catch (e2) { parsed = null; } }\n'
+    html += '      if (parsed && parsed.warning === "lastDivision")\n'
+    html += '        cb(false, "Cannot remove last division");\n'
+    html += '      else if (parsed && parsed.error)\n'
+    html += '        cb(false, String(parsed.error));\n'
+    html += '      else if (s === "error")\n'
+    html += '        cb(false, "ToggleTag error");\n'
+    html += '      else\n'
+    html += '        cb(true, okMsg || "ok");\n'
+    html += '    }).fail(function(xhr) {\n'
+    html += '      cb(false, "ToggleTag failed (" + (xhr.status || "?") + ")");\n'
+    html += '    });\n'
     html += '  }\n'
     html += '  function setTab(tab) {\n'
     html += '    currentTab = tab;\n'
@@ -1599,7 +1701,7 @@ if is_ajax:
             inc = _b(_form_val('include_inactive'))
             created = _form_val('created_after', '')
             rows = _run_tree(prog, div, inc, created)
-            summary = _tree_summary(prog, div, inc, created)
+            summary = _summary_from_tree_rows(rows)
             _json_out({'rows': rows, 'count': len(rows), 'summary': summary})
         elif action == 'get_warnings':
             _json_out({'rows': _org_warnings(_parse_org_ids())})
@@ -1612,6 +1714,8 @@ if is_ajax:
             _json_out({
                 'rows': _div_membership(_parse_org_ids(), _i(_form_val('div_id')))
             })
+        elif action == 'list_related_divisions':
+            _json_out({'rows': _related_divisions(_parse_org_ids())})
         else:
             _json_out({'error': 'Unknown action'})
     except Exception, e:
