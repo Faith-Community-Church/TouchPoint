@@ -349,6 +349,16 @@ ORDER BY n.AttemptDate DESC, n.OrganizationName, n.RegistrantName
     return rows, emailed_lookup
 
 
+def _id_csv(idmap):
+    """Comma-separated digit-only ids for SQL IN (...) lists."""
+    ids = []
+    for k in idmap.keys():
+        s = _s(k)
+        if s.isdigit():
+            ids.append(s)
+    return ','.join(ids)
+
+
 def _last_emailed_lookup(rows):
     """
     Map 'recipientPid~orgId' -> last emailed datetime for IncompleteReg outreach.
@@ -371,10 +381,13 @@ def _last_emailed_lookup(rows):
     if len(recip_ids) == 0 or len(org_ids) == 0:
         return lookup
 
-    recip_csv = ','.join(recip_ids.keys())
-    org_csv = ','.join(org_ids.keys())
+    recip_csv = _id_csv(recip_ids)
+    org_csv = _id_csv(org_ids)
+    if (not recip_csv) or (not org_csv):
+        return lookup
 
-    # Primary: OrgId stamped on EmailQueueTo when we set model.CurrentOrgId before send
+    # Primary: OrgId stamped on EmailQueueTo when we set model.CurrentOrgId before send.
+    # Require IncompleteReg in the subject — FromAddr alone matches unrelated mail.
     sql = """
 SELECT
     eqt.PeopleId AS RecipientPeopleId,
@@ -384,16 +397,12 @@ FROM dbo.EmailQueue eq
 JOIN dbo.EmailQueueTo eqt ON eqt.Id = eq.Id
 WHERE eqt.PeopleId IN ({recips})
   AND eqt.OrgId IN ({orgs})
-  AND (
-        ISNULL(eq.Subject, '') LIKE '%' + @prefix + '%'
-        OR ISNULL(eq.FromAddr, '') = @fromaddr
-      )
+  AND ISNULL(eq.Subject, '') LIKE '%' + @prefix + '%'
 GROUP BY eqt.PeopleId, eqt.OrgId
 """.format(orgs=org_csv, recips=recip_csv)
 
     p = _dd()
     p.AddValue('prefix', TEMPLATE_TITLE_PREFIX)
-    p.AddValue('fromaddr', FROM_ADDR)
     emailed = list(q.QuerySql(sql, p))
 
     for e in emailed:
@@ -402,8 +411,8 @@ GROUP BY eqt.PeopleId, eqt.OrgId
         key = _s(e.RecipientPeopleId) + '~' + _s(e.OrganizationId)
         lookup[key] = e.LastEmailed
 
-    # Fallback for older sends (before OrgId stamping): subject match + body has org id
-    # after Handlebars merge, or literal InvolvementId value in body.
+    # Fallback for older sends (before OrgId stamping): subject + /OnlineReg/{id} in body.
+    # Do not match a bare org id — "12" hits 112, 123, etc.
     sql2 = """
 SELECT
     eqt.PeopleId AS RecipientPeopleId,
@@ -415,10 +424,7 @@ JOIN dbo.Organizations o ON o.OrganizationId IN ({orgs})
 WHERE eqt.PeopleId IN ({recips})
   AND ISNULL(eqt.OrgId, 0) = 0
   AND ISNULL(eq.Subject, '') LIKE '%' + @prefix + '%'
-  AND (
-        eq.Body LIKE '%/OnlineReg/' + CAST(o.OrganizationId AS varchar(20)) + '%'
-        OR eq.Body LIKE '%' + CAST(o.OrganizationId AS varchar(20)) + '%'
-      )
+  AND eq.Body LIKE '%/OnlineReg/' + CAST(o.OrganizationId AS varchar(20)) + '%'
 GROUP BY eqt.PeopleId, o.OrganizationId
 """.format(orgs=org_csv, recips=recip_csv)
 
@@ -508,7 +514,8 @@ def _sortable_table_assets(table_id):
         '    var emptyA = (!va || va === "never" || va === "—" || va === "-");\n'
         '    var emptyB = (!vb || vb === "never" || vb === "—" || vb === "-");\n'
         '    if (emptyA && emptyB) return 0;\n'
-        '    if (emptyA) return       '    if (emptyB) return -1;\n'
+        '    if (emptyA) return 1;\n'
+        '    if (emptyB) return -1;\n'
         '    var cmp = 0;\n'
         '    if (type === "num") {\n'
         '      cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);\n'
@@ -740,7 +747,7 @@ def _confirm_page(sp, tokens, template_name, templates):
     html += '<p>Send <strong>' + str(len(tokens)) + '</strong> email(s) using template '
     html += '<strong>' + _html(title) + '</strong> from <strong>' + _html(FROM_ADDR) + '</strong>?</p>'
     html += '<p style="color:#666;font-size:13px">Each selected row emails the registration starter/parent when known, '
-    html += 'otherwise the registrant. Use Handlebars fields in the template (see notes on the report page).</p>'
+    html += 'otherwise the registrant. Merge fields are filled in before send (see notes on the report page).</p>'
     html += '<form method="post" action="' + SCRIPT_PATH + '" style="display:inline">'
     html += _hidden_filters(sp)
     html += '<input type="hidden" name="action" value="email" />'
@@ -817,7 +824,9 @@ def _page(sp, rows, templates, message, emailed_lookup):
     html += '<p><strong>' + str(len(rows)) + '</strong> incomplete attempt(s)</p>'
     html += '<p class="text-muted">Email goes to the starter/parent when known, otherwise the registrant. '
     html += 'Attempt date links require Admin, Finance, or ManageTransactions. '
-    html += 'Use Handlebars fields in the template: {{RegistrantName}}, {{InvolvementName}}, {{RegisterUrl}}. '
+    html += 'Template fields (merged before send): {{RegistrantName}}, {{RegistrantFirst}}, {{InvolvementName}}, {{RegisterUrl}}. '
+    html += 'In Unlayer, set a Button URL to <code>{{RegisterUrl}}</code> (not typed as visible text only). '
+    html += 'HTML link: {{{RegisterLink}}}. '
     html += '<strong>Last emailed</strong> is based on prior IncompleteReg outreach for that recipient + involvement. '
     html += 'Click a column header to sort.</p>'
     html += '<table id="iro-table" class="table table-striped table-condensed"><thead><tr>'
@@ -855,6 +864,125 @@ def _page(sp, rows, templates, message, emailed_lookup):
     return html
 
 
+def _load_template(name):
+    """
+    Load Title + HTML body for an email template.
+    Unlayer (TypeID 7) stores JSON; use exported HTML like Content.GetHTML().
+    Also parse JSON when Body looks like Unlayer even if TypeID is 0/2.
+    """
+    sql = """
+SELECT TOP 1 c.Name, c.Title, c.TypeID, c.Body
+FROM dbo.Content c
+WHERE c.Name = @name
+  AND c.TypeID IN (0, 2, 7)
+"""
+    p = _dd()
+    p.AddValue('name', name)
+    rows = list(q.QuerySql(sql, p))
+    if (not rows) or (len(rows) == 0):
+        return None, None
+    row = rows[0]
+    title = _s(row.Title) or name
+    try:
+        body = unicode(row.Body).strip()
+    except:
+        body = _s(row.Body)
+    typeid = _i(row.TypeID, 0)
+    if typeid == 7 or _looks_like_unlayer(body):
+        parsed = _unlayer_html(body)
+        if _looks_like_unlayer(parsed):
+            return title, None
+        body = parsed
+    if not body:
+        return title, None
+    return title, body
+
+
+def _looks_like_unlayer(s):
+    t = _s(s)
+    if not t.startswith('{'):
+        return False
+    tl = t.lower()
+    return ('"html"' in tl) or ('"rawhtml"' in tl) or ('"design"' in tl)
+
+
+def _jstring(tok):
+    """String value from a Newtonsoft JToken without JSON-quoting."""
+    if tok is None:
+        return ''
+    try:
+        v = tok.Value
+        if v is not None:
+            return unicode(v)
+    except:
+        pass
+    try:
+        return unicode(tok)
+    except:
+        return ''
+
+
+def _unlayer_html(body):
+    s = _s(body)
+    if not s:
+        return s
+    try:
+        from Newtonsoft.Json.Linq import JObject
+        obj = JObject.Parse(s)
+        for key in ('rawHtml', 'html'):
+            val = _jstring(obj[key]).strip()
+            if val:
+                return val
+    except:
+        pass
+    return s
+
+
+def _replace_token(text, token, value):
+    """Replace {{token}}, {{{token}}}, URL-encoded, and HTML-entity forms."""
+    variants = [
+        '{{{' + token + '}}}',
+        '{{' + token + '}}',
+        '%7B%7B%7B' + token + '%7D%7D%7D',
+        '%7B%7B' + token + '%7D%7D',
+        '%7b%7b%7b' + token + '%7d%7d%7d',
+        '%7b%7b' + token + '%7d%7d',
+        '&#123;&#123;&#123;' + token + '&#125;&#125;&#125;',
+        '&#123;&#123;' + token + '&#125;&#125;',
+    ]
+    for v in variants:
+        text = text.replace(v, value)
+    return text
+
+
+def _merge_template(html, fields):
+    """
+    Merge custom fields into the template before queueing.
+    EmailContentWithPythonData Handlebars runs only on the legacy SMTP path;
+    production CmsApi send never sees that Python data, so {{RegisterUrl}}
+    would go out unreplaced. Token replace here so the queued body is final
+    (standard {first} codes still run at send time).
+    """
+    text = _s(html)
+    # Unlayer button URL field often prepends http(s):// onto {{RegisterUrl}}
+    if 'RegisterUrl' in fields:
+        url = _s(fields['RegisterUrl'])
+        prefixes = [
+            'https://{{RegisterUrl}}', 'http://{{RegisterUrl}}',
+            'https://%7B%7BRegisterUrl%7D%7D', 'http://%7B%7BRegisterUrl%7D%7D',
+            'https://%7b%7bRegisterUrl%7d%7d', 'http://%7b%7bRegisterUrl%7d%7d',
+            'https://&#123;&#123;RegisterUrl&#125;&#125;',
+            'http://&#123;&#123;RegisterUrl&#125;&#125;',
+        ]
+        for pref in prefixes:
+            text = text.replace(pref, url)
+    keys = list(fields.keys())
+    keys.sort(key=lambda k: -len(k))
+    for key in keys:
+        text = _replace_token(text, key, _s(fields[key]))
+    return text
+
+
 def _send_email(tokens, template_name):
     if not tokens:
         return False, 'No rows selected.'
@@ -868,12 +996,17 @@ def _send_email(tokens, template_name):
     if template_name not in names:
         return False, 'Template does not match IncompleteReg filter (or Name mismatch).'
 
+    subject, template_html = _load_template(template_name)
+    if not template_html:
+        return False, 'Could not load HTML for template "' + template_name + '".'
+
     queued_by = model.UserPeopleId
     if not queued_by:
         return False, 'Cannot determine current user PeopleId for email queue.'
 
     recipient_pids = []
     skipped = 0
+    from_name = _from_name()
 
     for token in tokens:
         info = _parse_row_token(token)
@@ -904,23 +1037,24 @@ FROM dbo.People WHERE PeopleId = @pid
         # Prebuilt HTML link — use triple braces in template: {{{RegisterLink}}}
         reg_link = '<a href="' + reg_url + '">Complete registration for ' + _html(org_name) + '</a>'
 
-        dd = model.DynamicData()
-        dd.AddValue('PeopleId', recip)
-        dd.AddValue('RegistrantName', reg_name)
-      dd.AddValue('RegistrantFirst', reg_first)
-        dd.AddValue('InvolvementName', org_name)
-        dd.AddValue('InvolvementId', str(info['OrganizationId']))
-        dd.AddValue('RegisterUrl', reg_url)
-        dd.AddValue('RegisterLink', reg_link)
-        dd.AddValue('RecipientKind', info['RecipientKind'])
+        fields = {
+            'RegistrantName': reg_name,
+            'RegistrantFirst': reg_first,
+            'InvolvementName': org_name,
+            'InvolvementId': str(info['OrganizationId']),
+            'RegisterUrl': reg_url,
+            'RegisterLink': reg_link,
+            'RecipientKind': info['RecipientKind'],
+        }
+        body = _merge_template(template_html, fields)
 
         # Stamp involvement on EmailQueueTo so Last emailed can find this send.
-        # EmailContentWithPythonData uses model.CurrentOrgId -> Util2.CurrentOrgId.
         model.CurrentOrgId = info['OrganizationId']
 
-        # One email per selected row so sibling registrations keep correct merge data
+        # One email per selected row so sibling registrations keep correct merge data.
+        # model.Email queues already-merged HTML; CmsApi still replaces {first} etc.
         query = 'peopleids=(' + str(recip) + ')'
-        model.EmailContentWithPythonData(query, queued_by, FROM_ADDR, _from_name(), template_name, [dd])
+        model.Email(query, queued_by, FROM_ADDR, from_name, subject, body)
         recipient_pids.append(recip)
 
     if len(recipient_pids) == 0:
@@ -1007,7 +1141,7 @@ ORDER BY c.Name
                 note += '<br/>No Content rows with "Incomplete" in Name/Title were found either. ' + \
                         'Confirm the template was saved under Communication → Email Templates.'
             if message:
-                message = message + br/>' + note
+                message = message + '<br/>' + note
             else:
                 message = note
 
@@ -1017,4 +1151,3 @@ ORDER BY c.Name
 
 
 main()
-
