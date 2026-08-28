@@ -1,14 +1,15 @@
 #Roles=Access
 # Script: InvolvementDashboard.py
-# Purpose: Involvement demographics/finance dashboard with Registration, Allergies,
-#   and Next Gen Contacts tabs. Registration summarizes Registration Form (type 26)
-#   question responses with drill-down to options/people/full Q&A. Allergies lists
-#   org members with RecReg allergy notes. Contacts (Next Gen only) lists parents
-#   and emergency contacts from RecReg stock fields. Find involvements via name
-#   search (OrgSearch-style LimitToRole + OrgLeadersOnly). Finance shows Amt>0
-#   payment groups with paid-in-full vs remaining-balance counts. Overview
-#   demographics can vary by Program Id (see PROGRAM_OVERVIEW_PROFILES).
-# Author: Ben Swaby (base dashboard); Jake Pierson (Registration / Allergies / Contacts)
+# Purpose: Involvement demographics/finance dashboard with Roster, Registration,
+#   Allergies, and Next Gen Contacts tabs. Roster lists all members with join
+#   date. Registration summarizes Registration Form (type 26) question responses
+#   with drill-down to options/people/full Q&A. Allergies lists org members with
+#   RecReg allergy notes. Contacts (Next Gen only) lists parents and emergency
+#   contacts from RecReg stock fields. Find involvements via name search
+#   (OrgSearch-style LimitToRole + OrgLeadersOnly). Finance shows Amt>0 payment
+#   groups with paid-in-full vs remaining-balance counts. Overview demographics
+#   can vary by Program Id (see PROGRAM_OVERVIEW_PROFILES).
+# Author: Ben Swaby (base dashboard); Jake Pierson (Roster / Registration / Allergies / Contacts)
 # Date: 2026-08-28
 # Email: bswaby@fbchtn.org
 #
@@ -1027,6 +1028,38 @@ def _get_option_people(org_id, question_id, option_value):
     }
 
 
+def _get_roster_people(org_id):
+    """All current org members with enrollment (join) date."""
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    om.EnrollmentDate,
+    CASE
+        WHEN om.EnrollmentDate IS NULL THEN ''
+        ELSE CONVERT(varchar(10), om.EnrollmentDate, 101)
+    END AS JoinedDate
+FROM OrganizationMembers om
+INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+WHERE om.OrganizationId = @orgId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName),
+            'joined': _s(r.JoinedDate),
+        })
+    return {
+        'count': len(people),
+        'people': people,
+    }
+
+
 def _get_allergy_people(org_id):
     """Org members with a real allergy note on RecReg (default allergies list)."""
     sql = """
@@ -1943,6 +1976,17 @@ ORDER BY
         except Exception, e:
             _err_out(e)
 
+    elif action == 'get_roster_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_roster_people(org_id))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'get_contact_people':
         try:
             org_id = _i(_data('org_id'), 0)
@@ -2433,6 +2477,11 @@ else:
         cursor: pointer;
     }
     .dash-tab[data-tab="overview"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab[data-tab="roster"].active {
         border-color: #012b58;
         background: #012b58;
         color: #f5f4e8;
@@ -3036,6 +3085,7 @@ else:
 
         <div class="dash-tabs" id="dash-tabs">
             <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
+            <button type="button" class="dash-tab" data-tab="roster">Roster</button>
             <button type="button" class="dash-tab" data-tab="registration">Registration</button>
             <button type="button" class="dash-tab" data-tab="allergies">Allergies</button>
             <button type="button" class="dash-tab dash-tab-nextgen" data-tab="contacts" id="tab-btn-contacts">Contacts</button>
@@ -3079,6 +3129,18 @@ else:
                 <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a subgroup to view people</p>
                 <div id="subgroup-list"></div>
                 <div id="subgroup-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-roster">
+            <div class="section">
+                <div class="reg-toolbar">
+                    <h2 class="section-title" style="margin:0;"><i class="fa fa-list"></i> Roster</h2>
+                </div>
+                <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                    Everyone currently enrolled in this involvement and the date they joined.
+                </p>
+                <div id="roster-view"></div>
             </div>
         </div>
 
@@ -3344,6 +3406,9 @@ else:
             $(this).addClass('active');
             $('.tab-panel').removeClass('active');
             $('#tab-' + tab).addClass('active');
+            if (tab === 'roster' && currentOrgId) {
+                loadRoster();
+            }
             if (tab === 'registration' && currentOrgId) {
                 loadRegistrationSummary();
             }
@@ -3864,7 +3929,7 @@ else:
                 }
 
                 // Restore tab on refresh; otherwise open Overview
-                if (tabToShow !== 'overview' && tabToShow !== 'registration' && tabToShow !== 'allergies' && tabToShow !== 'contacts') {
+                if (tabToShow !== 'overview' && tabToShow !== 'roster' && tabToShow !== 'registration' && tabToShow !== 'allergies' && tabToShow !== 'contacts') {
                     tabToShow = 'overview';
                 }
                 if (tabToShow === 'contacts' && !currentShowContacts) {
@@ -4026,6 +4091,9 @@ else:
 
                 $('#dashboard-content').fadeIn();
 
+                if (tabToShow === 'roster') {
+                    loadRoster();
+                }
                 if (tabToShow === 'registration') {
                     loadRegistrationSummary();
                 }
@@ -4050,6 +4118,34 @@ else:
                 parts.push('<span>' + esc(regState.person.name) + '</span>');
             }
             $('#reg-breadcrumb').html(parts.join(' <i class="fa fa-chevron-right"></i> '));
+        }
+
+        function loadRoster() {
+            if (!currentOrgId) return;
+            showLoading('Loading roster...', false);
+            $('#roster-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_roster_people', org_id: currentOrgId }, function(data) {
+                if (data && data.error) {
+                    $('#roster-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                var people = (data && data.people) || [];
+                if (!people.length) {
+                    $('#roster-view').html('<div class="empty-state">No members enrolled in this involvement.</div>');
+                    return;
+                }
+                var ids = collectPeopleIds(people);
+                var html = '<div class="reg-meta" style="margin-bottom:14px;">Members: <strong>' +
+                    people.length + '</strong></div>';
+                html += drillActionsHtml({ peopleIds: ids });
+                html += '<table class="people-table"><thead><tr><th>Person</th><th>Date Joined</th></tr></thead><tbody>';
+                people.forEach(function(p) {
+                    html += '<tr><td>' + personLink(p.people_id, p.name) + '</td><td>' +
+                        esc(p.joined || '') + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                $('#roster-view').html(html);
+            }, { showLoading: true });
         }
 
         function loadAllergies() {
