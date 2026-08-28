@@ -1,50 +1,175 @@
-#Roles=Admin
-# Script: InvolvementCleanup.py
-# Purpose: Admin tool with three tabs:
-#   Structure - nested Program > Division > Involvement tree (ministry structure)
-#   Clean Up  - problem queues (dormant, past dates, zero members, etc.)
-#   Manage    - flat selectable list for bulk actions
-# Author: Jake Pierson
-# Date: 2026-08-12
+#Roles=Access
+# Script: InvolvementDashboard.py
+# Purpose: Involvement demographics/finance dashboard with Registration and Allergies
+#   tabs. Registration summarizes Registration Form (type 26) question responses
+#   with drill-down to options/people/full Q&A. Allergies lists org members with
+#   RecReg allergy notes. Find involvements via name search (OrgSearch-style
+#   LimitToRole + OrgLeadersOnly). Finance shows Amt>0 payment groups with
+#   paid-in-full vs remaining-balance counts. Overview demographics can vary by
+#   Program Id (see PROGRAM_OVERVIEW_PROFILES).
+# Author: Ben Swaby (base dashboard); Jake Pierson (Registration / Allergies tabs)
+# Date: 2026-08-07
+# Email: bswaby@fbchtn.org
 #
-# Install: Special Content -> Python Scripts -> name InvolvementCleanup
-# Run: /PyScriptForm/InvolvementCleanup
-#
-# Special Content only (no C# deploy). Writes use the signed-in browser session:
-#   POST /Org/PostData          status / type
-#   POST /OrgSearch/Edit        id=amc-{orgId} mobile category
-#   POST /OrgSearch/MainDiv     main division
-#   POST /OrgSearch/ToggleTag   add/remove related (non-main) division
-#   Python DropOrgMember        drop current members to Previous
-#
-# Terminology: main division = Organizations.DivisionId.
-# Related / non-main divisions = other DivOrg rows for that involvement.
+# Install: Special Content -> Python Scripts -> name InvolvementDashboard
+# Run: /PyScriptForm/InvolvementDashboard
 #
 # IronPython notes (TouchPoint embeds IronPython 2.7):
 #   - Use print without parentheses; except Exception, ex
 #   - Put UI in model.Form on GET (PyScriptForm ignores Output)
-#   - Heavy SQL via ajax POST after shell paints
-#   - Prefer string concat over .format() for large HTML
+#   - Prefer model.DynamicData() for SQL params
+#   - Prefer token replace over .format() for large HTML (JS braces break format)
+#   - Never unicode(byte_string) with default encoding ('unknown' codec);
+#     use _s() / _json_out() for safe text + ASCII JSON (handles ö / 0xF6)
 
+import json
 import traceback
 
-SCRIPT_PATH = '/PyScriptForm/InvolvementCleanup'
-INVOLVEMENT_DASHBOARD_BASE = 'https://fcchudson.tpsdb.com/PyScriptForm/InvolvementDashboard'
+# Soft-set default encoding so implicit str<->unicode coercions don't use 'unknown'
+try:
+    import sys
+    reload(sys)
+    sys.setdefaultencoding('latin-1')
+except:
+    pass
 
-ORG_STATUS_ACTIVE = 30
-ORG_STATUS_INACTIVE = 40
-INACTIVE_DAYS = 90
-RECENT_ATTEND_DAYS = 30
-DORMANT_MEMBER_DAYS = 45
+REGISTRATION_FORM_TYPE = 26
+STATUS_COMPLETED = 2
 
-# Queues: (key, label, description)
-QUEUES = [
-    ('dormant', 'Dormant', 'Active involvements with no meetings or member activity in ~90 days'),
-    ('past_meeting', 'Last meeting in the past', 'Active involvements whose last meeting date is before today'),
-    ('past_regend', 'Registration end in the past', 'Active involvements with RegEnd before today'),
-    ('main_fellowship', 'Main Fellowship - no attendance (30d)', 'Active Bible Fellowship orgs with no qualifying attendance in 30 days'),
-    ('zero_members', 'Zero current members', 'Active involvements with MemberCount = 0'),
+# Overview question types: choice + text. Emergency/Parents only on person drill-down.
+# Money skipped for v1 (refine later). Other structural types skipped.
+QTYPE_TEXT = 1
+QTYPE_SINGLE = 2
+QTYPE_MULTI = 3
+QTYPE_DROPDOWN = 6
+QTYPE_EMERGENCY = 8
+QTYPE_PARENTS = 12
+QTYPE_MONEY = 11
+
+OVERVIEW_CHOICE_TYPES = (QTYPE_SINGLE, QTYPE_MULTI, QTYPE_DROPDOWN)
+OVERVIEW_TEXT_TYPES = (QTYPE_TEXT,)
+PERSON_EXTRA_TYPES = (QTYPE_EMERGENCY, QTYPE_PARENTS)
+
+SUBTYPE_MENU = 1
+
+
+def _is_hear_about_question(label):
+    """True when free-text Other answers should collapse into one Other group."""
+    lab = _s(label).lower()
+    return 'how did you hear' in lab
+
+
+def _allergy_text_meaningful(text):
+    """True only when MedicalDescription looks like a real allergy note."""
+    t = _s(text).lower()
+    if not t:
+        return False
+    t = ' '.join(t.split())
+    if not t:
+        return False
+    t_bare = t.rstrip('.,;:')
+    ignore = (
+        'none', 'n/a', 'na', 'n.a.', 'n.a', 'no', 'nope', '-', '--', '.',
+        'none known', 'no known', 'no known allergies', 'n/a.', 'nil',
+        'nothing', 'unknown', 'unk',
+        'nka', 'nkda', 'n.k.a', 'n.k.a.', 'n.k.d.a', 'n.k.d.a.',
+        'no allergies', 'no allergy', 'none listed', 'not applicable',
+    )
+    if t in ignore or t_bare in ignore:
+        return False
+    return True
+
+
+# Age brackets for Overview demographics (label -> inclusive min/max; None max = no upper bound)
+AGE_BRACKETS = [
+    ('0-5', 0, 5),
+    ('6-10', 6, 10),
+    ('11-13', 11, 13),
+    ('14-17', 14, 17),
+    ('18-24', 18, 24),
+    ('25-29', 25, 29),
+    ('30-39', 30, 39),
+    ('40-49', 40, 49),
+    ('50-64', 50, 64),
+    ('65+', 65, None),
 ]
+AGE_BRACKET_LABELS = [b[0] for b in AGE_BRACKETS] + ['Unknown']
+
+
+def _age_bracket_label(age):
+    """Map a numeric age to a bracket label."""
+    if age is None:
+        return 'Unknown'
+    try:
+        age = int(age)
+    except:
+        return 'Unknown'
+    for label, lo, hi in AGE_BRACKETS:
+        if hi is None:
+            if age >= lo:
+                return label
+        elif lo <= age <= hi:
+            return label
+    return 'Unknown'
+
+
+def _empty_age_groups():
+    groups = {}
+    for label in AGE_BRACKET_LABELS:
+        groups[label] = 0
+    return groups
+
+# ---------------------------------------------------------------------------
+# Program-specific Overview profiles
+# Edit this block to customize demographics by Program Id.
+# Anything not listed here uses DEFAULT_OVERVIEW_PROFILE.
+# ---------------------------------------------------------------------------
+DEFAULT_OVERVIEW_PROFILE = {
+    'show_age': True,
+    'show_grade': False,
+    'show_marital': True,
+    'show_enrollment_timeline': True,
+    # Future knobs (not wired yet — safe to set for later):
+    # 'show_gender_stats': True,
+    # 'show_finance': True,
+    # 'show_subgroups': True,
+}
+
+PROGRAM_OVERVIEW_PROFILES = {
+    # Next Generation
+    1112: {
+        'name': 'Next Generation',
+        'show_age': False,
+        'show_grade': True,
+        'show_marital': False,
+        'show_enrollment_timeline': True,
+    },
+    # Example for a future program:
+    # 9999: {
+    #     'name': 'Example Program',
+    #     'show_age': True,
+    #     'show_grade': False,
+    #     'show_marital': True,
+    #     'show_enrollment_timeline': True,
+    # },
+}
+
+
+def _overview_profile(program_id):
+    """Merge program overrides onto the default overview profile."""
+    profile = {}
+    for k, v in DEFAULT_OVERVIEW_PROFILE.items():
+        profile[k] = v
+    overrides = PROGRAM_OVERVIEW_PROFILES.get(_i(program_id), None)
+    if overrides:
+        for k, v in overrides.items():
+            if k != 'name':
+                profile[k] = v
+        profile['profile_name'] = _s(overrides.get('name'), '')
+    else:
+        profile['profile_name'] = ''
+    profile['program_id'] = _i(program_id)
+    return profile
 
 
 def _is_null(val):
@@ -60,13 +185,70 @@ def _is_null(val):
 
 
 def _s(val, default=''):
+    """
+    Convert any DB/CLR/byte value to a pure Python unicode string.
+    Avoids IronPython's default 'unknown' codec (byte 0xF6 = ö in cp1252/latin-1).
+    Never call bare unicode(bytes) or .decode() on a unicode string.
+    """
     if _is_null(val):
         return default
     try:
-        return unicode(val).strip()
-    except:
+        from System import String as NetString
+        from System.Text import Encoding
+
+        net = None
+
+        # True Python 2 byte string (not unicode / System.String)
         try:
-            return str(val).strip()
+            is_py_bytes = isinstance(val, str) and not isinstance(val, unicode)
+        except:
+            is_py_bytes = False
+
+        if is_py_bytes:
+            # latin-1 accepts every byte (0xF6 -> ö)
+            s = val.decode('latin-1').strip()
+        else:
+            # System.String / unicode / numbers / other CLR objects
+            try:
+                if isinstance(val, NetString):
+                    net = val
+                else:
+                    net = NetString.Format('{0}', val)
+            except:
+                try:
+                    net = NetString(val.ToString())
+                except:
+                    return default
+
+            if net is None:
+                return default
+
+            # Round-trip via UTF-8 bytes -> Python unicode (detaches from CLR quirks)
+            utf8 = Encoding.UTF8.GetBytes(net)
+            buf = []
+            i = 0
+            while i < utf8.Length:
+                buf.append(chr(utf8[i] & 0xFF))
+                i += 1
+            s = ''.join(buf).decode('utf-8').strip()
+
+        if s == '' or s == 'None' or s == 'null':
+            return default
+        return s
+    except:
+        # Last resort: keep only ASCII
+        try:
+            raw = repr(val)
+            out = []
+            for ch in raw:
+                try:
+                    o = ord(ch)
+                    if 32 <= o <= 126:
+                        out.append(chr(o))
+                except:
+                    pass
+            s = ''.join(out).strip()
+            return s if s else default
         except:
             return default
 
@@ -78,53 +260,190 @@ def _i(val, default=0):
     try:
         return int(s)
     except:
-        return default
-
-
-def _b(val):
-    s = _s(val).lower()
-    return s in ('1', 'true', 'yes', 'on')
-
-
-def _html(val):
-    s = _s(val)
-    return (s.replace('&', '&amp;')
-             .replace('<', '&lt;')
-             .replace('>', '&gt;')
-             .replace('"', '&quot;'))
-
-
-def _get(name, default=None):
-    try:
-        v = Data.GetValue(name)
-    except:
-        v = None
-    if _is_null(v):
-        return default
-    return v
-
-
-def _form_val(name, default=''):
-    v = _get(name, None)
-    if v is None:
-        return default
-    return _s(v, default)
+        try:
+            return int(float(s))
+        except:
+            return default
 
 
 def _dd():
     return model.DynamicData()
 
 
-def _fmt_dt(val):
-    if _is_null(val):
-        return ''
+def _data(name, default=None):
+    if hasattr(model.Data, name):
+        return getattr(model.Data, name)
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Org visibility (mirrors dbo.OrgSearch: LimitToRole + OrgLeadersOnly)
+# ---------------------------------------------------------------------------
+
+# Applied to queries that alias Organizations as o. Params: @userId, @pid, @olo
+_ORG_ACCESS_SQL = """
+  AND (
+        o.LimitToRole IS NULL
+        OR EXISTS (
+            SELECT NULL
+            FROM dbo.Roles r
+            INNER JOIN dbo.UserRole ur ON ur.RoleId = r.RoleId
+            WHERE ur.UserId = @userId
+              AND r.RoleName = o.LimitToRole
+        )
+      )
+  AND (
+        @olo = 0
+        OR EXISTS (
+            SELECT NULL
+            FROM (
+                SELECT om.OrganizationId AS OrgId
+                FROM dbo.OrganizationMembers om
+                WHERE om.PeopleId = @pid
+                UNION
+                SELECT o2.OrganizationId
+                FROM dbo.Organizations o2
+                WHERE o2.ParentOrgId IN (
+                    SELECT om.OrganizationId
+                    FROM dbo.OrganizationMembers om
+                    WHERE om.PeopleId = @pid
+                )
+                UNION
+                SELECT o3.OrganizationId
+                FROM dbo.Organizations o3
+                WHERE o3.ParentOrgId IN (
+                    SELECT o2.OrganizationId
+                    FROM dbo.Organizations o2
+                    WHERE o2.ParentOrgId IN (
+                        SELECT om.OrganizationId
+                        FROM dbo.OrganizationMembers om
+                        WHERE om.PeopleId = @pid
+                    )
+                )
+            ) allowed
+            WHERE allowed.OrgId = o.OrganizationId
+        )
+      )
+"""
+
+
+def _auth_context():
+    """Current user PeopleId / UserId and OrgLeadersOnly flag."""
+    pid = 0
     try:
-        return _s(val.ToString('M/d/yyyy'))
+        if model.UserPeopleId:
+            pid = int(model.UserPeopleId)
     except:
-        return _html(val)
+        pid = 0
+    olo = False
+    try:
+        olo = bool(model.UserIsInRole('OrgLeadersOnly'))
+    except:
+        olo = False
+    uid = 0
+    if pid > 0:
+        try:
+            p = _dd()
+            p.AddValue('pid', pid)
+            rows = list(q.QuerySql(
+                "SELECT TOP 1 UserId FROM dbo.Users WHERE PeopleId = @pid ORDER BY UserId",
+                p
+            ))
+            if rows:
+                uid = _i(rows[0].UserId, 0)
+        except:
+            uid = 0
+    return {
+        'people_id': pid,
+        'user_id': uid,
+        'olo': 1 if olo else 0,
+    }
+
+
+def _bind_org_access(params):
+    """Add @userId, @pid, @olo to a DynamicData param bag."""
+    auth = _auth_context()
+    params.AddValue('userId', auth['user_id'])
+    params.AddValue('pid', auth['people_id'])
+    params.AddValue('olo', auth['olo'])
+    return auth
+
+
+def _user_can_access_org(org_id):
+    """True if current user may see this involvement (OrgSearch rules)."""
+    org_id = _i(org_id, 0)
+    if org_id <= 0:
+        return False
+    auth = _auth_context()
+    if auth['people_id'] <= 0:
+        return False
+    sql = """
+SELECT TOP 1 o.OrganizationId
+FROM dbo.Organizations o
+WHERE o.OrganizationId = @orgId
+""" + _ORG_ACCESS_SQL
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    _bind_org_access(p)
+    try:
+        rows = list(q.QuerySql(sql, p))
+        return len(rows) > 0
+    except:
+        return False
+
+
+def _require_org_access(org_id):
+    """Return an error dict if access is denied; otherwise None."""
+    if _i(org_id, 0) <= 0:
+        return {'error': 'Invalid involvement'}
+    if not _user_can_access_org(org_id):
+        return {'error': 'You do not have access to this involvement.'}
+    return None
+
+
+def _json_safe(obj):
+    """Recursively coerce values to JSON-friendly Python types."""
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    try:
+        if isinstance(obj, (int, long)) and not isinstance(obj, bool):
+            return int(obj)
+        if isinstance(obj, float):
+            return float(obj)
+    except:
+        try:
+            if isinstance(obj, int) and not isinstance(obj, bool):
+                return int(obj)
+            if isinstance(obj, float):
+                return float(obj)
+        except:
+            pass
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[_s(k, u'')] = _json_safe(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    # CLR Decimal / numeric
+    try:
+        from System import Decimal as NetDecimal
+        if isinstance(obj, NetDecimal):
+            return float(obj)
+    except:
+        pass
+    try:
+        if not isinstance(obj, (str, unicode)):
+            return float(obj)
+    except:
+        pass
+    return _s(obj, u'')
 
 
 def _json_quote(s):
+    """Quote a string as ASCII-only JSON (\\uXXXX for non-ASCII)."""
     s = _s(s, u'')
     parts = ['"']
     for ch in s:
@@ -133,6 +452,10 @@ def _json_quote(s):
             parts.append('\\"')
         elif ch == u'\\':
             parts.append('\\\\')
+        elif ch == u'\b':
+            parts.append('\\b')
+        elif ch == u'\f':
+            parts.append('\\f')
         elif ch == u'\n':
             parts.append('\\n')
         elif ch == u'\r':
@@ -148,23 +471,41 @@ def _json_quote(s):
 
 
 def _json_dump(obj):
+    """Manual JSON serializer — avoids IronPython json.dumps codec issues."""
+    obj = _json_safe(obj)
+    return _json_dump_raw(obj)
+
+
+def _json_dump_raw(obj):
     if obj is None:
         return 'null'
     if obj is True:
         return 'true'
     if obj is False:
         return 'false'
-    if isinstance(obj, (int, long)) and not isinstance(obj, bool):
-        return str(int(obj))
+    try:
+        if isinstance(obj, (int, long)) and not isinstance(obj, bool):
+            return str(int(obj))
+    except:
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            return str(int(obj))
     if isinstance(obj, float):
+        # Ensure JSON-legal number formatting
+        try:
+            if obj != obj:  # NaN
+                return 'null'
+            if obj == float('inf') or obj == float('-inf'):
+                return 'null'
+        except:
+            pass
         return repr(float(obj))
     if isinstance(obj, dict):
         items = []
         for k, v in obj.items():
-            items.append(_json_quote(_s(k)) + ':' + _json_dump(v))
+            items.append(_json_quote(_s(k)) + ':' + _json_dump_raw(v))
         return '{' + ','.join(items) + '}'
     if isinstance(obj, (list, tuple)):
-        return '[' + ','.join([_json_dump(x) for x in obj]) + ']'
+        return '[' + ','.join([_json_dump_raw(x) for x in obj]) + ']'
     return _json_quote(_s(obj))
 
 
@@ -173,6 +514,7 @@ def _json_out(obj):
 
 
 def _err_out(e):
+    """Safe AJAX error payload (exception text can also contain non-ASCII)."""
     try:
         tb = _s(traceback.format_exc())
     except:
@@ -180,1548 +522,3800 @@ def _err_out(e):
     _json_out({'error': _s(e), 'traceback': tb})
 
 
-def _parse_org_ids():
-    raw = _form_val('org_ids')
+def _parse_answer(raw):
+    """Parse RegAnswer.AnswerValue (usually JSON string / array)."""
+    s = _s(raw)
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except:
+        return s
+
+
+def _answer_display(val, question_type_id, sub_type_id, options):
+    """Human-readable answer for text/export/person view."""
+    if val is None:
+        return ''
+    if question_type_id == QTYPE_EMERGENCY:
+        parts = _s(val).split('\n')
+        name = _s(parts[0] if parts else '')
+        phone = _s(parts[1] if len(parts) > 1 else '')
+        if name and phone:
+            return name + ' / ' + phone
+        return name or phone
+    if question_type_id == QTYPE_PARENTS:
+        parts = _s(val).split('\n')
+        mother = _s(parts[0] if parts else '')
+        father = _s(parts[1] if len(parts) > 1 else '')
+        bits = []
+        if mother:
+            bits.append('Mother: ' + mother)
+        if father:
+            bits.append('Father: ' + father)
+        return '; '.join(bits)
+    if sub_type_id == SUBTYPE_MENU and isinstance(val, list) and options:
+        bits = []
+        i = 0
+        while i < len(options) and i < len(val):
+            qty = _s(val[i])
+            if qty and qty != '0':
+                bits.append(_s(options[i].get('text'), 'Option') + ': ' + qty)
+            i += 1
+        return '; '.join(bits)
+    if isinstance(val, list):
+        return ', '.join([_s(x) for x in val if _s(x)])
+    return _s(val)
+
+
+def _is_blank_answer(val):
+    if val is None:
+        return True
+    if isinstance(val, list):
+        for x in val:
+            if _s(x) and _s(x) != '0':
+                return False
+        return True
+    s = _s(val)
+    if not s:
+        return True
+    # Emergency/Parents often store "null\nnull"
+    if s.replace('\n', '').replace('null', '').strip() == '':
+        return True
+    return False
+
+
+def _parse_options(options_json):
+    raw = _s(options_json)
+    if not raw:
+        return []
+    try:
+        opts = json.loads(raw)
+    except:
+        return []
+    result = []
+    if not isinstance(opts, list):
+        return result
+    for o in opts:
+        if not isinstance(o, dict):
+            continue
+        text = _s(o.get('text') or o.get('Text'))
+        value = _s(o.get('value') or o.get('Value') or text)
+        lookup = _s(o.get('lookup') or o.get('Lookup'))
+        result.append({
+            'text': text or value or lookup,
+            'value': value or text or lookup,
+            'lookup': lookup,
+            'other': bool(o.get('other') or o.get('Other')),
+        })
+    return result
+
+
+def _option_key(o):
+    """Unique option identity for counting.
+
+    When Save as SubGroup is on, option.value is the SubGroup name and can be
+    shared (e.g. 6th/7th/8th all value=Middle School). Prefer text, then lookup.
+    """
+    return _s(o.get('text')) or _s(o.get('lookup')) or _s(o.get('value'))
+
+
+def _choice_selected_values(parsed, options, sub_type_id):
+    """Return list of option keys this answer selected (for counting)."""
+    selected = []
+    if parsed is None:
+        return selected
+    if sub_type_id == SUBTYPE_MENU and isinstance(parsed, list):
+        i = 0
+        while i < len(options) and i < len(parsed):
+            qty = _s(parsed[i])
+            if qty and qty != '0':
+                selected.append(_option_key(options[i]))
+            i += 1
+        return selected
+
+    # Shared SubGroup values must not match every grade that uses that SubGroup
+    value_uses = {}
+    for o in options:
+        v = _s(o.get('value'))
+        if v:
+            value_uses[v] = value_uses.get(v, 0) + 1
+
+    opt_by_text = {}
+    opt_by_lookup = {}
+    opt_by_value = {}
+    for o in options:
+        key = _option_key(o)
+        t = _s(o.get('text'))
+        lk = _s(o.get('lookup'))
+        v = _s(o.get('value'))
+        if t:
+            opt_by_text[t] = key
+        if lk:
+            opt_by_lookup[lk] = key
+        # Only match on value when it uniquely identifies one option
+        if v and value_uses.get(v, 0) == 1:
+            opt_by_value[v] = key
+
+    values = parsed if isinstance(parsed, list) else [parsed]
+    for v in values:
+        sv = _s(v)
+        if not sv:
+            continue
+        if sv in opt_by_text:
+            selected.append(opt_by_text[sv])
+        elif sv in opt_by_lookup:
+            selected.append(opt_by_lookup[sv])
+        elif sv in opt_by_value:
+            selected.append(opt_by_value[sv])
+        else:
+            # Free-text "Other" or unmatched — count under raw value
+            selected.append(sv)
+    return selected
+
+
+def _org_meta(org_id):
+    sql = """
+SELECT o.OrganizationId, o.OrganizationName, o.RegistrationTypeId,
+       d.Name AS DivisionName, p.Name AS ProgramName
+FROM Organizations o
+LEFT JOIN Division d ON o.DivisionId = d.Id
+LEFT JOIN Program p ON d.ProgId = p.Id
+WHERE o.OrganizationId = @orgId
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _completed_registrants(org_id):
+    """Most recent completed RegPeople per PeopleId for the involvement."""
+    sql = """
+;WITH Ranked AS (
+    SELECT
+        rp.RegPeopleId,
+        rp.PeopleId,
+        rp.CompletedDate,
+        ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(rp.FirstName,'') + ' ' + ISNULL(rp.LastName,'')))) AS PersonName,
+        ROW_NUMBER() OVER (
+            PARTITION BY rp.PeopleId
+            ORDER BY rp.CompletedDate DESC, rp.RegPeopleId
+        ) AS rn
+    FROM dbo.RegPeople rp
+    INNER JOIN dbo.Registration r ON r.RegistrationId = rp.RegistrationId
+    LEFT JOIN dbo.People pe ON pe.PeopleId = rp.PeopleId
+    WHERE r.OrganizationId = @orgId
+      AND rp.Status = @status
+      AND rp.CompletedDate IS NOT NULL
+      AND rp.PeopleId IS NOT NULL
+)
+SELECT RegPeopleId, PeopleId, CompletedDate, PersonName
+FROM Ranked
+WHERE rn = 1
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('status', STATUS_COMPLETED)
+    return list(q.QuerySql(sql, p))
+
+
+def _questions_for_org(org_id):
+    sql = """
+SELECT RegQuestionId, [Order], Label, QuestionTypeId, QuestionSubTypeId,
+       IsRequired, IsDisabled, Options
+FROM dbo.RegQuestion
+WHERE OrganizationId = @orgId
+  AND ISNULL(IsDisabled, 0) = 0
+ORDER BY [Order], Label
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    return list(q.QuerySql(sql, p))
+
+
+def _answers_for_registrants(org_id, question_ids):
+    """All answers for completed registrants (most recent per person) for given questions."""
+    if not question_ids:
+        return []
+    # Build IN list of quoted guids (safe: from our own query)
+    id_list = ','.join(["'" + _s(qid).replace("'", "") + "'" for qid in question_ids])
+    sql = """
+;WITH Ranked AS (
+    SELECT
+        rp.RegPeopleId,
+        rp.PeopleId,
+        ROW_NUMBER() OVER (
+            PARTITION BY rp.PeopleId
+            ORDER BY rp.CompletedDate DESC, rp.RegPeopleId
+        ) AS rn
+    FROM dbo.RegPeople rp
+    INNER JOIN dbo.Registration r ON r.RegistrationId = rp.RegistrationId
+    WHERE r.OrganizationId = @orgId
+      AND rp.Status = @status
+      AND rp.CompletedDate IS NOT NULL
+      AND rp.PeopleId IS NOT NULL
+)
+SELECT ra.RegQuestionId, ra.RegPeopleId, ra.AnswerValue,
+       rk.PeopleId,
+       ISNULL(pe.Name2, '') AS PersonName
+FROM Ranked rk
+INNER JOIN dbo.RegAnswer ra ON ra.RegPeopleId = rk.RegPeopleId
+LEFT JOIN dbo.People pe ON pe.PeopleId = rk.PeopleId
+WHERE rk.rn = 1
+  AND ra.RegQuestionId IN ({0})
+""".format(id_list)
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('status', STATUS_COMPLETED)
+    return list(q.QuerySql(sql, p))
+
+
+def _build_registration_summary(org_id):
+    org = _org_meta(org_id)
+    if not org:
+        return {'error': 'Organization not found'}
+
+    reg_type = _i(org.RegistrationTypeId, 0)
+    if reg_type != REGISTRATION_FORM_TYPE:
+        return {
+            'is_registration_form': False,
+            'org_name': _s(org.OrganizationName),
+            'message': 'This involvement is not using the new Registration Form architecture. Registration question summaries are only available for Registration Form involvements.',
+            'questions': [],
+            'completed_count': 0,
+            'empty': True,
+        }
+
+    registrants = _completed_registrants(org_id)
+    completed_count = len(registrants)
+    questions = _questions_for_org(org_id)
+
+    overview_qs = []
+    for qrow in questions:
+        qt = _i(qrow.QuestionTypeId, 0)
+        if qt in OVERVIEW_CHOICE_TYPES or qt in OVERVIEW_TEXT_TYPES:
+            overview_qs.append(qrow)
+        # Money and structural types intentionally skipped
+
+    if not overview_qs:
+        return {
+            'is_registration_form': True,
+            'org_name': _s(org.OrganizationName),
+            'completed_count': completed_count,
+            'questions': [],
+            'empty': True,
+            'message': 'No registration questions are configured for this involvement yet.',
+        }
+
+    qids = [_s(qrow.RegQuestionId) for qrow in overview_qs]
+    answers = _answers_for_registrants(org_id, qids)
+
+    # Index answers by question
+    by_q = {}
+    for a in answers:
+        qid = _s(a.RegQuestionId)
+        if qid not in by_q:
+            by_q[qid] = []
+        by_q[qid].append(a)
+
+    result_questions = []
+
+    for qrow in overview_qs:
+        qid = _s(qrow.RegQuestionId)
+        qt = _i(qrow.QuestionTypeId, 0)
+        st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
+        label = _s(qrow.Label, '(Untitled question)')
+        options = _parse_options(qrow.Options)
+        q_answers = by_q.get(qid, [])
+
+        answered_people = set()
+        blank_count = 0
+        parsed_by_person = []
+
+        # Map RegPeopleId -> answer for this question
+        ans_by_rp = {}
+        for a in q_answers:
+            ans_by_rp[_s(a.RegPeopleId)] = a
+
+        for reg in registrants:
+            rp_id = _s(reg.RegPeopleId)
+            a = ans_by_rp.get(rp_id)
+            parsed = _parse_answer(a.AnswerValue) if a else None
+            if _is_blank_answer(parsed):
+                blank_count += 1
+            else:
+                answered_people.add(_i(reg.PeopleId))
+                parsed_by_person.append({
+                    'people_id': _i(reg.PeopleId),
+                    'name': _s(reg.PersonName),
+                    'parsed': parsed,
+                    'raw_display': _answer_display(parsed, qt, st, options),
+                })
+
+        answered_count = len(answered_people)
+        # blank_count already counts registrants with no/blank answer
+        item = {
+            'id': qid,
+            'label': label,
+            'type_id': qt,
+            'sub_type_id': st,
+            'answered': answered_count,
+            'blank': blank_count,
+        }
+
+        if qt in OVERVIEW_CHOICE_TYPES:
+            item['kind'] = 'choice'
+            counts = {}
+            for o in options:
+                counts[_option_key(o)] = 0
+            other_counts = {}
+            for row in parsed_by_person:
+                for sel in _choice_selected_values(row['parsed'], options, st):
+                    if sel in counts:
+                        counts[sel] += 1
+                    else:
+                        other_counts[sel] = other_counts.get(sel, 0) + 1
+            opt_out = []
+            # Only "How did you hear..." collapses free-text / Other into one group.
+            # Grade and similar dropdowns list each answer as its own bar.
+            collapse_other = _is_hear_about_question(label)
+            other_variants = []
+            other_total = 0
+            for o in options:
+                key = _option_key(o)
+                c = counts.get(key, 0)
+                pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
+                if collapse_other and o.get('other'):
+                    if c > 0:
+                        other_variants.append({
+                            'value': key,
+                            'text': o['text'],
+                            'count': c,
+                            'pct': pct,
+                        })
+                        other_total += c
+                    continue
+                opt_out.append({
+                    'value': key,
+                    'text': o['text'],
+                    'count': c,
+                    'pct': pct,
+                })
+            for ov, c in sorted(other_counts.items(), key=lambda x: (-x[1], x[0])):
+                pct = int(round((100.0 * c / answered_count), 0)) if answered_count else 0
+                if collapse_other:
+                    other_variants.append({
+                        'value': ov,
+                        'text': ov + ' (other)',
+                        'count': c,
+                        'pct': pct,
+                    })
+                    other_total += c
+                else:
+                    opt_out.append({
+                        'value': ov,
+                        'text': ov,
+                        'count': c,
+                        'pct': pct,
+                    })
+            if collapse_other and other_variants:
+                other_pct = int(round((100.0 * other_total / answered_count), 0)) if answered_count else 0
+                opt_out.append({
+                    'value': '__other__',
+                    'text': 'Other',
+                    'count': other_total,
+                    'pct': other_pct,
+                    'is_other_group': True,
+                    'variant_count': len(other_variants),
+                    'variants': other_variants,
+                })
+            item['options'] = opt_out
+        else:
+            item['kind'] = 'text'
+            previews = []
+            for row in parsed_by_person[:5]:
+                disp = row['raw_display']
+                if len(disp) > 80:
+                    disp = disp[:77] + '...'
+                previews.append(disp)
+            item['preview'] = previews
+
+        result_questions.append(item)
+
+    empty = completed_count == 0 or (
+        sum([qitem['answered'] for qitem in result_questions]) == 0
+        and len(result_questions) > 0
+        and all(qitem['answered'] == 0 for qitem in result_questions)
+    )
+
+    return {
+        'is_registration_form': True,
+        'org_name': _s(org.OrganizationName),
+        'completed_count': completed_count,
+        'questions': result_questions,
+        'empty': empty and len(result_questions) == 0,
+        'message': (
+            'No completed registration answers yet.'
+            if completed_count == 0 or all(qitem['answered'] == 0 for qitem in result_questions)
+            else ''
+        ),
+    }
+
+
+def _get_option_people(org_id, question_id, option_value):
+    questions = _questions_for_org(org_id)
+    qrow = None
+    for q in questions:
+        if _s(q.RegQuestionId) == _s(question_id):
+            qrow = q
+            break
+    if not qrow:
+        return {'error': 'Question not found'}
+
+    qt = _i(qrow.QuestionTypeId, 0)
+    st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
+    options = _parse_options(qrow.Options)
+    registrants = _completed_registrants(org_id)
+    answers = _answers_for_registrants(org_id, [_s(question_id)])
+    ans_by_rp = {}
+    for a in answers:
+        ans_by_rp[_s(a.RegPeopleId)] = a
+
+    target = _s(option_value)
+    configured_other = {}
+    known_keys = {}
+    for o in options:
+        key = _option_key(o)
+        known_keys[key] = True
+        if o.get('other'):
+            configured_other[key] = True
+
+    people = []
+    for reg in registrants:
+        a = ans_by_rp.get(_s(reg.RegPeopleId))
+        parsed = _parse_answer(a.AnswerValue) if a else None
+        if _is_blank_answer(parsed):
+            continue
+        selected = _choice_selected_values(parsed, options, st)
+        match = False
+        if target == '__other__':
+            for sel in selected:
+                if sel in configured_other or sel not in known_keys:
+                    match = True
+                    break
+        elif target in selected:
+            match = True
+        if match:
+            people.append({
+                'people_id': _i(reg.PeopleId),
+                'name': _s(reg.PersonName),
+                'answer': _answer_display(parsed, qt, st, options),
+            })
+    return {
+        'question_id': _s(question_id),
+        'question_label': _s(qrow.Label),
+        'option_value': target,
+        'people': people,
+    }
+
+
+def _get_allergy_people(org_id):
+    """Org members with a real allergy note on RecReg (default allergies list)."""
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    ISNULL(rr.MedicalDescription, '') AS AllergyText
+FROM OrganizationMembers om
+INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+LEFT JOIN RecReg rr ON rr.PeopleId = pe.PeopleId
+WHERE om.OrganizationId = @orgId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        allergy = _s(r.AllergyText)
+        if not _allergy_text_meaningful(allergy):
+            continue
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName),
+            'allergy': allergy,
+        })
+    return {
+        'count': len(people),
+        'people': people,
+    }
+
+
+def _get_registration_excel_url(org_id):
+    """
+    Build the standard Involvement Registration Report (Excel) URL.
+    Uses OrgMembersQuery (same people set as the org toolbar export).
+    """
+    org = _org_meta(org_id)
+    if not org:
+        return {'error': 'Organization not found'}
+    if _i(org.RegistrationTypeId, 0) != REGISTRATION_FORM_TYPE:
+        return {'error': 'Registration Excel export is only for Registration Form involvements.'}
+
+    # Prog/Div for MemberTypeCodes clause
+    meta_sql = """
+SELECT o.OrganizationId, ISNULL(o.DivisionId, 0) AS DivisionId, ISNULL(d.ProgId, 0) AS ProgId
+FROM Organizations o
+LEFT JOIN Division d ON d.Id = o.DivisionId
+WHERE o.OrganizationId = @orgId
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    meta_rows = list(q.QuerySql(meta_sql, p))
+    if not meta_rows:
+        return {'error': 'Organization not found'}
+    prog_id = _i(meta_rows[0].ProgId, 0)
+    div_id = _i(meta_rows[0].DivisionId, 0)
+
+    mt_rows = list(q.QuerySql("SELECT Description FROM lookup.MemberType WHERE Description IS NOT NULL AND LTRIM(RTRIM(Description)) <> ''"))
+    mt_names = []
+    for r in mt_rows:
+        name = _s(r.Description)
+        if name:
+            mt_names.append(name)
+    if not mt_names:
+        return {'error': 'No member types found to build the registration export.'}
+    member_types = ','.join(mt_names)
+
+    try:
+        qid = model.OrgMembersQuery(prog_id, div_id, org_id, member_types)
+    except Exception, e:
+        return {'error': 'Could not build registration export query: ' + _s(e)}
+
+    qid_s = _s(qid)
+    if not qid_s:
+        return {'error': 'Could not build registration export query.'}
+
+    return {
+        'ok': True,
+        'url': '/Reports/RegistrationExcel/' + qid_s + '?oid=' + str(org_id),
+        'filename': 'Registrations.xlsx',
+    }
+
+
+def _get_text_answers(org_id, question_id):
+    questions = _questions_for_org(org_id)
+    qrow = None
+    for q in questions:
+        if _s(q.RegQuestionId) == _s(question_id):
+            qrow = q
+            break
+    if not qrow:
+        return {'error': 'Question not found'}
+
+    qt = _i(qrow.QuestionTypeId, 0)
+    st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
+    options = _parse_options(qrow.Options)
+    registrants = _completed_registrants(org_id)
+    answers = _answers_for_registrants(org_id, [_s(question_id)])
+    ans_by_rp = {}
+    for a in answers:
+        ans_by_rp[_s(a.RegPeopleId)] = a
+
+    rows = []
+    blank_people = []
+    for reg in registrants:
+        a = ans_by_rp.get(_s(reg.RegPeopleId))
+        parsed = _parse_answer(a.AnswerValue) if a else None
+        person = {
+            'people_id': _i(reg.PeopleId),
+            'name': _s(reg.PersonName),
+            'answer': _answer_display(parsed, qt, st, options),
+        }
+        if _is_blank_answer(parsed):
+            blank_people.append(person)
+        else:
+            rows.append(person)
+    return {
+        'question_id': _s(question_id),
+        'question_label': _s(qrow.Label),
+        'kind': 'text',
+        'answered_people': rows,
+        'blank_people': blank_people,
+    }
+
+
+def _get_person_answers(org_id, people_id):
+    org = _org_meta(org_id)
+    if not org:
+        return {'error': 'Organization not found'}
+
+    registrants = _completed_registrants(org_id)
+    reg = None
+    for r in registrants:
+        if _i(r.PeopleId) == people_id:
+            reg = r
+            break
+    if not reg:
+        return {'error': 'No completed registration found for this person'}
+
+    questions = _questions_for_org(org_id)
+    # Include overview types + emergency/parents for person view; skip other structural
+    show_types = OVERVIEW_CHOICE_TYPES + OVERVIEW_TEXT_TYPES + PERSON_EXTRA_TYPES
+    visible = [q for q in questions if _i(q.QuestionTypeId, 0) in show_types]
+    qids = [_s(q.RegQuestionId) for q in visible]
+    answers = _answers_for_registrants(org_id, qids)
+    ans_by_q = {}
+    for a in answers:
+        if _s(a.RegPeopleId) == _s(reg.RegPeopleId):
+            ans_by_q[_s(a.RegQuestionId)] = a
+
+    items = []
+    for qrow in visible:
+        qid = _s(qrow.RegQuestionId)
+        qt = _i(qrow.QuestionTypeId, 0)
+        st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
+        options = _parse_options(qrow.Options)
+        a = ans_by_q.get(qid)
+        parsed = _parse_answer(a.AnswerValue) if a else None
+        items.append({
+            'question_id': qid,
+            'label': _s(qrow.Label, '(Untitled)'),
+            'type_id': qt,
+            'answer': _answer_display(parsed, qt, st, options) if not _is_blank_answer(parsed) else '',
+            'blank': _is_blank_answer(parsed),
+        })
+
+    return {
+        'people_id': people_id,
+        'name': _s(reg.PersonName),
+        'profile_url': '/Person2/' + str(people_id),
+        'answers': items,
+    }
+
+
+def _get_age_people(org_id, bracket):
+    """People in an involvement whose age falls in the given bracket label."""
+    bracket = _s(bracket)
+    if bracket not in AGE_BRACKET_LABELS:
+        return {'error': 'Invalid age bracket'}
+
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    CASE
+        WHEN pe.BirthYear IS NOT NULL AND pe.BirthMonth IS NOT NULL AND pe.BirthDay IS NOT NULL
+        THEN DATEDIFF(year, DATEFROMPARTS(pe.BirthYear, pe.BirthMonth, pe.BirthDay), GETDATE())
+        ELSE NULL
+    END AS Age
+FROM OrganizationMembers om
+INNER JOIN People pe ON om.PeopleId = pe.PeopleId
+WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        age = r.Age if hasattr(r, 'Age') and not _is_null(r.Age) else None
+        try:
+            age_i = int(age) if age is not None else None
+        except:
+            age_i = None
+        if _age_bracket_label(age_i) != bracket:
+            continue
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName, '(Unknown)'),
+            'age': age_i,
+        })
+    return {
+        'bracket': bracket,
+        'label': bracket,
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _member_grade_label(row):
+    """Same grade label logic as Overview grade distribution."""
+    label = _s(row.GradeLabel, 'Unknown') if hasattr(row, 'GradeLabel') else 'Unknown'
+    if not label or label.lower() == 'unknown':
+        return 'Unknown'
+    return label
+
+
+def _get_grade_people(org_id, grade):
+    """People in an involvement whose grade label matches (org grade, else person grade).
+    Includes gender so the Next Gen UI can filter grade + gender together.
+    """
+    grade = _s(grade, 'Unknown') or 'Unknown'
+
+    sql = """
+SELECT
+    pe.PeopleId,
+    pe.GenderId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    COALESCE(
+        NULLIF(LTRIM(RTRIM(gl_om.Description)), ''),
+        NULLIF(LTRIM(RTRIM(gl_pe.Description)), ''),
+        'Unknown'
+    ) AS GradeLabel
+FROM OrganizationMembers om
+INNER JOIN People pe ON om.PeopleId = pe.PeopleId
+LEFT JOIN lookup.GradeLevel gl_pe ON pe.GradeLevelId = gl_pe.Id
+LEFT JOIN lookup.GradeLevel gl_om ON om.GradeLevelId = gl_om.Id
+WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    male_count = 0
+    female_count = 0
+    for r in rows:
+        label = _member_grade_label(r)
+        if label != grade:
+            continue
+        gid = _i(r.GenderId, 0) if hasattr(r, 'GenderId') and not _is_null(r.GenderId) else 0
+        if gid == 1:
+            gender = 'male'
+            male_count += 1
+        elif gid == 2:
+            gender = 'female'
+            female_count += 1
+        else:
+            gender = 'unknown'
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName, '(Unknown)'),
+            'grade': label,
+            'gender': gender,
+        })
+    return {
+        'grade': grade,
+        'label': grade,
+        'people': people,
+        'count': len(people),
+        'male_count': male_count,
+        'female_count': female_count,
+    }
+
+
+def _get_gender_people(org_id, gender):
+    """People in an involvement by gender: male (1) or female (2)."""
+    gender = _s(gender).lower()
+    if gender == 'male':
+        gender_id = 1
+        label = 'Male'
+    elif gender == 'female':
+        gender_id = 2
+        label = 'Female'
+    else:
+        return {'error': 'Invalid gender'}
+
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName
+FROM OrganizationMembers om
+INNER JOIN People pe ON om.PeopleId = pe.PeopleId
+WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
+  AND pe.GenderId = @genderId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('genderId', gender_id)
+    rows = list(q.QuerySql(sql, p))
+    people = [{
+        'people_id': _i(r.PeopleId),
+        'name': _s(r.PersonName, '(Unknown)'),
+    } for r in rows]
+    return {
+        'gender': gender,
+        'label': label,
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _get_marital_people(org_id, status):
+    """People in an involvement with the given marital status label."""
+    status = _s(status, 'Unknown')
+    if not status:
+        status = 'Unknown'
+
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    ISNULL(NULLIF(LTRIM(RTRIM(ms.Description)), ''), 'Unknown') AS MaritalStatus
+FROM OrganizationMembers om
+INNER JOIN People pe ON om.PeopleId = pe.PeopleId
+LEFT JOIN lookup.MaritalStatus ms ON pe.MaritalStatusId = ms.Id
+WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        row_status = _s(r.MaritalStatus, 'Unknown') if hasattr(r, 'MaritalStatus') else 'Unknown'
+        if not row_status:
+            row_status = 'Unknown'
+        if row_status != status:
+            continue
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName, '(Unknown)'),
+            'marital_status': row_status,
+        })
+    return {
+        'status': status,
+        'label': status,
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _get_subgroup_people(org_id, subgroup_id):
+    """People tagged into a specific involvement subgroup (MemberTag)."""
+    subgroup_id = _i(subgroup_id, 0)
+    if subgroup_id <= 0:
+        return {'error': 'Invalid subgroup'}
+
+    name_sql = """
+SELECT TOP 1 mt.Name AS SubgroupName
+FROM MemberTags mt
+WHERE mt.Id = @tagId
+  AND mt.OrgId = @orgId
+"""
+    p0 = _dd()
+    p0.AddValue('tagId', subgroup_id)
+    p0.AddValue('orgId', org_id)
+    name_rows = list(q.QuerySql(name_sql, p0))
+    if not name_rows:
+        return {'error': 'Subgroup not found'}
+    subgroup_name = _s(name_rows[0].SubgroupName, 'Subgroup')
+
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName
+FROM OrgMemMemTags omt
+INNER JOIN People pe ON omt.PeopleId = pe.PeopleId
+WHERE omt.OrgId = @orgId
+  AND omt.MemberTagId = @tagId
+  AND pe.IsDeceased = 0
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('tagId', subgroup_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName, '(Unknown)'),
+        })
+    return {
+        'subgroup_id': subgroup_id,
+        'label': subgroup_name,
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _parse_people_ids(raw):
+    """Parse a comma-separated PeopleId list into unique positive ints."""
     ids = []
     seen = {}
-    for part in raw.replace(';', ',').split(','):
-        oid = _i(part, 0)
-        if oid > 0 and oid not in seen:
-            seen[oid] = 1
-            ids.append(oid)
+    for part in _s(raw).replace(';', ',').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            pid = int(part)
+        except:
+            continue
+        if pid > 0 and pid not in seen:
+            seen[pid] = True
+            ids.append(pid)
     return ids
 
 
-def _dashboard_url(org_id):
-    return INVOLVEMENT_DASHBOARD_BASE + '?org_id=' + str(_i(org_id))
+def _add_people_to_tag(people_ids_raw, tag_name, clear_first):
+    """
+    Add people to a personal tag owned by the current user.
+    clear_first: empty the tag before adding (vs append).
+    """
+    owner_id = model.UserPeopleId
+    if not owner_id:
+        return {'error': 'You must be signed in to add people to a tag.'}
 
+    tag_name = _s(tag_name).replace('!', '_').strip()
+    if not tag_name:
+        return {'error': 'Tag name is required.'}
+    if len(tag_name) > 50:
+        return {'error': 'Tag name is too long (max 50 characters).'}
 
-def _org_link(org_id, name):
-    return ('<a href="/Org/' + str(_i(org_id)) + '" target="_blank" rel="noopener noreferrer">'
-            + _html(name) + '</a>')
+    people_ids = _parse_people_ids(people_ids_raw)
+    if not people_ids:
+        return {'error': 'No people to add to the tag.'}
 
+    clear = False
+    clear_s = _s(clear_first).lower()
+    if clear_s in ('1', 'true', 'yes', 'clear'):
+        clear = True
 
-def _dash_icon(org_id):
-    url = _html(_dashboard_url(org_id))
-    return ('<a class="ic-icon-btn" href="' + url + '" target="_blank" rel="noopener noreferrer" '
-            'title="Open Involvement Dashboard"><i class="fa fa-dashboard"></i></a>')
+    # peopleids='1,2,3' is accepted by PeopleQuery2 / AddTag
+    query = "peopleids='" + ','.join([str(pid) for pid in people_ids]) + "'"
+    model.AddTag(query, tag_name, int(owner_id), clear)
 
-
-def _mobile_badge(allow):
-    if _i(allow, 0) == 1 or allow is True or _s(allow).lower() == 'true':
-        return '<span class="ic-badge ic-badge-on" title="Allow Mobile View">Mobile</span>'
-    return '<span class="ic-badge ic-badge-off" title="Mobile view off">-</span>'
-
-
-# ---------------------------------------------------------------------------
-# Lookups
-# ---------------------------------------------------------------------------
-
-def _lookup_programs():
-    sql = """
-SELECT p.Id, p.Name
-FROM dbo.Program p
-ORDER BY p.Name
-"""
-    rows = []
-    for r in q.QuerySql(sql):
-        rows.append({'id': _i(r.Id), 'name': _s(r.Name)})
-    return rows
-
-
-def _lookup_divisions(prog_id=0):
-    sql = """
-SELECT d.Id, d.Name, pd.ProgId
-FROM dbo.Division d
-LEFT JOIN dbo.ProgDiv pd ON pd.DivId = d.Id
-WHERE (@progId = 0 OR pd.ProgId = @progId)
-ORDER BY d.Name
-"""
-    p = _dd()
-    p.AddValue('progId', str(_i(prog_id, 0)))
-    rows = []
-    for r in q.QuerySql(sql, p):
-        rows.append({'id': _i(r.Id), 'name': _s(r.Name), 'prog_id': _i(r.ProgId)})
-    return rows
-
-
-def _lookup_org_types():
-    sql = """
-SELECT Id, Description
-FROM lookup.OrganizationType
-ORDER BY Description
-"""
-    rows = [{'id': 0, 'name': '(none)'}]
-    for r in q.QuerySql(sql):
-        rows.append({'id': _i(r.Id), 'name': _s(r.Description)})
-    return rows
-
-
-def _lookup_mobile_categories():
-    sql = """
-SELECT Id, Description
-FROM lookup.CategoryMobile
-ORDER BY Description
-"""
-    rows = [{'id': 0, 'name': '(none)'}]
     try:
-        for r in q.QuerySql(sql):
-            rows.append({'id': _i(r.Id), 'name': _s(r.Description)})
+        import urllib
+        tag_q = urllib.quote(tag_name.encode('utf-8'))
     except:
-        pass
-    return rows
+        tag_q = tag_name.replace(' ', '%20')
 
-
-# ---------------------------------------------------------------------------
-# Queue / structure queries
-# ---------------------------------------------------------------------------
-
-def _base_select():
-    return """
-SELECT
-    o.OrganizationId AS OrgId,
-    o.OrganizationName AS Organization,
-    o.OrganizationStatusId AS OrgStatusId,
-    CASE WHEN o.OrganizationStatusId = 30 THEN 'Active' ELSE 'Inactive' END AS OrgStatus,
-    o.MemberCount AS Members,
-    o.DivisionId AS MainDivId,
-    d.Name AS Division,
-    p.Id AS ProgId,
-    p.Name AS Program,
-    o.OrganizationTypeId AS OrgTypeId,
-    ot.Description AS OrgType,
-    ISNULL(o.AllowMobileView, 0) AS AllowMobileView,
-    o.CategoryMobileId AS CategoryMobileId,
-    cm.Description AS MobileCategory,
-    o.LastMeetingDate,
-    o.RegEnd,
-    o.CreatedDate,
-    o.IsBibleFellowshipOrg
-"""
-
-
-def _base_from():
-    return """
-FROM dbo.Organizations o
-LEFT JOIN dbo.Division d ON d.Id = o.DivisionId
-OUTER APPLY (
-    SELECT TOP 1 p2.Id, p2.Name
-    FROM dbo.ProgDiv pd2
-    JOIN dbo.Program p2 ON p2.Id = pd2.ProgId
-    WHERE pd2.DivId = d.Id
-    ORDER BY p2.Name
-) p
-LEFT JOIN lookup.OrganizationType ot ON ot.Id = o.OrganizationTypeId
-LEFT JOIN lookup.CategoryMobile cm ON cm.Id = o.CategoryMobileId
-"""
-
-
-def _row_dict(r):
     return {
-        'org_id': _i(r.OrgId),
-        'name': _s(r.Organization),
-        'status': _s(r.OrgStatus),
-        'status_id': _i(r.OrgStatusId),
-        'members': _i(r.Members),
-        'prog_id': _i(r.ProgId),
-        'program': _s(r.Program),
-        'div_id': _i(r.MainDivId),
-        'division': _s(r.Division),
-        'org_type_id': _i(r.OrgTypeId),
-        'org_type': _s(r.OrgType),
-        'allow_mobile': _i(r.AllowMobileView),
-        'category_id': _i(r.CategoryMobileId),
-        'mobile_category': _s(r.MobileCategory),
-        'last_meeting': _fmt_dt(r.LastMeetingDate),
-        'reg_end': _fmt_dt(r.RegEnd),
-        'created': _fmt_dt(r.CreatedDate),
+        'ok': True,
+        'tag_name': tag_name,
+        'count': len(people_ids),
+        'cleared': clear,
+        'tag_url': '/Tags?tag=' + tag_q,
     }
 
 
-def _run_queue(queue_key, prog_id=0, div_id=0, include_inactive=False):
-    queue_key = _s(queue_key) or 'dormant'
-    p = _dd()
-    p.AddValue('progId', str(_i(prog_id, 0)))
-    p.AddValue('divId', str(_i(div_id, 0)))
-    p.AddValue('inactiveDays', str(INACTIVE_DAYS))
-    p.AddValue('attendDays', str(RECENT_ATTEND_DAYS))
-    p.AddValue('memberDays', str(DORMANT_MEMBER_DAYS))
-
-    prog_filter = ' AND (@progId = 0 OR p.Id = CAST(@progId AS int)) '
-    div_filter = ' AND (@divId = 0 OR o.DivisionId = CAST(@divId AS int)) '
-
-    if queue_key == 'dormant':
-        sql = _base_select() + _base_from() + """
-WHERE o.OrganizationStatusId = 30
-""" + prog_filter + div_filter + """
-  AND (
-        o.LastMeetingDate IS NULL
-        OR o.LastMeetingDate < DATEADD(day, -CAST(@inactiveDays AS int), GETDATE())
-      )
-  AND NOT EXISTS (
-        SELECT 1 FROM dbo.OrganizationMembers om
-        WHERE om.OrganizationId = o.OrganizationId
-          AND (
-                om.EnrollmentDate >= DATEADD(day, -CAST(@memberDays AS int), GETDATE())
-                OR (om.InactiveDate IS NOT NULL
-                    AND om.InactiveDate >= DATEADD(day, -CAST(@memberDays AS int), GETDATE()))
-              )
-      )
-ORDER BY o.OrganizationName
-"""
-    elif queue_key == 'past_meeting':
-        sql = _base_select() + _base_from() + """
-WHERE o.OrganizationStatusId = 30
-""" + prog_filter + div_filter + """
-  AND o.LastMeetingDate IS NOT NULL
-  AND o.LastMeetingDate < CAST(GETDATE() AS date)
-ORDER BY o.LastMeetingDate, o.OrganizationName
-"""
-    elif queue_key == 'past_regend':
-        sql = _base_select() + _base_from() + """
-WHERE o.OrganizationStatusId = 30
-""" + prog_filter + div_filter + """
-  AND o.RegEnd IS NOT NULL
-  AND o.RegEnd < GETDATE()
-ORDER BY o.RegEnd, o.OrganizationName
-"""
-    elif queue_key == 'main_fellowship':
-        sql = _base_select() + _base_from() + """
-WHERE o.OrganizationStatusId = 30
-  AND ISNULL(o.IsBibleFellowshipOrg, 0) = 1
-""" + prog_filter + div_filter + """
-  AND NOT EXISTS (
-        SELECT 1 FROM dbo.Meetings m
-        WHERE m.OrganizationId = o.OrganizationId
-          AND m.MeetingDate > DATEADD(day, -CAST(@attendDays AS int), GETDATE())
-          AND m.MeetingDate < GETDATE()
-          AND m.NumPresent > 3
-      )
-ORDER BY o.OrganizationName
-"""
-    elif queue_key == 'zero_members':
-        sql = _base_select() + _base_from() + """
-WHERE o.OrganizationStatusId = 30
-""" + prog_filter + div_filter + """
-  AND ISNULL(o.MemberCount, 0) = 0
-ORDER BY o.OrganizationName
-"""
-    elif queue_key == 'manage':
-        # flat browse for bulk Manage tab
-        inactive_sql = '' if include_inactive else ' AND o.OrganizationStatusId = 30 '
-        sql = _base_select() + _base_from() + """
-WHERE 1=1
-""" + inactive_sql + prog_filter + div_filter + """
-ORDER BY p.Name, d.Name, o.OrganizationName
-"""
-    else:
-        inactive_sql = ' AND o.OrganizationStatusId = 30 '
-        sql = _base_select() + _base_from() + """
-WHERE 1=0
-""" + inactive_sql + prog_filter + div_filter + """
-ORDER BY o.OrganizationName
-"""
-
-    rows = []
-    for r in q.QuerySql(sql, p):
-        rows.append(_row_dict(r))
-    return rows
-
-
-
-def _tree_where(include_inactive=False):
-    where = ['1=1']
-    if not include_inactive:
-        where.append("os.OrgStatus = 'Active'")
-    where.append('(@progId = 0 OR os.ProgId = CAST(@progId AS int))')
-    where.append('(@divId = 0 OR os.DivId = CAST(@divId AS int))')
-    where.append("(@createdAfter = '' OR o.CreatedDate >= CAST(@createdAfter AS datetime))")
-    return ' AND '.join(where)
-
-
-def _tree_params(prog_id=0, div_id=0, created_after=''):
-    p = _dd()
-    p.AddValue('progId', str(_i(prog_id, 0)))
-    p.AddValue('divId', str(_i(div_id, 0)))
-    p.AddValue('createdAfter', _s(created_after))
-    return p
-
-
-def _tree_row_dict(r, related_divs=''):
-    return {
-        'prog_id': _i(r.ProgId),
-        'program': _s(r.Program),
-        'div_id': _i(r.DivId),
-        'division': _s(r.Division),
-        'org_id': _i(r.OrgId),
-        'name': _s(r.Organization),
-        'status': _s(r.OrgStatus),
-        'members': _i(r.Members),
-        'previous': _i(r.Previous),
-        'visitors': _i(r.Visitors),
-        'meetings': _i(r.Meetings),
-        'org_type': _s(r.OrgType),
-        'created': _fmt_dt(r.CreatedDate),
-        'related_divs': _s(related_divs),
-    }
-
-
-def _run_tree(prog_id=0, div_id=0, include_inactive=False, created_after=''):
-    """Nested ministry structure rows from OrganizationStructure (+ related divs)."""
-    p = _tree_params(prog_id, div_id, created_after)
-    where_sql = _tree_where(include_inactive)
-    # Prefer related-div aggregation; fall back if STUFF/FOR XML fails on this SQL host.
-    sql_related = (
-        "SELECT "
-        "os.ProgId, os.Program, os.DivId, os.Division, os.OrgId, os.Organization, "
-        "os.OrgStatus, os.Members, os.Previous, os.Vistors AS Visitors, os.Meetings, "
-        "ot.Description AS OrgType, o.CreatedDate, "
-        "STUFF(( "
-        "  SELECT '|' + CAST(d2.Id AS varchar(20)) + ':' + REPLACE(d2.Name, '|', '/') "
-        "  FROM dbo.DivOrg do2 "
-        "  JOIN dbo.Division d2 ON d2.Id = do2.DivId "
-        "  WHERE do2.OrgId = os.OrgId AND d2.Id <> os.DivId "
-        "  FOR XML PATH(''), TYPE "
-        ").value('.', 'nvarchar(max)'), 1, 1, '') AS RelatedDivs "
-        "FROM dbo.OrganizationStructure os "
-        "INNER JOIN dbo.Organizations o ON o.OrganizationId = os.OrgId "
-        "LEFT JOIN lookup.OrganizationType ot ON ot.Id = o.OrganizationTypeId "
-        "WHERE " + where_sql + " "
-        "ORDER BY os.Program, os.Division, os.Organization"
-    )
-    sql_basic = (
-        "SELECT "
-        "os.ProgId, os.Program, os.DivId, os.Division, os.OrgId, os.Organization, "
-        "os.OrgStatus, os.Members, os.Previous, os.Vistors AS Visitors, os.Meetings, "
-        "ot.Description AS OrgType, o.CreatedDate "
-        "FROM dbo.OrganizationStructure os "
-        "INNER JOIN dbo.Organizations o ON o.OrganizationId = os.OrgId "
-        "LEFT JOIN lookup.OrganizationType ot ON ot.Id = o.OrganizationTypeId "
-        "WHERE " + where_sql + " "
-        "ORDER BY os.Program, os.Division, os.Organization"
-    )
-    rows = []
-    try:
-        for r in q.QuerySql(sql_related, p):
-            rows.append(_tree_row_dict(r, _s(r.RelatedDivs)))
-    except:
-        rows = []
-        for r in q.QuerySql(sql_basic, p):
-            rows.append(_tree_row_dict(r, ''))
-    return rows
-
-
-def _summary_from_tree_rows(rows):
+def _get_finance_people(org_id, status):
     """
-    Build Structure tile totals from the same rows used for the tree.
-    Counts programs/divisions/involvements distinctly; member metrics are
-    summed once per OrgId (OrganizationStructure can repeat an org under
-    multiple divisions).
+    People linked to payment groups (Amt>0) for an involvement.
+    status: 'paid_in_full' (balance <= 0) or 'remaining_balance' (balance > 0)
+
+    Performance notes:
+    - Filters to OrgId first, then only groups with Amt>0 and matching balance.
+    - Prefers TransactionPeople; LoginPeopleId only when a group has no TP rows.
+    - No role checks here — speed is SQL shape / data volume, not roles.
     """
-    progs = {}
-    divs = {}
-    orgs = {}
-    for r in rows or []:
-        pid = _i(r.get('prog_id'))
-        did = _i(r.get('div_id'))
-        oid = _i(r.get('org_id'))
-        if pid > 0:
-            progs[pid] = 1
-        if did > 0:
-            divs[did] = 1
-        if oid > 0 and oid not in orgs:
-            orgs[oid] = r
-    members = 0
-    previous = 0
-    visitors = 0
-    meetings = 0
-    active = 0
-    for oid, r in orgs.items():
-        members += _i(r.get('members'))
-        previous += _i(r.get('previous'))
-        visitors += _i(r.get('visitors'))
-        meetings += _i(r.get('meetings'))
-        if _s(r.get('status')) == 'Active':
-            active += 1
-    return {
-        'programs': len(progs),
-        'divisions': len(divs),
-        'involvements': len(orgs),
-        'active': active,
-        'members': members,
-        'previous': previous,
-        'visitors': visitors,
-        'meetings': meetings,
-    }
+    status = _s(status)
+    if status not in ('paid_in_full', 'remaining_balance'):
+        return {'error': 'Invalid finance status'}
 
-
-def _org_warnings(org_ids):
-    """Warn-but-allow signals for selected orgs."""
-    if not org_ids:
-        return []
-    # Build safe IN list from ints only
-    in_list = ','.join([str(_i(x)) for x in org_ids if _i(x) > 0])
-    if not in_list:
-        return []
+    # Leaner query: one OrgId scan, early group filter, avoid triple UNION + CTE self-refs
     sql = """
+;WITH TranBase AS (
+    SELECT
+        t.Id,
+        ISNULL(t.OriginalId, t.Id) AS GroupId,
+        ISNULL(t.Amt, 0) AS Amt,
+        ISNULL(t.Amtdue, 0) AS Amtdue,
+        t.TransactionDate,
+        t.LoginPeopleId
+    FROM dbo.[Transaction] t WITH (NOLOCK)
+    WHERE t.OrgId = @orgId
+),
+GroupTotals AS (
+    SELECT GroupId, SUM(Amt) AS GroupPaid
+    FROM TranBase
+    GROUP BY GroupId
+    HAVING SUM(Amt) > 0
+),
+GroupBalance AS (
+    SELECT
+        g.GroupId,
+        g.GroupPaid,
+        b.BalanceDue
+    FROM GroupTotals g
+    CROSS APPLY (
+        SELECT TOP (1) tb.Amtdue AS BalanceDue
+        FROM TranBase tb
+        WHERE tb.GroupId = g.GroupId
+        ORDER BY tb.TransactionDate DESC, tb.Id DESC
+    ) b
+    WHERE (
+        (@status = 'paid_in_full' AND b.BalanceDue <= 0)
+        OR (@status = 'remaining_balance' AND b.BalanceDue > 0)
+    )
+),
+LinkedPeople AS (
+    SELECT
+        gb.GroupId,
+        gb.GroupPaid,
+        gb.BalanceDue,
+        tp.PeopleId
+    FROM GroupBalance gb
+    INNER JOIN TranBase tb ON tb.GroupId = gb.GroupId
+    INNER JOIN dbo.TransactionPeople tp WITH (NOLOCK) ON tp.Id = tb.Id
+
+    UNION
+
+    SELECT
+        gb.GroupId,
+        gb.GroupPaid,
+        gb.BalanceDue,
+        tb.LoginPeopleId AS PeopleId
+    FROM GroupBalance gb
+    INNER JOIN TranBase tb ON tb.GroupId = gb.GroupId
+    WHERE tb.LoginPeopleId IS NOT NULL
+      AND NOT EXISTS (
+            SELECT 1
+            FROM TranBase tb2
+            INNER JOIN dbo.TransactionPeople tp2 WITH (NOLOCK) ON tp2.Id = tb2.Id
+            WHERE tb2.GroupId = gb.GroupId
+        )
+)
 SELECT
-    o.OrganizationId AS OrgId,
-    o.OrganizationName AS Organization,
-    ISNULL(o.MemberCount, 0) AS Members,
-    CASE WHEN EXISTS (
-        SELECT 1 FROM dbo.Meetings m
-        WHERE m.OrganizationId = o.OrganizationId AND m.MeetingDate > GETDATE()
-    ) THEN 1 ELSE 0 END AS HasFutureMeetings,
-    CASE WHEN ISNULL(o.RegistrationTypeId, 0) > 0
-              AND (o.RegEnd IS NULL OR o.RegEnd > GETDATE())
-              AND ISNULL(o.RegistrationClosed, 0) = 0
-         THEN 1 ELSE 0 END AS OpenRegistration
-FROM dbo.Organizations o
-WHERE o.OrganizationId IN (""" + in_list + """)
+    lp.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName, '') + ' ' + ISNULL(pe.LastName, '')))) AS PersonName,
+    MAX(lp.GroupPaid) AS TotalPaid,
+    MAX(lp.BalanceDue) AS BalanceDue
+FROM LinkedPeople lp
+INNER JOIN dbo.People pe WITH (NOLOCK) ON pe.PeopleId = lp.PeopleId
+GROUP BY
+    lp.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName, '') + ' ' + ISNULL(pe.LastName, ''))))
+ORDER BY PersonName
 """
-    out = []
-    for r in q.QuerySql(sql):
-        notes = []
-        if _i(r.Members) > 0:
-            notes.append(str(_i(r.Members)) + ' current members')
-        if _i(r.HasFutureMeetings) == 1:
-            notes.append('future meetings')
-        if _i(r.OpenRegistration) == 1:
-            notes.append('open registration')
-        out.append({
-            'org_id': _i(r.OrgId),
-            'name': _s(r.Organization),
-            'warnings': notes,
-        })
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Server-side helpers for writes (Special Content only)
-# Status/type/category/divisions are applied in the browser via existing
-# TouchPoint endpoints. Python only drops members and reports DivOrg membership.
-# ---------------------------------------------------------------------------
-
-def _action_drop_members(org_ids):
-    """Drop current members to Previous via model.DropOrgMember (built-in)."""
-    results = []
-    for oid in org_ids:
-        item = {'org_id': oid, 'ok': False, 'message': '', 'dropped': 0}
-        try:
-            p = _dd()
-            p.AddValue('orgid', str(oid))
-            sql = '''
-SELECT om.PeopleId
-FROM dbo.OrganizationMembers om
-WHERE om.OrganizationId = @orgid
-  AND om.InactiveDate IS NULL
-'''
-            rows = list(q.QuerySql(sql, p))
-            n = 0
-            for r in rows:
-                pid = _i(r.PeopleId)
-                if pid <= 0:
-                    continue
-                model.DropOrgMember(pid, oid)
-                n += 1
-            item['ok'] = True
-            item['dropped'] = n
-            item['message'] = 'Dropped ' + str(n) + ' to Previous'
-        except Exception, ex:
-            item['message'] = _s(ex)
-        results.append(item)
-    return results
-
-
-def _div_membership(org_ids, div_id):
-    """Return which orgs already have DivOrg for div_id (for ToggleTag add/remove)."""
-    out = []
-    if not org_ids or div_id <= 0:
-        return out
-    safe_ids = []
-    for i in org_ids:
-        n = _i(i)
-        if n > 0:
-            safe_ids.append(str(n))
-    if not safe_ids:
-        return out
-    id_list = ','.join(safe_ids)
     p = _dd()
-    p.AddValue('divid', str(div_id))
-    sql = '''
-SELECT o.OrganizationId AS OrgId,
-       CASE WHEN EXISTS (
-           SELECT 1 FROM dbo.DivOrg d
-           WHERE d.OrgId = o.OrganizationId AND d.DivId = @divid
-       ) THEN 1 ELSE 0 END AS HasDiv
-FROM dbo.Organizations o
-WHERE o.OrganizationId IN ({0})
-'''.format(id_list)
-    for r in q.QuerySql(sql, p):
-        out.append({
-            'org_id': _i(r.OrgId),
-            'has': _i(r.HasDiv) == 1,
-        })
-    return out
-
-
-def _related_divisions(org_ids):
-    """
-    For each org, list DivOrg rows that are not the main division
-    (Organizations.DivisionId). Used to strip related/non-main divisions.
-    """
-    by_org = {}
-    safe_ids = []
-    for i in org_ids:
-        n = _i(i)
-        if n > 0 and n not in by_org:
-            by_org[n] = {'org_id': n, 'main_div_id': 0, 'related': []}
-            safe_ids.append(str(n))
-    if not safe_ids:
-        return []
-    id_list = ','.join(safe_ids)
-    sql = '''
-SELECT
-    o.OrganizationId AS OrgId,
-    ISNULL(o.DivisionId, 0) AS MainDivId,
-    d.DivId AS RelatedDivId
-FROM dbo.Organizations o
-LEFT JOIN dbo.DivOrg d
-    ON d.OrgId = o.OrganizationId
-   AND ISNULL(o.DivisionId, 0) > 0
-   AND d.DivId <> o.DivisionId
-WHERE o.OrganizationId IN ({0})
-ORDER BY o.OrganizationId, d.DivId
-'''.format(id_list)
-    for r in q.QuerySql(sql):
-        oid = _i(r.OrgId)
-        if oid not in by_org:
+    p.AddValue('orgId', org_id)
+    p.AddValue('status', status)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        pid = _i(r.PeopleId, 0) if hasattr(r, 'PeopleId') and not _is_null(r.PeopleId) else 0
+        if pid <= 0:
             continue
-        by_org[oid]['main_div_id'] = _i(r.MainDivId)
-        rid = _i(r.RelatedDivId)
-        if rid > 0 and rid not in by_org[oid]['related']:
-            by_org[oid]['related'].append(rid)
-    out = []
-    for oid in sorted(by_org.keys()):
-        out.append(by_org[oid])
-    return out
-
-
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
-
-def _css():
-    return '''
-.ic-root {
-    display: block !important;
-    color: #1e293b !important;
-    max-width: 1280px;
-    margin: 0 auto;
-    padding: 20px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #f5f5f5 !important;
-    box-sizing: border-box;
-}
-.ic-root .dashboard-header {
-    background: #19283B;
-    color: white !important;
-    padding: 18px 24px 20px;
-    border-radius: 12px;
-    margin: 0 auto 16px auto;
-    box-shadow: 0 4px 15px rgba(1, 43, 88, 0.35);
-    text-align: center;
-    max-width: 720px;
-}
-.ic-root .dashboard-header h1 {
-    margin: 0 0 6px 0;
-    font-size: 26px;
-    font-weight: 700;
-    color: white !important;
-}
-.ic-root .dashboard-header .header-sub {
-    margin: 0;
-    font-size: 13px;
-    opacity: 0.9;
-    color: white !important;
-}
-.ic-card {
-    background: white !important;
-    padding: 18px 20px;
-    border-radius: 12px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    margin-bottom: 14px;
-    color: #1e293b !important;
-}
-.ic-card-title {
-    font-size: 18px;
-    font-weight: 600;
-    margin: 0 0 8px 0;
-}
-.ic-meta { font-size: 13px; color: #64748b !important; margin: 0 0 12px 0; }
-.ic-tabs { text-align: center; margin: 0 0 14px 0; }
-.ic-tab {
-    display: inline-block;
-    border: 1px solid #e2e8f0;
-    background: white;
-    color: #475569 !important;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-weight: 600;
-    font-size: 13px;
-    text-decoration: none !important;
-    margin: 2px;
-    cursor: pointer;
-}
-.ic-tab.active {
-    border-color: #19283B;
-    background: #19283B;
-    color: white !important;
-}
-.ic-filters .form-group {
-    display: inline-block;
-    vertical-align: top;
-    margin: 0 10px 10px 0;
-}
-.ic-filters label {
-    display: block;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    color: #64748b;
-    margin-bottom: 4px;
-}
-.ic-filters select, .ic-filters input {
-    min-width: 160px;
-    padding: 6px 8px;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-}
-.ic-actions {
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    padding: 12px;
-    margin: 0 0 12px 0;
-}
-.ic-actions .btn-primary, .ic-actions .btn-secondary {
-    display: inline-block;
-    margin: 0 6px 6px 0;
-    text-decoration: none !important;
-    border-radius: 8px;
-    padding: 8px 12px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-}
-.ic-actions .btn-primary { background: #19283B; color: #fff !important; }
-.ic-actions .btn-secondary {
-    background: white;
-    color: #19283B !important;
-    border: 2px solid #e2e8f0;
-}
-.ic-actions .btn-secondary:hover { border-color: #6699ea; color: #6699ea !important; }
-.ic-root .people-table {
-    width: 100%;
-    border-collapse: collapse;
-    background: white !important;
-}
-.ic-root .people-table th, .ic-root .people-table td {
-    text-align: left;
-    padding: 8px 10px;
-    border-bottom: 1px solid #e2e8f0;
-    vertical-align: middle;
-    font-size: 13px;
-}
-.ic-root .people-table th {
-    color: #64748b !important;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-}
-.ic-root .people-table a {
-    color: #19283B !important;
-    font-weight: 600;
-    text-decoration: none;
-}
-.ic-root .people-table a:hover { color: #6699ea !important; text-decoration: underline; }
-.ic-root .people-table tbody tr:hover { background: #f8fafc; }
-.ic-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 11px;
-    font-weight: 700;
-}
-.ic-badge-on { background: #dcfce7; color: #166534; }
-.ic-badge-off { background: #f1f5f9; color: #94a3b8; }
-.ic-icon-btn {
-    display: inline-block;
-    width: 28px;
-    height: 28px;
-    line-height: 28px;
-    text-align: center;
-    border-radius: 6px;
-    border: 1px solid #e2e8f0;
-    color: #19283B !important;
-    text-decoration: none !important;
-}
-.ic-icon-btn:hover { border-color: #6699ea; color: #6699ea !important; }
-.ic-modal-overlay {
-    display: none;
-    position: fixed;
-    z-index: 10000;
-    left: 0; top: 0; right: 0; bottom: 0;
-    background: rgba(15, 23, 42, 0.45);
-}
-.ic-modal-overlay.visible { display: block; }
-.ic-modal {
-    background: white;
-    max-width: 560px;
-    margin: 60px auto;
-    padding: 22px 24px;
-    border-radius: 12px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-}
-.ic-modal h3 { margin: 0 0 10px 0; }
-.ic-warn {
-    background: #fff7ed;
-    border: 1px solid #fdba74;
-    color: #9a3412;
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 13px;
-    margin: 10px 0;
-}
-.ic-empty { color: #64748b; padding: 20px; text-align: center; }
-
-.ic-stats {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin: 0 0 14px 0;
-}
-.ic-stat {
-    flex: 1;
-    min-width: 90px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    padding: 12px 10px;
-    text-align: center;
-}
-.ic-stat .n {
-    font-size: 22px;
-    font-weight: 700;
-    color: #19283B;
-    line-height: 1.1;
-}
-.ic-stat .l {
-    margin-top: 4px;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    color: #64748b;
-}
-.ic-tree-wrap { overflow: auto; }
-.ic-tree-table { width: 100%; border-collapse: collapse; background: white !important; }
-.ic-tree-table th, .ic-tree-table td {
-    padding: 8px 10px;
-    border-bottom: 1px solid #e2e8f0;
-    font-size: 13px;
-    vertical-align: middle;
-}
-.ic-tree-table th {
-    text-align: left;
-    color: #64748b !important;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    background: #f8fafc;
-}
-.ic-tree-table .num { text-align: center; }
-.ic-prog-row { background: #e8eef7; font-weight: 700; cursor: pointer; }
-.ic-div-row { background: #f0f5fa; cursor: pointer; display: none; }
-.ic-org-row { display: none; }
-.ic-org-row.inactive { background: #fff1f2; color: #94a3b8; }
-.ic-toggle {
-    display: inline-block;
-    width: 18px;
-    text-align: center;
-    font-weight: 700;
-    margin-right: 4px;
-    color: #19283B;
-}
-.ic-related { font-size: 12px; color: #64748b; }
-.ic-related a { color: #6699ea !important; text-decoration: none; }
-.ic-related a:hover { text-decoration: underline; }
-.ic-highlight { animation: ic-hl 2s ease-in-out; }
-@keyframes ic-hl {
-    0% { background-color: #fef9c3; }
-    100% { background-color: transparent; }
-}
-.ic-pad-div { padding-left: 28px !important; }
-.ic-pad-org { padding-left: 56px !important; }
-'''
-
-
-def _options_html(items, selected=0):
-    html = ''
-    for it in items:
-        sel = ' selected="selected"' if _i(it.get('id')) == _i(selected) else ''
-        html += '<option value="' + str(_i(it.get('id'))) + '"' + sel + '>'
-        html += _html(it.get('name')) + '</option>'
-    return html
-
-
-def _queue_options_html():
-    html = ''
-    for key, label, desc in QUEUES:
-        html += '<option value="' + _html(key) + '">' + _html(label) + '</option>'
-    return html
-
-
-def _page():
-    programs = _lookup_programs()
-    divisions = _lookup_divisions(0)
-    org_types = _lookup_org_types()
-    categories = _lookup_mobile_categories()
-
-    html = '<style>' + _css() + '</style>'
-    html += '<div class="ic-root">'
-    html += '<div class="dashboard-header">'
-    html += '<h1>Involvement Cleanup</h1>'
-    html += '<p class="header-sub">Browse ministry structure, work cleanup lists, and manage '
-    html += 'involvements in bulk. Admin only. Writes use your TouchPoint session.</p>'
-    html += '</div>'
-
-    html += '<div class="ic-tabs">'
-    html += '<a class="ic-tab active" data-tab="structure" href="#">Structure</a>'
-    html += '<a class="ic-tab" data-tab="cleanup" href="#">Clean Up</a>'
-    html += '<a class="ic-tab" data-tab="manage" href="#">Manage</a>'
-    html += '</div>'
-
-    html += '<div class="ic-card" id="ic-filters-card">'
-    html += '<div class="ic-card-title">Filters</div>'
-    html += '<div class="ic-filters form-inline">'
-    html += '<div class="form-group" id="ic-queue-wrap" style="display:none"><label>Queue</label>'
-    html += '<select id="ic-queue">' + _queue_options_html() + '</select></div>'
-    html += '<div class="form-group"><label>Program</label>'
-    html += '<select id="ic-prog"><option value="0">All programs</option>'
-    html += _options_html(programs) + '</select></div>'
-    html += '<div class="form-group"><label>Division</label>'
-    html += '<select id="ic-div"><option value="0">All divisions</option>'
-    html += _options_html(divisions) + '</select></div>'
-    html += '<div class="form-group" id="ic-created-wrap"><label>Created after</label>'
-    html += '<input type="date" id="ic-created-after" /></div>'
-    html += '<div class="form-group" id="ic-inactive-wrap"><label>Include inactive</label>'
-    html += '<select id="ic-include-inactive"><option value="0">Active only</option>'
-    html += '<option value="1">Active + inactive</option></select></div>'
-    html += '<div class="form-group"><label>&nbsp;</label>'
-    html += '<button type="button" class="btn-primary" id="ic-load" style="background:#19283B;color:#fff;'
-    html += 'border:none;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer">Load</button></div>'
-    html += '</div></div>'
-
-    html += '<div id="ic-stats" class="ic-stats" style="display:none"></div>'
-
-    html += '<div class="ic-card" id="ic-actions-card" style="display:none">'
-    html += '<div class="ic-card-title">Actions</div>'
-    html += '<p class="ic-meta">Select rows, then choose an action. Every write asks for confirmation. '
-    html += 'Writes use your TouchPoint session (Org / OrgSearch endpoints); drops use DropOrgMember. '
-    html += 'Warnings are shown but do not block.</p>'
-    html += '<div class="ic-actions">'
-    html += '<button type="button" class="btn-primary" data-action="mark_inactive">Mark inactive</button>'
-    html += '<button type="button" class="btn-secondary" data-action="set_main_division">Set main division</button>'
-    html += '<button type="button" class="btn-secondary" data-action="add_division">Add related division</button>'
-    html += '<button type="button" class="btn-secondary" data-action="remove_division">Remove related division</button>'
-    html += '<button type="button" class="btn-secondary" data-action="remove_all_related">Remove all related divisions</button>'
-    html += '<button type="button" class="btn-secondary" data-action="set_type">Change type</button>'
-    html += '<button type="button" class="btn-secondary" data-action="set_category">Set mobile category</button>'
-    html += '<button type="button" class="btn-secondary" id="ic-select-all">Select all</button>'
-    html += '<button type="button" class="btn-secondary" id="ic-clear">Clear</button>'
-    html += '</div>'
-    html += '<div id="ic-result" class="ic-meta"></div>'
-    html += '</div>'
-
-    html += '<div class="ic-card">'
-    html += '<div class="ic-card-title" id="ic-list-title">Structure</div>'
-    html += '<p class="ic-meta" id="ic-list-meta">Expand programs and divisions to browse involvements.</p>'
-    html += '<div id="ic-table-wrap"><div class="ic-empty">Loading...</div></div>'
-    html += '</div>'
-    html += '</div>'
-
-    # Modal
-    html += '<div class="ic-modal-overlay" id="ic-modal">'
-    html += '<div class="ic-modal">'
-    html += '<h3 id="ic-modal-title">Confirm</h3>'
-    html += '<div id="ic-modal-body"></div>'
-    html += '<div style="margin-top:16px;text-align:right">'
-    html += '<button type="button" class="btn-secondary" id="ic-modal-cancel" '
-    html += 'style="margin-right:8px;background:#fff;border:2px solid #e2e8f0;border-radius:8px;'
-    html += 'padding:8px 14px;font-weight:600;cursor:pointer">Cancel</button>'
-    html += '<button type="button" class="btn-primary" id="ic-modal-ok" '
-    html += 'style="background:#19283B;color:#fff;border:none;border-radius:8px;'
-    html += 'padding:8px 14px;font-weight:600;cursor:pointer">Confirm</button>'
-    html += '</div></div></div>'
-
-    look = {
-        'divisions': divisions,
-        'org_types': org_types,
-        'categories': categories,
+        people.append({
+            'people_id': pid,
+            'name': _s(r.PersonName, '(Unknown)'),
+            'total_paid': float(r.TotalPaid) if hasattr(r, 'TotalPaid') and r.TotalPaid else 0,
+            'balance_due': float(r.BalanceDue) if hasattr(r, 'BalanceDue') and r.BalanceDue else 0,
+        })
+    label = 'Paid in Full' if status == 'paid_in_full' else 'Remaining Balance'
+    return {
+        'status': status,
+        'label': label,
+        'people': people,
+        'count': len(people),
     }
-    look_json = _json_dump(look)
-
-    html += '<script>\n'
-    html += '(function() {\n'
-    html += '  var scriptUrl = window.location.pathname;\n'
-    html += '  var lookups = ' + look_json + ';\n'
-    html += '  var currentTab = "structure";\n'
-    html += '  var pendingAction = null;\n'
-    html += '  function esc(s) {\n'
-    html += '    return String(s == null ? "" : s)\n'
-    html += '      .replace(/&/g, "&amp;").replace(/</g, "&lt;")\n'
-    html += '      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");\n'
-    html += '  }\n'
-    html += '  function selectedIds() {\n'
-    html += '    var ids = [];\n'
-    html += '    var boxes = document.querySelectorAll(".ic-cb:checked");\n'
-    html += '    for (var i = 0; i < boxes.length; i++) ids.push(boxes[i].value);\n'
-    html += '    return ids;\n'
-    html += '  }\n'
-    html += '  function setResult(msg) {\n'
-    html += '    var el = document.getElementById("ic-result");\n'
-    html += '    if (el) el.innerHTML = msg || "";\n'
-    html += '  }\n'
-    html += '  function refreshDivOptions() {\n'
-    html += '    var prog = document.getElementById("ic-prog").value || "0";\n'
-    html += '    var sel = document.getElementById("ic-div");\n'
-    html += '    var cur = sel.value;\n'
-    html += '    var h = "<option value=\\"0\\">All divisions</option>";\n'
-    html += '    for (var i = 0; i < lookups.divisions.length; i++) {\n'
-    html += '      var d = lookups.divisions[i];\n'
-    html += '      if (prog !== "0" && String(d.prog_id) !== String(prog)) continue;\n'
-    html += '      h += "<option value=\\"" + d.id + "\\">" + esc(d.name) + "</option>";\n'
-    html += '    }\n'
-    html += '    sel.innerHTML = h;\n'
-    html += '    var found = false;\n'
-    html += '    for (var j = 0; j < sel.options.length; j++) {\n'
-    html += '      if (sel.options[j].value === cur) { found = true; break; }\n'
-    html += '    }\n'
-    html += '    sel.value = found ? cur : "0";\n'
-    html += '  }\n'
-    html += '  function renderRows(rows) {\n'
-    html += '    var wrap = document.getElementById("ic-table-wrap");\n'
-    html += '    var meta = document.getElementById("ic-list-meta");\n'
-    html += '    if (!rows || !rows.length) {\n'
-    html += '      wrap.innerHTML = "<div class=\\"ic-empty\\">No matching involvements.</div>";\n'
-    html += '      if (meta) meta.textContent = "0 involvements";\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (meta) meta.textContent = rows.length + " involvement(s)";\n'
-    html += '    var h = "<table class=\\"people-table\\"><thead><tr>";\n'
-    html += '    h += "<th></th><th></th><th>Involvement</th><th>Program</th><th>Division</th>";\n'
-    html += '    h += "<th>Type</th><th>Mobile</th><th>Category</th><th>Members</th>";\n'
-    html += '    h += "<th>Last meeting</th><th>Reg end</th><th>Status</th></tr></thead><tbody>";\n'
-    html += '    for (var i = 0; i < rows.length; i++) {\n'
-    html += '      var r = rows[i];\n'
-    html += '      var dash = "' + _html(INVOLVEMENT_DASHBOARD_BASE) + '?org_id=" + r.org_id;\n'
-    html += '      h += "<tr>";\n'
-    html += '      h += "<td><input type=\\"checkbox\\" class=\\"ic-cb\\" value=\\"" + r.org_id + "\\" /></td>";\n'
-    html += '      h += "<td><a class=\\"ic-icon-btn\\" href=\\"" + esc(dash) + "\\" target=\\"_blank\\" rel=\\"noopener noreferrer\\" title=\\"Involvement Dashboard\\"><i class=\\"fa fa-dashboard\\"></i></a></td>";\n'
-    html += '      h += "<td><a href=\\"/Org/" + r.org_id + "\\" target=\\"_blank\\" rel=\\"noopener noreferrer\\">" + esc(r.name) + "</a>";\n'
-    html += '      h += " <span class=\\"ic-meta\\">(" + r.org_id + ")</span></td>";\n'
-    html += '      h += "<td>" + esc(r.program || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.division || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.org_type || "") + "</td>";\n'
-    html += '      h += "<td>" + (r.allow_mobile ? "<span class=\\"ic-badge ic-badge-on\\">Mobile</span>" : "<span class=\\"ic-badge ic-badge-off\\">-</span>") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.mobile_category || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.members) + "</td>";\n'
-    html += '      h += "<td>" + esc(r.last_meeting || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.reg_end || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.status || "") + "</td>";\n'
-    html += '      h += "</tr>";\n'
-    html += '    }\n'
-    html += '    h += "</tbody></table>";\n'
-    html += '    wrap.innerHTML = h;\n'
-    html += '  }\n'
-    html += '  function renderStats(s) {\n'
-    html += '    var el = document.getElementById("ic-stats");\n'
-    html += '    if (!el || !s) { if (el) el.style.display = "none"; return; }\n'
-    html += '    var items = [\n'
-    html += '      ["Programs", s.programs], ["Divisions", s.divisions], ["Total Inv", s.involvements],\n'
-    html += '      ["Active Inv", s.active], ["Members", s.members], ["Previous", s.previous],\n'
-    html += '      ["Visitors", s.visitors], ["Meetings", s.meetings]\n'
-    html += '    ];\n'
-    html += '    var h = "";\n'
-    html += '    for (var i = 0; i < items.length; i++) {\n'
-    html += '      h += "<div class=\\"ic-stat\\"><div class=\\"n\\">" + esc(items[i][1]) + "</div>";\n'
-    html += '      h += "<div class=\\"l\\">" + esc(items[i][0]) + "</div></div>";\n'
-    html += '    }\n'
-    html += '    el.innerHTML = h;\n'
-    html += '    el.style.display = "flex";\n'
-    html += '  }\n'
-    html += '  function parseRelated(related, currentDivId) {\n'
-    html += '    if (!related) return "";\n'
-    html += '    var parts = String(related).split("|");\n'
-    html += '    var links = [];\n'
-    html += '    for (var i = 0; i < parts.length; i++) {\n'
-    html += '      if (!parts[i]) continue;\n'
-    html += '      var idx = parts[i].indexOf(":");\n'
-    html += '      if (idx < 0) continue;\n'
-    html += '      var did = parts[i].substring(0, idx);\n'
-    html += '      var dname = parts[i].substring(idx + 1);\n'
-    html += '      if (String(did) === String(currentDivId)) continue;\n'
-    html += '      links.push("<a href=\\"#\\" data-hl-div=\\"" + esc(did) + "\\">" + esc(dname) + "</a>");\n'
-    html += '    }\n'
-    html += '    if (!links.length) return "";\n'
-    html += '    return "<span class=\\"ic-related\\">Also in: " + links.join(", ") + "</span>";\n'
-    html += '  }\n'
-    html += '  function toggleChildren(elementId, type) {\n'
-    html += '    var element = document.getElementById(elementId);\n'
-    html += '    if (!element) return;\n'
-    html += '    var icon = element.querySelector(".ic-toggle");\n'
-    html += '    var children = document.getElementsByClassName(elementId);\n'
-    html += '    var isExpanded = icon && icon.getAttribute("data-open") === "1";\n'
-    html += '    if (isExpanded) {\n'
-    html += '      if (icon) { icon.innerHTML = "+"; icon.setAttribute("data-open", "0"); }\n'
-    html += '      for (var i = 0; i < children.length; i++) {\n'
-    html += '        children[i].style.display = "none";\n'
-    html += '        if (type === "program") {\n'
-    html += '          var divId = children[i].id;\n'
-    html += '          var divChildren = document.getElementsByClassName(divId);\n'
-    html += '          var divIcon = children[i].querySelector(".ic-toggle");\n'
-    html += '          if (divIcon) { divIcon.innerHTML = "+"; divIcon.setAttribute("data-open", "0"); }\n'
-    html += '          for (var j = 0; j < divChildren.length; j++) divChildren[j].style.display = "none";\n'
-    html += '        }\n'
-    html += '      }\n'
-    html += '    } else {\n'
-    html += '      if (icon) { icon.innerHTML = "-"; icon.setAttribute("data-open", "1"); }\n'
-    html += '      for (var k = 0; k < children.length; k++) children[k].style.display = "table-row";\n'
-    html += '    }\n'
-    html += '  }\n'
-    html += '  function highlightDivision(divId) {\n'
-    html += '    var divisionElement = document.getElementById("div_" + divId);\n'
-    html += '    if (!divisionElement) return false;\n'
-    html += '    var classes = divisionElement.className.split(" ");\n'
-    html += '    var programClass = null;\n'
-    html += '    for (var i = 0; i < classes.length; i++) {\n'
-    html += '      if (classes[i].indexOf("prog_") === 0) { programClass = classes[i]; break; }\n'
-    html += '    }\n'
-    html += '    if (programClass) {\n'
-    html += '      var programElement = document.getElementById(programClass);\n'
-    html += '      if (programElement) {\n'
-    html += '        var programIcon = programElement.querySelector(".ic-toggle");\n'
-    html += '        if (programIcon && programIcon.getAttribute("data-open") !== "1") toggleChildren(programClass, "program");\n'
-    html += '      }\n'
-    html += '    }\n'
-    html += '    var divisionIcon = divisionElement.querySelector(".ic-toggle");\n'
-    html += '    if (divisionIcon && divisionIcon.getAttribute("data-open") !== "1") toggleChildren("div_" + divId, "division");\n'
-    html += '    if (divisionElement.scrollIntoView) divisionElement.scrollIntoView({ behavior: "smooth", block: "center" });\n'
-    html += '    divisionElement.classList.add("ic-highlight");\n'
-    html += '    setTimeout(function() { divisionElement.classList.remove("ic-highlight"); }, 2000);\n'
-    html += '    return false;\n'
-    html += '  }\n'
-    html += '  function renderTree(rows, summary) {\n'
-    html += '    var wrap = document.getElementById("ic-table-wrap");\n'
-    html += '    var meta = document.getElementById("ic-list-meta");\n'
-    html += '    renderStats(summary);\n'
-    html += '    if (!rows || !rows.length) {\n'
-    html += '      wrap.innerHTML = "<div class=\\"ic-empty\\">No matching structure rows.</div>";\n'
-    html += '      if (meta) meta.textContent = "0 involvements";\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (meta) meta.textContent = rows.length + " involvement row(s) in tree";\n'
-    html += '    var progTotals = {}, divTotals = {};\n'
-    html += '    for (var i = 0; i < rows.length; i++) {\n'
-    html += '      var r0 = rows[i];\n'
-    html += '      if (!progTotals[r0.prog_id]) progTotals[r0.prog_id] = {m:0,p:0,v:0,mt:0};\n'
-    html += '      if (!divTotals[r0.div_id]) divTotals[r0.div_id] = {m:0,p:0,v:0,mt:0};\n'
-    html += '      progTotals[r0.prog_id].m += (r0.members||0); progTotals[r0.prog_id].p += (r0.previous||0);\n'
-    html += '      progTotals[r0.prog_id].v += (r0.visitors||0); progTotals[r0.prog_id].mt += (r0.meetings||0);\n'
-    html += '      divTotals[r0.div_id].m += (r0.members||0); divTotals[r0.div_id].p += (r0.previous||0);\n'
-    html += '      divTotals[r0.div_id].v += (r0.visitors||0); divTotals[r0.div_id].mt += (r0.meetings||0);\n'
-    html += '    }\n'
-    html += '    var h = "<div class=\\"ic-tree-wrap\\"><table class=\\"ic-tree-table\\"><thead><tr>";\n'
-    html += '    h += "<th>Name</th><th>Status</th><th>Type</th><th class=\\"num\\">Members</th>";\n'
-    html += '    h += "<th class=\\"num\\">Previous</th><th class=\\"num\\">Visitors</th><th class=\\"num\\">Meetings</th>";\n'
-    html += '    h += "<th>Related divisions</th><th>Created</th></tr></thead><tbody>";\n'
-    html += '    var curProg = null, curDiv = null;\n'
-    html += '    for (var x = 0; x < rows.length; x++) {\n'
-    html += '      var r = rows[x];\n'
-    html += '      if (curProg !== r.prog_id) {\n'
-    html += '        curProg = r.prog_id; curDiv = null;\n'
-    html += '        var pt = progTotals[r.prog_id] || {m:0,p:0,v:0,mt:0};\n'
-    html += '        var pid = "prog_" + r.prog_id;\n'
-    html += '        h += "<tr id=\\"" + pid + "\\" class=\\"ic-prog-row\\" data-toggle=\\"" + pid + "\\" data-ttype=\\"program\\">";\n'
-    html += '        h += "<td><span class=\\"ic-toggle\\" data-open=\\"0\\">+</span>" + esc(r.program) + "</td>";\n'
-    html += '        h += "<td>-</td><td>-</td>";\n'
-    html += '        h += "<td class=\\"num\\">" + pt.m + "</td><td class=\\"num\\">" + pt.p + "</td>";\n'
-    html += '        h += "<td class=\\"num\\">" + pt.v + "</td><td class=\\"num\\">" + pt.mt + "</td>";\n'
-    html += '        h += "<td></td><td></td></tr>";\n'
-    html += '      }\n'
-    html += '      if (curDiv !== r.div_id) {\n'
-    html += '        curDiv = r.div_id;\n'
-    html += '        var dt = divTotals[r.div_id] || {m:0,p:0,v:0,mt:0};\n'
-    html += '        var did = "div_" + r.div_id;\n'
-    html += '        h += "<tr id=\\"" + did + "\\" class=\\"ic-div-row prog_" + r.prog_id + "\\" data-toggle=\\"" + did + "\\" data-ttype=\\"division\\">";\n'
-    html += '        h += "<td class=\\"ic-pad-div\\"><span class=\\"ic-toggle\\" data-open=\\"0\\">+</span>" + esc(r.division) + "</td>";\n'
-    html += '        h += "<td>-</td><td>-</td>";\n'
-    html += '        h += "<td class=\\"num\\">" + dt.m + "</td><td class=\\"num\\">" + dt.p + "</td>";\n'
-    html += '        h += "<td class=\\"num\\">" + dt.v + "</td><td class=\\"num\\">" + dt.mt + "</td>";\n'
-    html += '        h += "<td></td><td></td></tr>";\n'
-    html += '      }\n'
-    html += '      var inactive = (r.status === "Inactive") ? " inactive" : "";\n'
-    html += '      h += "<tr class=\\"ic-org-row div_" + r.div_id + inactive + "\\">";\n'
-    html += '      h += "<td class=\\"ic-pad-org\\"><a href=\\"/Org/" + r.org_id + "\\" target=\\"_blank\\" rel=\\"noopener noreferrer\\">" + esc(r.name) + "</a></td>";\n'
-    html += '      h += "<td>" + esc(r.status || "") + "</td>";\n'
-    html += '      h += "<td>" + esc(r.org_type || "") + "</td>";\n'
-    html += '      h += "<td class=\\"num\\">" + esc(r.members) + "</td>";\n'
-    html += '      h += "<td class=\\"num\\">" + esc(r.previous) + "</td>";\n'
-    html += '      h += "<td class=\\"num\\">" + esc(r.visitors) + "</td>";\n'
-    html += '      h += "<td class=\\"num\\">" + esc(r.meetings) + "</td>";\n'
-    html += '      h += "<td>" + parseRelated(r.related_divs, r.div_id) + "</td>";\n'
-    html += '      h += "<td>" + esc(r.created || "") + "</td>";\n'
-    html += '      h += "</tr>";\n'
-    html += '    }\n'
-    html += '    h += "</tbody></table></div>";\n'
-    html += '    wrap.innerHTML = h;\n'
-    html += '    var toggles = wrap.querySelectorAll("[data-toggle]");\n'
-    html += '    for (var t = 0; t < toggles.length; t++) {\n'
-    html += '      toggles[t].onclick = function() {\n'
-    html += '        toggleChildren(this.getAttribute("data-toggle"), this.getAttribute("data-ttype"));\n'
-    html += '      };\n'
-    html += '    }\n'
-    html += '    var links = wrap.querySelectorAll("[data-hl-div]");\n'
-    html += '    for (var L = 0; L < links.length; L++) {\n'
-    html += '      links[L].onclick = function(e) {\n'
-    html += '        if (e && e.preventDefault) e.preventDefault();\n'
-    html += '        highlightDivision(this.getAttribute("data-hl-div"));\n'
-    html += '        return false;\n'
-    html += '      };\n'
-    html += '    }\n'
-    html += '    var programRows = wrap.querySelectorAll(".ic-prog-row");\n'
-    html += '    for (var p = 0; p < programRows.length; p++) {\n'
-    html += '      toggleChildren(programRows[p].id, "program");\n'
-    html += '    }\n'
-    html += '  }\n'
-    html += '  function setListStatus(msg) {\n'
-    html += '    var meta = document.getElementById("ic-list-meta");\n'
-    html += '    if (meta) meta.textContent = msg || "";\n'
-    html += '    setResult(msg || "");\n'
-    html += '  }\n'
-    html += '  function loadList() {\n'
-    html += '    if (!window.jQuery) return;\n'
-    html += '    var prog = document.getElementById("ic-prog").value || "0";\n'
-    html += '    var div = document.getElementById("ic-div").value || "0";\n'
-    html += '    var inc = document.getElementById("ic-include-inactive").value || "0";\n'
-    html += '    var created = document.getElementById("ic-created-after").value || "";\n'
-    html += '    var wrap = document.getElementById("ic-table-wrap");\n'
-    html += '    if (wrap) wrap.innerHTML = "<div class=\\"ic-empty\\">Loading...</div>";\n'
-    html += '    setListStatus("Loading...");\n'
-    html += '    if (currentTab === "structure") {\n'
-    html += '      jQuery.ajax({\n'
-    html += '        url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '        data: { ajax: "true", action: "get_tree", prog_id: prog, div_id: div, include_inactive: inc, created_after: created }\n'
-    html += '      }).done(function(response) {\n'
-    html += '        var text = String(response || "").replace(/^\\uFEFF/, "").trim();\n'
-    html += '        var data = null;\n'
-    html += '        try { data = JSON.parse(text); } catch (e) {\n'
-    html += '          setListStatus("Bad tree response (not JSON). Re-upload InvolvementCleanup.py?");\n'
-    html += '          if (wrap) wrap.innerHTML = "<div class=\\"ic-empty\\">Could not load structure tree.</div>";\n'
-    html += '          return;\n'
-    html += '        }\n'
-    html += '        if (data.error) {\n'
-    html += '          setListStatus("Tree error: " + (data.error || "unknown"));\n'
-    html += '          if (wrap) wrap.innerHTML = "<div class=\\"ic-empty\\">" + esc(data.error) + "</div>";\n'
-    html += '          return;\n'
-    html += '        }\n'
-    html += '        try {\n'
-    html += '          renderTree(data.rows || [], data.summary || null);\n'
-    html += '          setResult("");\n'
-    html += '        } catch (err) {\n'
-    html += '          setListStatus("Tree render failed: " + err);\n'
-    html += '          if (wrap) wrap.innerHTML = "<div class=\\"ic-empty\\">Tree render failed.</div>";\n'
-    html += '        }\n'
-    html += '      }).fail(function() {\n'
-    html += '        setListStatus("Tree load failed");\n'
-    html += '        if (wrap) wrap.innerHTML = "<div class=\\"ic-empty\\">Tree load failed.</div>";\n'
-    html += '      });\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    document.getElementById("ic-stats").style.display = "none";\n'
-    html += '    var queue = currentTab === "manage" ? "manage" : (document.getElementById("ic-queue").value || "dormant");\n'
-    html += '    jQuery.ajax({\n'
-    html += '      url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '      data: { ajax: "true", action: "get_queue", queue: queue, prog_id: prog, div_id: div, include_inactive: inc }\n'
-    html += '    }).done(function(response) {\n'
-    html += '      var text = String(response || "").replace(/^\\uFEFF/, "").trim();\n'
-    html += '      var data = null;\n'
-    html += '      try { data = JSON.parse(text); } catch (e) { setResult("Bad response"); return; }\n'
-    html += '      if (data.error) { setResult(esc(data.error)); return; }\n'
-    html += '      renderRows(data.rows || []);\n'
-    html += '      setResult("");\n'
-    html += '    }).fail(function() { setResult("Load failed"); });\n'
-    html += '  }\n'
-    html += '  function optionList(items) {\n'
-    html += '    var h = "";\n'
-    html += '    for (var i = 0; i < items.length; i++) {\n'
-    html += '      h += "<option value=\\"" + items[i].id + "\\">" + esc(items[i].name) + "</option>";\n'
-    html += '    }\n'
-    html += '    return h;\n'
-    html += '  }\n'
-    html += '  function openModal(action) {\n'
-    html += '    var ids = selectedIds();\n'
-    html += '    if (!ids.length) { alert("Select at least one involvement."); return; }\n'
-    html += '    pendingAction = { action: action, ids: ids };\n'
-    html += '    var title = document.getElementById("ic-modal-title");\n'
-    html += '    var body = document.getElementById("ic-modal-body");\n'
-    html += '    var html = "<p>Apply to <strong>" + ids.length + "</strong> involvement(s).</p>";\n'
-    html += '    if (action === "mark_inactive") {\n'
-    html += '      title.textContent = "Mark inactive";\n'
-    html += '      html += "<label><input type=\\"checkbox\\" id=\\"ic-drop-members\\" /> Also drop current members to Previous (keeps history)</label>";\n'
-    html += '      html += "<div class=\\"ic-warn\\" id=\\"ic-warn-box\\">Checking warnings...</div>";\n'
-    html += '    } else if (action === "set_type") {\n'
-    html += '      title.textContent = "Change involvement type";\n'
-    html += '      html += "<label>Type</label><br/><select id=\\"ic-modal-type\\">" + optionList(lookups.org_types) + "</select>";\n'
-    html += '    } else if (action === "set_category") {\n'
-    html += '      title.textContent = "Set mobile category";\n'
-    html += '      html += "<label>Mobile category</label><br/><select id=\\"ic-modal-cat\\">" + optionList(lookups.categories) + "</select>";\n'
-    html += '    } else if (action === "set_main_division" || action === "add_division" || action === "remove_division") {\n'
-    html += '      title.textContent = action === "set_main_division" ? "Set main division" : (action === "add_division" ? "Add related division" : "Remove related division");\n'
-    html += '      html += "<label>Division</label><br/><select id=\\"ic-modal-div\\">" + optionList(lookups.divisions) + "</select>";\n'
-    html += '      html += "<p class=\\"ic-meta\\">Program follows the selected division. Related = non-main DivOrg links.</p>";\n'
-    html += '    } else if (action === "remove_all_related") {\n'
-    html += '      title.textContent = "Remove all related divisions";\n'
-    html += '      html += "<p>Keeps the <strong>main</strong> division on each involvement and removes every other (related / non-main) division link.</p>";\n'
-    html += '      html += "<p class=\\"ic-meta\\">Involvements with no main division set are skipped.</p>";\n'
-    html += '    }\n'
-    html += '    body.innerHTML = html;\n'
-    html += '    document.getElementById("ic-modal").className = "ic-modal-overlay visible";\n'
-    html += '    if (action === "mark_inactive") loadWarnings(ids);\n'
-    html += '  }\n'
-    html += '  function loadWarnings(ids) {\n'
-    html += '    jQuery.ajax({\n'
-    html += '      url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '      data: { ajax: "true", action: "get_warnings", org_ids: ids.join(",") }\n'
-    html += '    }).done(function(response) {\n'
-    html += '      var data = null;\n'
-    html += '      try { data = JSON.parse(String(response || "").trim()); } catch (e) { return; }\n'
-    html += '      var box = document.getElementById("ic-warn-box");\n'
-    html += '      if (!box) return;\n'
-    html += '      var rows = data.rows || [];\n'
-    html += '      var lines = [];\n'
-    html += '      for (var i = 0; i < rows.length; i++) {\n'
-    html += '        if (rows[i].warnings && rows[i].warnings.length)\n'
-    html += '          lines.push(esc(rows[i].name) + ": " + esc(rows[i].warnings.join(", ")));\n'
-    html += '      }\n'
-    html += '      box.innerHTML = lines.length ? ("Warnings (allowed):<br/>" + lines.join("<br/>")) : "No special warnings.";\n'
-    html += '    });\n'
-    html += '  }\n'
-    html += '  function closeModal() {\n'
-    html += '    document.getElementById("ic-modal").className = "ic-modal-overlay";\n'
-    html += '    pendingAction = null;\n'
-    html += '  }\n'
-    html += '  function showActionResults(results) {\n'
-    html += '    var ok = 0, fail = 0, msgs = [];\n'
-    html += '    for (var i = 0; i < results.length; i++) {\n'
-    html += '      if (results[i].ok) ok++; else { fail++; msgs.push(results[i].org_id + ": " + results[i].message); }\n'
-    html += '    }\n'
-    html += '    setResult("Done. OK=" + ok + (fail ? (", failed=" + fail + " (" + esc(msgs.join("; ")) + ")") : ""));\n'
-    html += '    loadList();\n'
-    html += '  }\n'
-    html += '  function runEach(ids, fnEach, done) {\n'
-    html += '    var i = 0, results = [];\n'
-    html += '    function next() {\n'
-    html += '      if (i >= ids.length) { done(results); return; }\n'
-    html += '      var oid = ids[i++];\n'
-    html += '      fnEach(oid, function(item) { results.push(item); next(); });\n'
-    html += '    }\n'
-    html += '    next();\n'
-    html += '  }\n'
-    html += '  function postOrgField(oid, name, value, okMsg, cb) {\n'
-    html += '    jQuery.ajax({\n'
-    html += '      url: "/Org/PostData", type: "POST", dataType: "text",\n'
-    html += '      data: { pk: oid, name: name, value: String(value) }\n'
-    html += '    }).done(function() { cb({ org_id: oid, ok: true, message: okMsg }); })\n'
-    html += '     .fail(function(xhr) {\n'
-    html += '       cb({ org_id: oid, ok: false, message: "Org/PostData failed (" + (xhr.status || "?") + ")" });\n'
-    html += '     });\n'
-    html += '  }\n'
-    html += '  function confirmModal() {\n'
-    html += '    if (!pendingAction || !window.jQuery) return;\n'
-    html += '    var a = pendingAction.action;\n'
-    html += '    var ids = pendingAction.ids.slice(0);\n'
-    html += '    var dropMembers = false;\n'
-    html += '    var typeId = "0";\n'
-    html += '    var catId = "0";\n'
-    html += '    var divId = "0";\n'
-    html += '    if (a === "mark_inactive") {\n'
-    html += '      var cbDrop = document.getElementById("ic-drop-members");\n'
-    html += '      dropMembers = !!(cbDrop && cbDrop.checked);\n'
-    html += '    } else if (a === "set_type") {\n'
-    html += '      typeId = document.getElementById("ic-modal-type").value;\n'
-    html += '    } else if (a === "set_category") {\n'
-    html += '      catId = document.getElementById("ic-modal-cat").value;\n'
-    html += '    } else if (a === "set_main_division" || a === "add_division" || a === "remove_division") {\n'
-    html += '      divId = document.getElementById("ic-modal-div").value;\n'
-    html += '      if (!divId || divId === "0") { alert("Select a division."); return; }\n'
-    html += '    }\n'
-    html += '    setResult("Working...");\n'
-    html += '    closeModal();\n'
-    html += '    if (a === "mark_inactive") {\n'
-    html += '      var markAll = function() {\n'
-    html += '        runEach(ids, function(oid, cb) {\n'
-    html += '          postOrgField(oid, "status", "40", "Marked inactive", cb);\n'
-    html += '        }, showActionResults);\n'
-    html += '      };\n'
-    html += '      if (!dropMembers) { markAll(); return; }\n'
-    html += '      jQuery.ajax({\n'
-    html += '        url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '        data: { ajax: "true", action: "drop_members", org_ids: ids.join(","), confirm: "1" }\n'
-    html += '      }).done(function(response) {\n'
-    html += '        var data2 = null;\n'
-    html += '        try { data2 = JSON.parse(String(response || "").trim()); } catch (e) { setResult("Drop failed: bad response"); return; }\n'
-    html += '        if (data2.error) { setResult(esc(data2.error)); return; }\n'
-    html += '        markAll();\n'
-    html += '      }).fail(function() { setResult("Drop members failed"); });\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (a === "set_type") {\n'
-    html += '      runEach(ids, function(oid, cb) {\n'
-    html += '        postOrgField(oid, "type", typeId, "Type updated", cb);\n'
-    html += '      }, showActionResults);\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (a === "set_category") {\n'
-    html += '      runEach(ids, function(oid, cb) {\n'
-    html += '        jQuery.ajax({\n'
-    html += '          url: "/OrgSearch/Edit", type: "POST", dataType: "text",\n'
-    html += '          data: { id: "amc-" + oid, value: String(catId) }\n'
-    html += '        }).done(function() { cb({ org_id: oid, ok: true, message: "Mobile category updated" }); })\n'
-    html += '         .fail(function(xhr) {\n'
-    html += '           cb({ org_id: oid, ok: false, message: "OrgSearch/Edit failed (" + (xhr.status || "?") + ")" });\n'
-    html += '         });\n'
-    html += '      }, showActionResults);\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (a === "set_main_division") {\n'
-    html += '      runEach(ids, function(oid, cb) {\n'
-    html += '        jQuery.ajax({\n'
-    html += '          url: "/OrgSearch/MainDiv", type: "POST", dataType: "text",\n'
-    html += '          data: { id: oid, tagdiv: divId }\n'
-    html += '        }).done(function(ret) {\n'
-    html += '          if (String(ret || "").trim() === "error")\n'
-    html += '            cb({ org_id: oid, ok: false, message: "MainDiv error" });\n'
-    html += '          else\n'
-    html += '            cb({ org_id: oid, ok: true, message: "Main division updated" });\n'
-    html += '        }).fail(function(xhr) {\n'
-    html += '          cb({ org_id: oid, ok: false, message: "MainDiv failed (" + (xhr.status || "?") + ")" });\n'
-    html += '        });\n'
-    html += '      }, showActionResults);\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (a === "add_division" || a === "remove_division") {\n'
-    html += '      jQuery.ajax({\n'
-    html += '        url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '        data: { ajax: "true", action: "div_membership", org_ids: ids.join(","), div_id: divId }\n'
-    html += '      }).done(function(response) {\n'
-    html += '        var data2 = null;\n'
-    html += '        try { data2 = JSON.parse(String(response || "").trim()); } catch (e) { setResult("Bad div membership response"); return; }\n'
-    html += '        if (data2.error) { setResult(esc(data2.error)); return; }\n'
-    html += '        var hasMap = {};\n'
-    html += '        var rows = data2.rows || [];\n'
-    html += '        for (var r = 0; r < rows.length; r++) hasMap[rows[r].org_id] = !!rows[r].has;\n'
-    html += '        runEach(ids, function(oid, cb) {\n'
-    html += '          var has = !!hasMap[oid];\n'
-    html += '          if (a === "add_division" && has) {\n'
-    html += '            cb({ org_id: oid, ok: true, message: "Already has division" });\n'
-    html += '            return;\n'
-    html += '          }\n'
-    html += '          if (a === "remove_division" && !has) {\n'
-    html += '            cb({ org_id: oid, ok: true, message: "Not in division" });\n'
-    html += '            return;\n'
-    html += '          }\n'
-    html += '          postToggleTag(oid, divId, function(ok, msg) {\n'
-    html += '            cb({ org_id: oid, ok: ok, message: msg || (a === "add_division" ? "Related division added" : "Related division removed") });\n'
-    html += '          }, a === "add_division" ? "Related division added" : "Related division removed");\n'
-    html += '        }, showActionResults);\n'
-    html += '      }).fail(function() { setResult("div_membership failed"); });\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    if (a === "remove_all_related") {\n'
-    html += '      jQuery.ajax({\n'
-    html += '        url: scriptUrl, type: "POST", dataType: "text",\n'
-    html += '        data: { ajax: "true", action: "list_related_divisions", org_ids: ids.join(",") }\n'
-    html += '      }).done(function(response) {\n'
-    html += '        var data2 = null;\n'
-    html += '        try { data2 = JSON.parse(String(response || "").trim()); } catch (e) { setResult("Bad related-divisions response"); return; }\n'
-    html += '        if (data2.error) { setResult(esc(data2.error)); return; }\n'
-    html += '        var map = {};\n'
-    html += '        var rows = data2.rows || [];\n'
-    html += '        for (var r = 0; r < rows.length; r++) map[rows[r].org_id] = rows[r];\n'
-    html += '        runEach(ids, function(oid, cb) {\n'
-    html += '          var info = map[oid] || { main_div_id: 0, related: [] };\n'
-    html += '          if (!info.main_div_id) {\n'
-    html += '            cb({ org_id: oid, ok: false, message: "No main division set" });\n'
-    html += '            return;\n'
-    html += '          }\n'
-    html += '          var related = info.related || [];\n'
-    html += '          if (!related.length) {\n'
-    html += '            cb({ org_id: oid, ok: true, message: "No related divisions" });\n'
-    html += '            return;\n'
-    html += '          }\n'
-    html += '          var ri = 0, removed = 0, failMsg = "";\n'
-    html += '          function nextRelated() {\n'
-    html += '            if (ri >= related.length) {\n'
-    html += '              if (failMsg) cb({ org_id: oid, ok: false, message: failMsg });\n'
-    html += '              else cb({ org_id: oid, ok: true, message: "Removed " + removed + " related division(s)" });\n'
-    html += '              return;\n'
-    html += '            }\n'
-    html += '            var rid = related[ri++];\n'
-    html += '            postToggleTag(oid, rid, function(ok, msg) {\n'
-    html += '              if (ok) removed++;\n'
-    html += '              else if (!failMsg) failMsg = msg || ("Failed on div " + rid);\n'
-    html += '              nextRelated();\n'
-    html += '            }, "ok");\n'
-    html += '          }\n'
-    html += '          nextRelated();\n'
-    html += '        }, showActionResults);\n'
-    html += '      }).fail(function() { setResult("list_related_divisions failed"); });\n'
-    html += '      return;\n'
-    html += '    }\n'
-    html += '    setResult("Unknown action");\n'
-    html += '  }\n'
-    html += '  function postToggleTag(oid, tagdiv, cb, okMsg) {\n'
-    html += '    jQuery.ajax({\n'
-    html += '      url: "/OrgSearch/ToggleTag", type: "POST", dataType: "text",\n'
-    html += '      data: { id: oid, tagdiv: tagdiv }\n'
-    html += '    }).done(function(ret) {\n'
-    html += '      var s = String(ret || "").trim();\n'
-    html += '      var parsed = null;\n'
-    html += '      if (s.charAt(0) === "{") { try { parsed = JSON.parse(s); } catch (e2) { parsed = null; } }\n'
-    html += '      if (parsed && parsed.warning === "lastDivision")\n'
-    html += '        cb(false, "Cannot remove last division");\n'
-    html += '      else if (parsed && parsed.error)\n'
-    html += '        cb(false, String(parsed.error));\n'
-    html += '      else if (s === "error")\n'
-    html += '        cb(false, "ToggleTag error");\n'
-    html += '      else\n'
-    html += '        cb(true, okMsg || "ok");\n'
-    html += '    }).fail(function(xhr) {\n'
-    html += '      cb(false, "ToggleTag failed (" + (xhr.status || "?") + ")");\n'
-    html += '    });\n'
-    html += '  }\n'
-    html += '  function setTab(tab) {\n'
-    html += '    currentTab = tab;\n'
-    html += '    var tabs = document.querySelectorAll(".ic-tab");\n'
-    html += '    for (var i = 0; i < tabs.length; i++) {\n'
-    html += '      tabs[i].className = "ic-tab" + (tabs[i].getAttribute("data-tab") === tab ? " active" : "");\n'
-    html += '    }\n'
-    html += '    var isStructure = tab === "structure";\n'
-    html += '    var isCleanup = tab === "cleanup";\n'
-    html += '    var isManage = tab === "manage";\n'
-    html += '    document.getElementById("ic-queue-wrap").style.display = isCleanup ? "inline-block" : "none";\n'
-    html += '    document.getElementById("ic-created-wrap").style.display = isStructure ? "inline-block" : "none";\n'
-    html += '    document.getElementById("ic-inactive-wrap").style.display = (isStructure || isManage) ? "inline-block" : "none";\n'
-    html += '    document.getElementById("ic-actions-card").style.display = (isCleanup || isManage) ? "block" : "none";\n'
-    html += '    if (!isStructure) document.getElementById("ic-stats").style.display = "none";\n'
-    html += '    var title = "Structure";\n'
-    html += '    var meta = "Expand programs and divisions to browse involvements.";\n'
-    html += '    if (isCleanup) { title = "Clean Up"; meta = "Pick a queue, then select rows for actions."; }\n'
-    html += '    if (isManage) { title = "Manage"; meta = "Browse all involvements and take bulk actions."; }\n'
-    html += '    document.getElementById("ic-list-title").textContent = title;\n'
-    html += '    document.getElementById("ic-list-meta").textContent = meta;\n'
-    html += '    loadList();\n'
-    html += '  }\n'
-    html += '  function init() {\n'
-    html += '    document.getElementById("ic-load").onclick = function() { loadList(); };\n'
-    html += '    document.getElementById("ic-prog").onchange = function() { refreshDivOptions(); };\n'
-    html += '    document.getElementById("ic-select-all").onclick = function() {\n'
-    html += '      var boxes = document.querySelectorAll(".ic-cb");\n'
-    html += '      for (var i = 0; i < boxes.length; i++) boxes[i].checked = true;\n'
-    html += '    };\n'
-    html += '    document.getElementById("ic-clear").onclick = function() {\n'
-    html += '      var boxes = document.querySelectorAll(".ic-cb");\n'
-    html += '      for (var i = 0; i < boxes.length; i++) boxes[i].checked = false;\n'
-    html += '    };\n'
-    html += '    document.getElementById("ic-modal-cancel").onclick = closeModal;\n'
-    html += '    document.getElementById("ic-modal-ok").onclick = confirmModal;\n'
-    html += '    var tabs = document.querySelectorAll(".ic-tab");\n'
-    html += '    for (var t = 0; t < tabs.length; t++) {\n'
-    html += '      tabs[t].onclick = function(e) {\n'
-    html += '        if (e && e.preventDefault) e.preventDefault();\n'
-    html += '        setTab(this.getAttribute("data-tab"));\n'
-    html += '        return false;\n'
-    html += '      };\n'
-    html += '    }\n'
-    html += '    var btns = document.querySelectorAll("[data-action]");\n'
-    html += '    for (var b = 0; b < btns.length; b++) {\n'
-    html += '      btns[b].onclick = function() { openModal(this.getAttribute("data-action")); };\n'
-    html += '    }\n'
-    html += '    refreshDivOptions();\n'
-    html += '    setTab("structure");\n'
-    html += '  }\n'
-    html += '  if (window.jQuery) init();\n'
-    html += '  else window.addEventListener("load", function() { if (window.jQuery) init(); });\n'
-    html += '})();\n'
-    html += '</script>\n'
-    return html
-
-def _error_page(ex):
-    html = '<style>' + _css() + '</style><div class="ic-root">'
-    html += '<div class="dashboard-header"><h1>Involvement Cleanup</h1>'
-    html += '<p class="header-sub">Error loading tool.</p></div>'
-    html += '<div class="ic-card"><pre style="white-space:pre-wrap;font-size:12px">'
-    html += _html(traceback.format_exc()) + '</pre></div></div>'
-    return html
 
 
 # ---------------------------------------------------------------------------
-# Entry
+# AJAX / page entry
 # ---------------------------------------------------------------------------
 
-model.Header = 'Involvement Cleanup'
-is_ajax = _form_val('ajax') == 'true'
+model.Header = 'Involvement Dashboard'
+
+is_ajax = hasattr(model.Data, 'ajax') and model.Data.ajax == 'true'
 
 if is_ajax:
-    action = _form_val('action')
-    try:
-        if action == 'get_queue':
-            rows = _run_queue(
-                _form_val('queue', 'dormant'),
-                _i(_form_val('prog_id'), 0),
-                _i(_form_val('div_id'), 0),
-                _b(_form_val('include_inactive')),
-            )
-            _json_out({'rows': rows, 'count': len(rows)})
-        elif action == 'get_tree':
-            prog = _i(_form_val('prog_id'), 0)
-            div = _i(_form_val('div_id'), 0)
-            inc = _b(_form_val('include_inactive'))
-            created = _form_val('created_after', '')
-            rows = _run_tree(prog, div, inc, created)
-            summary = _summary_from_tree_rows(rows)
-            _json_out({'rows': rows, 'count': len(rows), 'summary': summary})
-        elif action == 'get_warnings':
-            _json_out({'rows': _org_warnings(_parse_org_ids())})
-        elif action == 'drop_members':
-            if _form_val('confirm') != '1':
-                _json_out({'error': 'Confirmation required'})
+    action = _s(_data('action'))
+
+    if action == 'search_involvements':
+        try:
+            term = _s(_data('term'))
+            if len(term) < 2:
+                _json_out([])
             else:
-                _json_out({'results': _action_drop_members(_parse_org_ids())})
-        elif action == 'div_membership':
-            _json_out({
-                'rows': _div_membership(_parse_org_ids(), _i(_form_val('div_id')))
-            })
-        elif action == 'list_related_divisions':
-            _json_out({'rows': _related_divisions(_parse_org_ids())})
-        else:
-            _json_out({'error': 'Unknown action'})
-    except Exception, e:
-        _err_out(e)
+                # Active involvements by name; also allow exact Id match when term is numeric.
+                # Visibility matches OrgSearch: LimitToRole + OrgLeadersOnly.
+                org_id_term = _i(term, 0)
+                sql = """
+SELECT TOP 30
+    o.OrganizationId,
+    o.OrganizationName,
+    ISNULL(d.Name, '') AS DivisionName,
+    ISNULL(p.Name, '') AS ProgramName
+FROM Organizations o
+LEFT JOIN Division d ON o.DivisionId = d.Id
+LEFT JOIN Program p ON d.ProgId = p.Id
+WHERE o.OrganizationStatusId = 30
+  AND (
+        o.OrganizationName LIKE '%' + @term + '%'
+        OR (@orgIdTerm > 0 AND o.OrganizationId = @orgIdTerm)
+      )
+""" + _ORG_ACCESS_SQL + """
+ORDER BY
+    CASE WHEN o.OrganizationName LIKE @term + '%' THEN 0 ELSE 1 END,
+    o.OrganizationName
+"""
+                p = _dd()
+                p.AddValue('term', term)
+                p.AddValue('orgIdTerm', org_id_term)
+                _bind_org_access(p)
+                rows = list(q.QuerySql(sql, p))
+                result = [{
+                    'id': r.OrganizationId,
+                    'name': _s(r.OrganizationName),
+                    'division': _s(r.DivisionName),
+                    'program': _s(r.ProgramName),
+                } for r in rows]
+                _json_out(result)
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_dashboard':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                org_sql = """
+                SELECT o.OrganizationId, o.OrganizationName, o.RegistrationTypeId,
+                       o.ImageUrl, o.BadgeUrl,
+                       d.Name as DivisionName, p.Id as ProgramId, p.Name as ProgramName,
+                       COALESCE(
+                           NULLIF(LTRIM(RTRIM(oe.Data)), ''),
+                           NULLIF(LTRIM(RTRIM(oe.StrValue)), ''),
+                           NULLIF(LTRIM(RTRIM(o.ImageUrl)), '')
+                       ) AS TitleGraphicUrl
+                FROM Organizations o
+                LEFT JOIN Division d ON o.DivisionId = d.Id
+                LEFT JOIN Program p ON d.ProgId = p.Id
+                LEFT JOIN dbo.Setting s ON s.Id = 'SitesDataHeroImageEv'
+                LEFT JOIN dbo.OrganizationExtra oe
+                    ON oe.OrganizationId = o.OrganizationId
+                   AND s.Setting IS NOT NULL
+                   AND LTRIM(RTRIM(s.Setting)) <> ''
+                   AND oe.Field = s.Setting
+                WHERE o.OrganizationId = @orgId
+            """
+                p = _dd()
+                p.AddValue('orgId', org_id)
+                org_info = list(q.QuerySql(org_sql, p))
+
+                if not org_info:
+                    _json_out({'error': 'Organization not found'})
+                else:
+                    org = org_info[0]
+                    program_id = _i(org.ProgramId, 0) if hasattr(org, 'ProgramId') else 0
+                    profile = _overview_profile(program_id)
+
+                    demo_sql = """
+                        SELECT
+                            pe.GenderId,
+                            CASE
+                                WHEN pe.BirthYear IS NOT NULL AND pe.BirthMonth IS NOT NULL AND pe.BirthDay IS NOT NULL
+                                THEN DATEDIFF(year, DATEFROMPARTS(pe.BirthYear, pe.BirthMonth, pe.BirthDay), GETDATE())
+                                ELSE NULL
+                            END as Age,
+                            ms.Description as MaritalStatus,
+                            om.EnrollmentDate,
+                            DATEDIFF(day, om.EnrollmentDate, GETDATE()) as DaysSinceEnrollment,
+                            COALESCE(
+                                NULLIF(LTRIM(RTRIM(gl_om.Description)), ''),
+                                NULLIF(LTRIM(RTRIM(gl_pe.Description)), ''),
+                                'Unknown'
+                            ) as GradeLabel,
+                            COALESCE(gl_om.Id, gl_pe.Id, 99999) as GradeSort
+                        FROM OrganizationMembers om
+                        JOIN People pe ON om.PeopleId = pe.PeopleId
+                        LEFT JOIN lookup.MaritalStatus ms ON pe.MaritalStatusId = ms.Id
+                        LEFT JOIN lookup.GradeLevel gl_pe ON pe.GradeLevelId = gl_pe.Id
+                        LEFT JOIN lookup.GradeLevel gl_om ON om.GradeLevelId = gl_om.Id
+                        WHERE om.OrganizationId = @orgId
+                            AND pe.IsDeceased = 0
+                    """
+                    p2 = _dd()
+                    p2.AddValue('orgId', org_id)
+                    members = list(q.QuerySql(demo_sql, p2))
+
+                    total_members = len(members)
+                    male_count = len([m for m in members if m.GenderId == 1])
+                    female_count = len([m for m in members if m.GenderId == 2])
+
+                    age_groups = _empty_age_groups()
+                    if profile.get('show_age'):
+                        for member in members:
+                            age = member.Age if hasattr(member, 'Age') and not _is_null(member.Age) else None
+                            try:
+                                age_i = int(age) if age is not None else None
+                            except:
+                                age_i = None
+                            label = _age_bracket_label(age_i)
+                            age_groups[label] = age_groups.get(label, 0) + 1
+
+                    grades = []
+                    if profile.get('show_grade'):
+                        grade_counts = {}
+                        grade_sort = {}
+                        for member in members:
+                            label = _s(member.GradeLabel, 'Unknown') if hasattr(member, 'GradeLabel') else 'Unknown'
+                            if not label or label.lower() == 'unknown':
+                                label = 'Unknown'
+                            grade_counts[label] = grade_counts.get(label, 0) + 1
+                            if label not in grade_sort:
+                                grade_sort[label] = _i(member.GradeSort, 99999) if hasattr(member, 'GradeSort') else 99999
+                        # Unknown last; otherwise by GradeLevel Id
+                        def _grade_key(item):
+                            label = item[0]
+                            if label == 'Unknown':
+                                return (1, 99999, label)
+                            return (0, grade_sort.get(label, 99999), label)
+                        for label, count in sorted(grade_counts.items(), key=_grade_key):
+                            grades.append({'label': label, 'count': count})
+
+                    marital_status = {}
+                    if profile.get('show_marital'):
+                        for member in members:
+                            raw = member.MaritalStatus if hasattr(member, 'MaritalStatus') and not _is_null(member.MaritalStatus) else None
+                            status = _s(raw, 'Unknown') or 'Unknown'
+                            marital_status[status] = marital_status.get(status, 0) + 1
+
+                    enrollment_timeline = {}
+                    if profile.get('show_enrollment_timeline'):
+                        for member in members:
+                            if hasattr(member, 'EnrollmentDate') and member.EnrollmentDate:
+                                date_key = "{0:04d}-{1:02d}".format(member.EnrollmentDate.Year, member.EnrollmentDate.Month)
+                                enrollment_timeline[date_key] = enrollment_timeline.get(date_key, 0) + 1
+
+                    sorted_timeline = sorted(enrollment_timeline.items(), key=lambda x: x[0], reverse=True)[:12]
+                    sorted_timeline.reverse()
+
+                    subgroup_sql = """
+                        SELECT mt.Id as SubgroupId, mt.Name as SubgroupName, COUNT(DISTINCT omt.PeopleId) as MemberCount
+                        FROM MemberTags mt
+                        INNER JOIN OrgMemMemTags omt ON mt.Id = omt.MemberTagId AND omt.OrgId = @orgId
+                        WHERE mt.OrgId = @orgId
+                        GROUP BY mt.Id, mt.Name
+                        HAVING COUNT(DISTINCT omt.PeopleId) > 0
+                        ORDER BY mt.Name
+                    """
+                    p3 = _dd()
+                    p3.AddValue('orgId', org_id)
+                    subgroups = list(q.QuerySql(subgroup_sql, p3))
+
+                    # Payment groups (OriginalId chain) with Amt > 0 only.
+                    # Balance = Amtdue on the latest transaction in the group.
+                    transaction_sql = """
+    ;WITH Raw AS (
+        SELECT
+            ISNULL(t.OriginalId, t.Id) AS GroupId,
+            t.Id,
+            t.Amt,
+            t.Amtdue,
+            t.TransactionDate
+        FROM [Transaction] t
+        WHERE t.OrgId = @orgId
+    ),
+    Grouped AS (
+        SELECT
+            GroupId,
+            SUM(ISNULL(Amt, 0)) AS GroupPaid
+        FROM Raw
+        GROUP BY GroupId
+        HAVING SUM(ISNULL(Amt, 0)) > 0
+    ),
+    Latest AS (
+        SELECT
+            r.GroupId,
+            ISNULL(r.Amtdue, 0) AS BalanceDue,
+            ROW_NUMBER() OVER (
+                PARTITION BY r.GroupId
+                ORDER BY r.TransactionDate DESC, r.Id DESC
+            ) AS rn
+        FROM Raw r
+        INNER JOIN Grouped g ON g.GroupId = r.GroupId
+    )
+    SELECT
+        COUNT(*) AS TotalTransactions,
+        SUM(CASE WHEN l.BalanceDue <= 0 THEN 1 ELSE 0 END) AS PaidInFullCount,
+        SUM(CASE WHEN l.BalanceDue > 0 THEN 1 ELSE 0 END) AS RemainingBalanceCount,
+        SUM(g.GroupPaid) AS TotalPaid,
+        SUM(CASE WHEN l.BalanceDue > 0 THEN l.BalanceDue ELSE 0 END) AS TotalDue
+    FROM Grouped g
+    INNER JOIN Latest l ON l.GroupId = g.GroupId AND l.rn = 1
+    """
+                    p4 = _dd()
+                    p4.AddValue('orgId', org_id)
+                    transaction_result = list(q.QuerySql(transaction_sql, p4))
+                    transactions = transaction_result[0] if transaction_result else None
+
+                    result = {
+                        'org_name': org.OrganizationName,
+                        'program_id': program_id,
+                        'program_name': org.ProgramName if hasattr(org, 'ProgramName') and org.ProgramName else 'None',
+                        'division_name': org.DivisionName if hasattr(org, 'DivisionName') and org.DivisionName else 'None',
+                        'title_graphic_url': _s(org.TitleGraphicUrl) if hasattr(org, 'TitleGraphicUrl') else '',
+                        'badge_url': _s(org.BadgeUrl) if hasattr(org, 'BadgeUrl') else '',
+                        'registration_type_id': _i(org.RegistrationTypeId, 0),
+                        'is_registration_form': _i(org.RegistrationTypeId, 0) == REGISTRATION_FORM_TYPE,
+                        'overview_profile': profile,
+                        'total_members': total_members,
+                        'male_count': male_count,
+                        'female_count': female_count,
+                        'age_groups': age_groups if profile.get('show_age') else {},
+                        'grades': grades,
+                        'marital_status': marital_status if profile.get('show_marital') else {},
+                        'enrollment_timeline': dict(sorted_timeline) if profile.get('show_enrollment_timeline') else {},
+                        'subgroups': [{'id': _i(s.SubgroupId), 'name': _s(s.SubgroupName), 'count': _i(s.MemberCount)} for s in subgroups],
+                        'transactions': {
+                            'total': int(transactions.TotalTransactions) if transactions and transactions.TotalTransactions else 0,
+                            'paid_in_full': int(transactions.PaidInFullCount) if transactions and transactions.PaidInFullCount else 0,
+                            'remaining_balance': int(transactions.RemainingBalanceCount) if transactions and transactions.RemainingBalanceCount else 0,
+                            'total_paid': float(transactions.TotalPaid) if transactions and transactions.TotalPaid else 0,
+                            'total_due': float(transactions.TotalDue) if transactions and transactions.TotalDue else 0,
+                        }
+                    }
+                    _json_out(result)
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_registration_summary':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_build_registration_summary(org_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_allergy_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_allergy_people(org_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_option_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                question_id = _s(_data('question_id'))
+                option_value = _s(_data('option_value'))
+                _json_out(_get_option_people(org_id, question_id, option_value))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_text_answers':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                question_id = _s(_data('question_id'))
+                _json_out(_get_text_answers(org_id, question_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_person_answers':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                people_id = _i(_data('people_id'), 0)
+                _json_out(_get_person_answers(org_id, people_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_age_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                bracket = _s(_data('bracket'))
+                _json_out(_get_age_people(org_id, bracket))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_grade_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                grade = _s(_data('grade'))
+                _json_out(_get_grade_people(org_id, grade))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_gender_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                gender = _s(_data('gender'))
+                _json_out(_get_gender_people(org_id, gender))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_marital_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                status = _s(_data('status'))
+                _json_out(_get_marital_people(org_id, status))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_subgroup_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                subgroup_id = _i(_data('subgroup_id'), 0)
+                _json_out(_get_subgroup_people(org_id, subgroup_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_finance_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                status = _s(_data('status'))
+                _json_out(_get_finance_people(org_id, status))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_registration_excel_url':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_registration_excel_url(org_id))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'add_to_tag':
+        try:
+            people_ids = _s(_data('people_ids'))
+            tag_name = _s(_data('tag_name'))
+            clear_first = _s(_data('clear_first'))
+            _json_out(_add_people_to_tag(people_ids, tag_name, clear_first))
+        except Exception, e:
+            _err_out(e)
+
+    else:
+        _json_out({'error': 'Unknown action'})
+
 else:
+    # Main page — optional deep link: /PyScriptForm/InvolvementDashboard?org_id=123
+    _initial_org_id = 0
+    _initial_org_name = ''
     try:
-        model.Form = _page()
-    except Exception, ex:
-        model.Form = _error_page(ex)
+        _initial_org_id = _i(_data('org_id'), 0)
+        if _initial_org_id <= 0:
+            _initial_org_id = _i(Data.GetValue('org_id'), 0)
+    except:
+        _initial_org_id = 0
+    if _initial_org_id > 0:
+        try:
+            _op = _dd()
+            _op.AddValue('orgId', str(_initial_org_id))
+            _orows = list(q.QuerySql(
+                'SELECT TOP 1 OrganizationName FROM dbo.Organizations WHERE OrganizationId = @orgId',
+                _op))
+            if _orows:
+                _initial_org_name = _s(_orows[0].OrganizationName)
+        except:
+            pass
+
+    model.Form = r'''
+<style>
+    .dashboard-container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    .selector-card {
+        background: white;
+        padding: 25px;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+    }
+    .selector-card h2 {
+        margin: 0 0 20px 0;
+        color: #1e293b;
+        font-size: 24px;
+    }
+    .selector-card h2.selector-toggleable {
+        cursor: pointer;
+        user-select: none;
+    }
+    .selector-card h2.selector-toggleable:hover {
+        color: #012b58;
+    }
+    .selector-card select {
+        width: 100%;
+        padding: 12px;
+        font-size: 16px;
+        border: 2px solid #e2e8f0;
+        border-radius: 8px;
+        margin-bottom: 15px;
+    }
+    .selector-card input[type="text"] {
+        width: 100%;
+        padding: 12px 14px;
+        font-size: 16px;
+        border: 2px solid #e2e8f0;
+        border-radius: 8px;
+        box-sizing: border-box;
+    }
+    .selector-card input[type="text"]:focus {
+        outline: none;
+        border-color: #019cff;
+    }
+    .search-wrap {
+        position: relative;
+    }
+    .search-row {
+        display: flex;
+        gap: 10px;
+        align-items: stretch;
+    }
+    .search-row input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        margin: 0;
+    }
+    .btn-search {
+        flex-shrink: 0;
+        background: #012b58;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 12px 22px;
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+    }
+    .btn-search:hover {
+        opacity: 0.92;
+    }
+    .btn-search:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+    .search-results {
+        display: none;
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 100%;
+        z-index: 20;
+        background: white;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+        max-height: 320px;
+        overflow-y: auto;
+        margin-top: 4px;
+    }
+    .search-results.visible { display: block; }
+    .search-result-item {
+        padding: 12px 14px;
+        cursor: pointer;
+        border-bottom: 1px solid #f1f5f9;
+    }
+    .search-result-item:last-child { border-bottom: none; }
+    .search-result-item:hover,
+    .search-result-item.active {
+        background: #f8fafc;
+    }
+    .search-result-name {
+        font-weight: 600;
+        color: #1e293b;
+    }
+    .search-result-meta {
+        font-size: 12px;
+        color: #64748b;
+        margin-top: 2px;
+    }
+    .search-hint {
+        font-size: 13px;
+        color: #64748b;
+        margin-top: 8px;
+    }
+    .search-empty {
+        padding: 14px;
+        color: #64748b;
+        font-size: 14px;
+    }
+    .dashboard-header {
+        background: linear-gradient(135deg, #012b58 0%, #012b58 25%, #019cff 100%);
+        color: white;
+        padding: 0;
+        border-radius: 12px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 15px rgba(1, 43, 88, 0.35);
+        display: none;
+        overflow: hidden;
+    }
+    .dashboard-header-graphic {
+        display: none;
+        background: #ffffff;
+        text-align: center;
+        padding: 16px 20px;
+    }
+    .dashboard-header-graphic.visible {
+        display: block;
+    }
+    .dashboard-header-graphic img {
+        max-width: 100%;
+        max-height: 160px;
+        width: auto;
+        height: auto;
+        object-fit: contain;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+        background: #ffffff;
+    }
+    .dashboard-header-body {
+        padding: 24px 30px 30px;
+        display: flex;
+        align-items: center;
+        gap: 18px;
+    }
+    .dashboard-header-badge {
+        display: none;
+        flex-shrink: 0;
+        width: 64px;
+        height: 64px;
+        border-radius: 12px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.15);
+        border: 2px solid rgba(255, 255, 255, 0.35);
+    }
+    .dashboard-header-badge.visible {
+        display: block;
+    }
+    .dashboard-header-badge img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+    .dashboard-header-text {
+        min-width: 0;
+        flex: 1;
+    }
+    .dashboard-header h1 {
+        margin: 0 0 10px 0;
+        font-size: 32px;
+    }
+    .dashboard-header h1 a {
+        color: inherit;
+        text-decoration: none;
+    }
+    .dashboard-header h1 a:hover {
+        text-decoration: underline;
+    }
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        margin-bottom: 30px;
+    }
+    .stat-card {
+        background: white;
+        padding: 25px;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        text-align: center;
+    }
+    .stat-card-clickable {
+        cursor: pointer;
+        border: 2px solid transparent;
+        transition: box-shadow 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+    }
+    .stat-card-clickable:hover {
+        box-shadow: 0 4px 14px rgba(1, 43, 88, 0.15);
+        transform: translateY(-1px);
+        border-color: #019cff;
+    }
+    .stat-card-clickable.active {
+        border-color: #012b58;
+        background: #eef6ff;
+    }
+    .stat-card-clickable .stat-drill-hint {
+        font-size: 11px;
+        color: #64748b;
+        margin-top: 4px;
+        text-transform: none;
+        letter-spacing: 0;
+    }
+    .stat-value {
+        font-size: 36px;
+        font-weight: bold;
+        color: #012b58;
+        margin: 10px 0;
+    }
+    .stat-label {
+        color: #64748b;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .section {
+        background: white;
+        padding: 25px;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+    }
+    .section-title {
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0 0 20px 0;
+        color: #1e293b;
+    }
+    .chart-bar {
+        display: flex;
+        align-items: center;
+        margin-bottom: 15px;
+    }
+    .chart-label {
+        width: 160px;
+        font-size: 14px;
+        color: #475569;
+        word-break: break-word;
+    }
+    .chart-bar-container {
+        flex: 1;
+        background: #f1f5f9;
+        height: 30px;
+        border-radius: 6px;
+        overflow: hidden;
+        margin: 0 15px;
+    }
+    .chart-bar-fill {
+        height: 100%;
+        background: #012b58;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        padding-right: 10px;
+        color: white;
+        font-size: 12px;
+        font-weight: 600;
+        min-width: 0;
+    }
+    .chart-count {
+        width: 60px;
+        text-align: right;
+        font-weight: 600;
+        color: #012b58;
+    }
+    #dashboard-content { display: none; }
+    .subgroup-list { list-style: none; padding: 0; margin: 0; }
+    .subgroup-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 15px;
+        background: #f8fafc;
+        margin-bottom: 8px;
+        border-radius: 6px;
+        border-left: 3px solid #019cff;
+    }
+    .subgroup-name { font-weight: 500; color: #1e293b; }
+    .subgroup-count {
+        background: #012b58;
+        color: white;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    .dash-tabs {
+        display: none;
+        gap: 8px;
+        margin-bottom: 20px;
+    }
+    .dash-tabs.visible { display: flex; }
+    .dash-tab {
+        border: 2px solid #e2e8f0;
+        background: white;
+        color: #475569;
+        padding: 10px 18px;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .dash-tab[data-tab="overview"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab[data-tab="registration"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab[data-tab="allergies"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab-refresh {
+        border: 2px solid #e2e8f0;
+        background: white;
+        color: #475569;
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-left: auto;
+    }
+    .dash-tab-refresh:hover {
+        border-color: #019cff;
+        color: #012b58;
+    }
+    .dash-tab-refresh:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* Registration tab: #ccebff bg, all text #012b58, Export #ff7941 */
+    #tab-registration,
+    #tab-registration .section-title,
+    #tab-registration .reg-breadcrumb,
+    #tab-registration .reg-breadcrumb a,
+    #tab-registration .reg-question-title,
+    #tab-registration .reg-meta,
+    #tab-registration .reg-preview,
+    #tab-registration .chart-label,
+    #tab-registration .chart-count,
+    #tab-registration .clickable-option:hover .chart-label,
+    #tab-registration .people-table th,
+    #tab-registration .people-table td,
+    #tab-registration .people-table a,
+    #tab-registration .btn-back,
+    #tab-registration .empty-state,
+    #tab-registration .info-banner {
+        color: #012b58;
+    }
+    #tab-registration .section {
+        background: #ccebff;
+        border: 1px solid #b3d9f5;
+    }
+    #tab-registration .reg-question-card {
+        background: #fffef8;
+        border-color: #b3d9f5;
+    }
+    #tab-registration .reg-question-card:hover {
+        border-color: #019cff;
+        box-shadow: 0 2px 10px rgba(1, 156, 255, 0.18);
+    }
+    #tab-registration .chart-bar-fill {
+        background: #019cff;
+        color: #fff;
+    }
+    #tab-registration .btn-back {
+        background: #fffef8;
+        border-color: #b3d9f5;
+    }
+    #tab-registration .empty-state {
+        background: #fffef8;
+        border-color: #b3d9f5;
+    }
+    #tab-registration .info-banner {
+        background: #e8f6ff;
+        border-left-color: #012b58;
+    }
+    .reg-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+    }
+    .btn-reg-excel {
+        background: #ff7941;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 16px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-reg-excel:hover { background: #e56a35; color: #fff; }
+    .btn-reg-excel:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+    .other-group-bar {
+        border-radius: 6px;
+        padding: 4px 0;
+        margin-bottom: 4px;
+    }
+    .other-group-toggle {
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        border: none;
+        background: #f8fafc;
+        border-radius: 6px;
+        padding: 6px 8px;
+        text-align: left;
+    }
+    .other-group-toggle:hover {
+        background: #eef6ff;
+    }
+    .other-group-toggle .chart-label {
+        flex: 0 0 140px;
+        color: #012b58;
+        font-weight: 600;
+    }
+    .other-variants {
+        display: none;
+        margin: 4px 0 12px 12px;
+        padding-left: 8px;
+        border-left: 3px solid #cbd5e1;
+    }
+    .other-variants.expanded {
+        display: block;
+    }
+    .other-variant-meta {
+        font-size: 12px;
+        color: #64748b;
+        margin: 0 0 8px 0;
+    }
+    .reg-breadcrumb {
+        font-size: 14px;
+        color: #64748b;
+        margin-bottom: 16px;
+    }
+    .reg-breadcrumb a {
+        color: #019cff;
+        cursor: pointer;
+        text-decoration: none;
+        font-weight: 600;
+    }
+    .reg-question-card {
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        cursor: pointer;
+        transition: box-shadow 0.15s ease, border-color 0.15s ease;
+        background: #fff;
+    }
+    .reg-question-card:hover {
+        border-color: #019cff;
+        box-shadow: 0 2px 10px rgba(1, 156, 255, 0.18);
+    }
+    .reg-question-title {
+        font-weight: 600;
+        color: #1e293b;
+        margin: 0 0 8px 0;
+        font-size: 16px;
+    }
+    .reg-meta {
+        color: #64748b;
+        font-size: 13px;
+        margin-bottom: 10px;
+    }
+    .reg-preview {
+        color: #475569;
+        font-size: 13px;
+        font-style: italic;
+        margin-top: 6px;
+    }
+    .clickable-option {
+        cursor: pointer;
+    }
+    .clickable-option:hover .chart-label {
+        color: #019cff;
+        text-decoration: underline;
+    }
+    .age-bar-clickable {
+        cursor: pointer;
+        border-radius: 6px;
+        padding: 4px 0;
+        margin-bottom: 11px;
+    }
+    .age-bar-clickable:hover {
+        background: #f1f5f9;
+    }
+    .age-bar-clickable:hover .chart-label {
+        color: #012b58;
+        text-decoration: underline;
+    }
+    .age-bar-clickable.active {
+        background: #eef6ff;
+    }
+    .grade-bar-clickable {
+        cursor: pointer;
+        border-radius: 6px;
+        padding: 4px 0;
+        margin-bottom: 11px;
+    }
+    .grade-bar-clickable:hover {
+        background: #f1f5f9;
+    }
+    .grade-bar-clickable:hover .chart-label {
+        color: #012b58;
+        text-decoration: underline;
+    }
+    .grade-bar-clickable.active {
+        background: #eef6ff;
+    }
+    .grade-gender-filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 0 0 14px 0;
+    }
+    .grade-gender-filter {
+        border: 2px solid #e2e8f0;
+        background: #fff;
+        color: #334155;
+        border-radius: 999px;
+        padding: 6px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .grade-gender-filter:hover {
+        border-color: #019cff;
+        color: #012b58;
+    }
+    .grade-gender-filter.active {
+        background: #012b58;
+        border-color: #012b58;
+        color: #fff;
+    }
+    .marital-bar-clickable {
+        cursor: pointer;
+        border-radius: 6px;
+        padding: 4px 0;
+        margin-bottom: 11px;
+    }
+    .marital-bar-clickable:hover {
+        background: #f1f5f9;
+    }
+    .marital-bar-clickable:hover .chart-label {
+        color: #012b58;
+        text-decoration: underline;
+    }
+    .marital-bar-clickable.active {
+        background: #eef6ff;
+    }
+    .subgroup-item-clickable {
+        cursor: pointer;
+    }
+    .subgroup-item-clickable:hover {
+        background: #eef6ff;
+    }
+    .subgroup-item-clickable:hover .subgroup-name {
+        color: #012b58;
+        text-decoration: underline;
+    }
+    .subgroup-item-clickable.active {
+        background: #eef6ff;
+        border-left-color: #012b58;
+    }
+    .people-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .people-table th, .people-table td {
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid #e2e8f0;
+        vertical-align: top;
+    }
+    .people-table th {
+        color: #64748b;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+    }
+    .people-table a {
+        color: #019cff;
+        font-weight: 600;
+        text-decoration: none;
+    }
+    .people-table a:hover { text-decoration: underline; }
+    .finance-stat-clickable {
+        cursor: pointer;
+        transition: box-shadow 0.15s ease, transform 0.15s ease;
+        border: 2px solid transparent;
+    }
+    .finance-stat-clickable:hover {
+        box-shadow: 0 4px 14px rgba(1, 43, 88, 0.15);
+        transform: translateY(-1px);
+    }
+    .finance-stat-clickable.active {
+        border-color: #012b58;
+        background: #eef6ff !important;
+    }
+    .finance-drill-hint {
+        font-size: 12px;
+        color: #64748b;
+        margin-top: 6px;
+    }
+    .finance-drill-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: #1e293b;
+        margin: 0 0 12px 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+    }
+    .drill-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .btn-tag-add {
+        background: #012b58;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-tag-add:hover { background: #019cff; color: #fff; }
+    .btn-tag-add:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+    .tag-modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10050;
+        background: rgba(15, 23, 42, 0.45);
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+    }
+    .tag-modal-overlay.visible { display: flex; }
+    .tag-modal {
+        background: #fff;
+        border-radius: 14px;
+        width: 100%;
+        max-width: 440px;
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+        overflow: hidden;
+    }
+    .tag-modal-header {
+        padding: 16px 20px;
+        background: #012b58;
+        color: #fff;
+        font-size: 18px;
+        font-weight: 600;
+    }
+    .tag-modal-body { padding: 20px; }
+    .tag-modal-body label {
+        display: block;
+        font-weight: 600;
+        color: #334155;
+        margin-bottom: 6px;
+        font-size: 13px;
+    }
+    .tag-modal-body input[type="text"] {
+        width: 100%;
+        padding: 10px 12px;
+        border: 2px solid #e2e8f0;
+        border-radius: 8px;
+        font-size: 15px;
+        box-sizing: border-box;
+        margin-bottom: 16px;
+    }
+    .tag-modal-body input[type="text"]:focus {
+        outline: none;
+        border-color: #019cff;
+    }
+    .tag-modal-meta {
+        font-size: 13px;
+        color: #64748b;
+        margin: 0 0 14px 0;
+    }
+    .tag-modal-options {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-bottom: 8px;
+    }
+    .tag-modal-options label.option-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        font-weight: 500;
+        cursor: pointer;
+        margin: 0;
+    }
+    .tag-modal-options input {
+        margin-top: 3px;
+    }
+    .tag-modal-footer {
+        padding: 14px 20px 20px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+    }
+    .btn-tag-confirm {
+        background: #012b58;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 16px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-tag-confirm:hover { background: #019cff; }
+    .btn-back {
+        background: #f1f5f9;
+        color: #334155;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .empty-state {
+        background: #f8fafc;
+        border: 1px dashed #cbd5e1;
+        border-radius: 10px;
+        padding: 28px;
+        text-align: center;
+        color: #64748b;
+    }
+    .info-banner {
+        background: #eff6ff;
+        border-left: 4px solid #3b82f6;
+        padding: 16px 18px;
+        border-radius: 8px;
+        color: #1e3a8a;
+    }
+    .loading-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10100;
+        background: rgba(15, 23, 42, 0.35);
+        align-items: center;
+        justify-content: center;
+    }
+    .loading-overlay.visible {
+        display: flex;
+    }
+    .loading-card {
+        background: #fff;
+        border-radius: 14px;
+        padding: 28px 36px;
+        box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25);
+        text-align: center;
+        min-width: 220px;
+    }
+    .loading-spinner {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 16px;
+        border: 4px solid #e2e8f0;
+        border-top-color: #019cff;
+        border-radius: 50%;
+        animation: dash-spin 0.8s linear infinite;
+    }
+    .loading-overlay.reg-loading .loading-spinner {
+        border-top-color: #019cff;
+    }
+    .loading-text {
+        color: #1e293b;
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0;
+    }
+    .loading-subtext {
+        color: #64748b;
+        font-size: 13px;
+        margin: 8px 0 0;
+    }
+    .btn-cancel-loading {
+        margin-top: 16px;
+        background: #f1f5f9;
+        color: #334155;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-cancel-loading:hover {
+        background: #e2e8f0;
+    }
+    @keyframes dash-spin {
+        to { transform: rotate(360deg); }
+    }
+</style>
+
+<div class="dashboard-container">
+    <div class="loading-overlay" id="loading-overlay" aria-live="polite" aria-busy="false">
+        <div class="loading-card">
+            <div class="loading-spinner"></div>
+            <p class="loading-text" id="loading-text">Loading...</p>
+            <p class="loading-subtext">This may take a minute to go to space and back. 🚀</p>
+            <button type="button" class="btn-cancel-loading" id="btn-cancel-loading">Cancel</button>
+        </div>
+    </div>
+
+    <div class="tag-modal-overlay" id="tag-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="tag-modal-title">
+        <div class="tag-modal">
+            <div class="tag-modal-header" id="tag-modal-title">Add to Tag</div>
+            <div class="tag-modal-body">
+                <p class="tag-modal-meta" id="tag-modal-count"></p>
+                <label for="tag-name-input">Tag name</label>
+                <input type="text" id="tag-name-input" maxlength="50" placeholder="e.g. FW Volunteers 18-24" autocomplete="off" />
+                <div class="tag-modal-options">
+                    <label class="option-row">
+                        <input type="radio" name="tag-mode" value="append" checked />
+                        <span>Append — add these people; keep anyone already on the tag</span>
+                    </label>
+                    <label class="option-row">
+                        <input type="radio" name="tag-mode" value="clear" />
+                        <span>Clear first — empty the tag, then add only this list</span>
+                    </label>
+                    <label class="option-row">
+                        <input type="checkbox" id="tag-open-when-done" checked />
+                        <span>Open the tag in a new tab when done</span>
+                    </label>
+                </div>
+            </div>
+            <div class="tag-modal-footer">
+                <button type="button" class="btn-back" id="btn-tag-cancel">Cancel</button>
+                <button type="button" class="btn-tag-confirm" id="btn-tag-confirm">Add to Tag</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="selector-card" id="selector-card">
+        <h2><i class="fa fa-search"></i> Find Involvement</h2>
+        <div id="selector-content">
+            <div class="search-wrap">
+                <div class="search-row">
+                    <input type="text" id="org-search" placeholder="Type an involvement name..." autocomplete="off" />
+                    <button type="button" class="btn-search" id="btn-search-org">
+                        <i class="fa fa-search"></i> Search
+                    </button>
+                </div>
+                <div class="search-results" id="search-results"></div>
+            </div>
+            <div class="search-hint">Enter at least 2 characters, then click Search (or press Enter). Click a result to open the dashboard.</div>
+        </div>
+    </div>
+
+    <div id="dashboard-content">
+        <div class="dashboard-header" id="dashboard-header">
+            <div class="dashboard-header-graphic" id="header-graphic">
+                <img id="org-graphic" alt="Involvement title graphic" />
+            </div>
+            <div class="dashboard-header-body">
+                <div class="dashboard-header-badge" id="header-badge">
+                    <img id="org-badge" alt="Channel logo" />
+                </div>
+                <div class="dashboard-header-text">
+                    <h1 id="org-name"></h1>
+                    <p id="org-info" style="margin: 0; opacity: 0.9;"></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="dash-tabs" id="dash-tabs">
+            <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
+            <button type="button" class="dash-tab" data-tab="registration">Registration</button>
+            <button type="button" class="dash-tab" data-tab="allergies">Allergies</button>
+            <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh this involvement" aria-label="Refresh">
+                <i class="fa fa-refresh"></i>
+            </button>
+        </div>
+
+        <div class="tab-panel active" id="tab-overview">
+            <div class="stats-grid" id="stats-grid"></div>
+            <div id="gender-drilldown" style="display:none; margin: 0 0 30px 0;"></div>
+            <div class="section" id="age-section" style="display:none;">
+                <h2 class="section-title" id="distribution-title"><i class="fa fa-chart-bar"></i> Age Distribution</h2>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click an age group to view people</p>
+                <div id="age-chart"></div>
+                <div id="age-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+            <div class="section" id="grade-section" style="display:none;">
+                <h2 class="section-title"><i class="fa fa-graduation-cap"></i> Grade Distribution</h2>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a grade, then filter All / Male / Female</p>
+                <div id="grade-chart"></div>
+                <div id="grade-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+            <div class="section" id="marital-section" style="display:none;">
+                <h2 class="section-title"><i class="fa fa-heart"></i> Marital Status</h2>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a status to view people</p>
+                <div id="marital-chart"></div>
+                <div id="marital-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+            <div class="section" id="timeline-section" style="display:none;">
+                <h2 class="section-title"><i class="fa fa-calendar-plus"></i> Enrollment Timeline (Last 12 Months)</h2>
+                <div id="timeline-chart"></div>
+            </div>
+            <div class="section" id="transaction-section" style="display:none;">
+                <h2 class="section-title"><i class="fa fa-dollar"></i> Financial Transactions</h2>
+                <div id="transaction-summary"></div>
+                <div id="finance-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+            <div class="section" id="subgroup-section" style="display:none;">
+                <h2 class="section-title"><i class="fa fa-layer-group"></i> Subgroups</h2>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a subgroup to view people</p>
+                <div id="subgroup-list"></div>
+                <div id="subgroup-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-registration">
+            <div class="section">
+                <div class="reg-toolbar">
+                    <h2 class="section-title" style="margin:0;"><i class="fa fa-clipboard-list"></i> Registration Questions</h2>
+                    <div>
+                        <button type="button" class="btn-reg-excel" id="btn-reg-excel" style="display:none;">
+                            <i class="fa fa-download"></i> Registration Report (Excel)
+                        </button>
+                    </div>
+                </div>
+                <div class="reg-breadcrumb" id="reg-breadcrumb"></div>
+                <div id="reg-view"></div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-allergies">
+            <div class="section">
+                <div class="reg-toolbar">
+                    <h2 class="section-title" style="margin:0;"><i class="fa fa-medkit"></i> Allergies</h2>
+                </div>
+                <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                    Participants with allergy notes from the default allergies list (RecReg).
+                </p>
+                <div id="allergies-view"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    function initDashboard() {
+        var scriptUrl = window.location.pathname;
+        var currentOrgId = null;
+        var initialOrgId = __INITIAL_ORG_ID__;
+        var initialOrgName = __INITIAL_ORG_NAME__;
+        var regState = { view: 'summary', question: null, option: null, person: null, summary: null };
+        var gradeDrillState = { label: '', people: [], filter: 'all' };
+        var currentXhr = null;
+        var loadGeneration = 0;
+
+        function esc(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function personLink(peopleId, name) {
+            return '<a href="/Person2/' + encodeURIComponent(peopleId) + '" target="_blank" rel="noopener">' + esc(name) + '</a>';
+        }
+
+        var pendingTagPeopleIds = [];
+
+        function collectPeopleIds(people) {
+            var ids = [];
+            var seen = {};
+            (people || []).forEach(function(p) {
+                var id = p && p.people_id ? parseInt(p.people_id, 10) : 0;
+                if (id > 0 && !seen[id]) {
+                    seen[id] = true;
+                    ids.push(id);
+                }
+            });
+            return ids;
+        }
+
+        function drillActionsHtml(options) {
+            options = options || {};
+            var ids = options.peopleIds || [];
+            var html = '<div class="drill-actions">';
+            if (ids.length) {
+                html += '<button type="button" class="btn-tag-add" data-people-ids="' + esc(ids.join(',')) + '">';
+                html += '<i class="fa fa-tag"></i> Add to Tag</button>';
+            }
+            if (options.closeBtnId) {
+                html += '<button type="button" class="btn-back" id="' + esc(options.closeBtnId) + '">' +
+                    esc(options.closeLabel || 'Close') + '</button>';
+            }
+            if (options.backNav) {
+                html += '<button type="button" class="btn-back" data-nav="' + esc(options.backNav) + '">';
+                html += '<i class="fa fa-arrow-left"></i> ' + esc(options.backLabel || 'Back') + '</button>';
+            }
+            html += '</div>';
+            return html;
+        }
+
+        function openTagModal(peopleIds, suggestedName) {
+            pendingTagPeopleIds = peopleIds || [];
+            if (!pendingTagPeopleIds.length) {
+                alert('No people in this list to tag.');
+                return;
+            }
+            $('#tag-modal-count').text(pendingTagPeopleIds.length + ' people will be added to this tag.');
+            $('#tag-name-input').val(suggestedName || '');
+            $('input[name="tag-mode"][value="append"]').prop('checked', true);
+            $('#tag-open-when-done').prop('checked', true);
+            $('#tag-modal-overlay').addClass('visible');
+            setTimeout(function() { $('#tag-name-input').focus().select(); }, 50);
+        }
+
+        function closeTagModal() {
+            $('#tag-modal-overlay').removeClass('visible');
+            pendingTagPeopleIds = [];
+        }
+
+        function submitAddToTag() {
+            var tagName = $.trim($('#tag-name-input').val() || '');
+            if (!tagName) {
+                alert('Enter a tag name.');
+                $('#tag-name-input').focus();
+                return;
+            }
+            if (!pendingTagPeopleIds.length) {
+                alert('No people to tag.');
+                return;
+            }
+            var clearFirst = $('input[name="tag-mode"]:checked').val() === 'clear';
+            var openWhenDone = $('#tag-open-when-done').is(':checked');
+            var idsCsv = pendingTagPeopleIds.join(',');
+            $('#tag-modal-overlay').removeClass('visible');
+            showLoading('Adding people to tag...', false);
+            ajaxPost({
+                action: 'add_to_tag',
+                people_ids: idsCsv,
+                tag_name: tagName,
+                clear_first: clearFirst ? '1' : '0'
+            }, function(data) {
+                pendingTagPeopleIds = [];
+                if (data.error) {
+                    alert(data.error);
+                    $('#tag-modal-overlay').addClass('visible');
+                    return;
+                }
+                var msg = (data.count || 0) + ' people added to tag "' + (data.tag_name || tagName) + '"';
+                if (data.cleared) msg += ' (tag cleared first)';
+                if (openWhenDone && data.tag_url) {
+                    window.open(data.tag_url, '_blank', 'noopener');
+                } else {
+                    alert(msg + '.');
+                }
+            }, { showLoading: true });
+        }
+
+        $(document).on('click', '.btn-tag-add', function() {
+            var ids = String($(this).attr('data-people-ids') || '')
+                .split(',')
+                .map(function(x) { return parseInt(x, 10); })
+                .filter(function(x) { return x > 0; });
+            var suggested = String($(this).attr('data-tag-suggest') || '');
+            openTagModal(ids, suggested);
+        });
+
+        $(document).on('click', '#btn-tag-cancel', function() {
+            closeTagModal();
+        });
+
+        $(document).on('click', '#btn-tag-confirm', function() {
+            submitAddToTag();
+        });
+
+        $(document).on('keydown', '#tag-name-input', function(e) {
+            if (e.which === 13) {
+                e.preventDefault();
+                submitAddToTag();
+            } else if (e.which === 27) {
+                closeTagModal();
+            }
+        });
+
+        $(document).on('click', '#tag-modal-overlay', function(e) {
+            if (e.target === this) closeTagModal();
+        });
+
+        function showLoading(message, isReg) {
+            $('#loading-text').text(message || 'Loading...');
+            $('#loading-overlay')
+                .toggleClass('reg-loading', !!isReg)
+                .attr('aria-busy', 'true')
+                .addClass('visible');
+        }
+
+        function hideLoading() {
+            $('#loading-overlay')
+                .attr('aria-busy', 'false')
+                .removeClass('visible reg-loading');
+        }
+
+        function cancelLoading() {
+            loadGeneration += 1;
+            if (currentXhr && typeof currentXhr.abort === 'function') {
+                try { currentXhr.abort(); } catch (e) {}
+            }
+            currentXhr = null;
+            hideLoading();
+            $('#finance-drilldown').filter(':visible').html(
+                '<div class="empty-state">Request cancelled.</div>'
+            );
+            $('.finance-stat-clickable').removeClass('active');
+        }
+
+        $('#btn-cancel-loading').on('click', function() {
+            cancelLoading();
+        });
+
+        function ajaxPost(data, success, options) {
+            options = options || {};
+            var gen = loadGeneration;
+            currentXhr = $.ajax({
+                url: scriptUrl,
+                type: 'POST',
+                data: $.extend({ ajax: 'true' }, data),
+                success: function(response) {
+                    if (gen !== loadGeneration) return;
+                    var parsed = typeof response === 'string' ? JSON.parse(response) : response;
+                    success(parsed);
+                },
+                error: function(xhr, textStatus) {
+                    if (textStatus === 'abort' || gen !== loadGeneration) return;
+                    alert('Request failed: ' + (xhr.statusText || 'error'));
+                },
+                complete: function(xhr) {
+                    if (currentXhr === xhr) {
+                        currentXhr = null;
+                    }
+                    if (options.hideLoadingOnComplete !== false && options.showLoading) {
+                        if (gen === loadGeneration) {
+                            hideLoading();
+                        }
+                    }
+                    if (typeof options.complete === 'function') {
+                        options.complete();
+                    }
+                }
+            });
+            return currentXhr;
+        }
+
+        $(document).on('click', '#selector-card h2.selector-toggleable', function() {
+            $('#selector-content').slideToggle();
+        });
+
+        $(document).on('click', '.dash-tab', function() {
+            var tab = $(this).data('tab');
+            $('.dash-tab').removeClass('active');
+            $(this).addClass('active');
+            $('.tab-panel').removeClass('active');
+            $('#tab-' + tab).addClass('active');
+            if (tab === 'registration' && currentOrgId) {
+                loadRegistrationSummary();
+            }
+            if (tab === 'allergies' && currentOrgId) {
+                loadAllergies();
+            }
+        });
+
+        $(document).on('click', '#btn-refresh-dashboard', function() {
+            if (!currentOrgId) return;
+            refreshCurrentInvolvement();
+        });
+
+        var searchTimer = null;
+        var searchReq = 0;
+
+        function hideSearchResults() {
+            $('#search-results').removeClass('visible').empty();
+        }
+
+        function renderSearchResults(items) {
+            var $box = $('#search-results');
+            if (!items || !items.length) {
+                $box.html('<div class="search-empty">No matching involvements found.</div>').addClass('visible');
+                return;
+            }
+            var html = '';
+            items.forEach(function(org) {
+                var meta = [];
+                if (org.program) meta.push(org.program);
+                if (org.division) meta.push(org.division);
+                meta.push('ID ' + org.id);
+                html += '<div class="search-result-item" data-org-id="' + org.id + '">';
+                html += '<div class="search-result-name">' + esc(org.name) + '</div>';
+                html += '<div class="search-result-meta">' + esc(meta.join(' · ')) + '</div>';
+                html += '</div>';
+            });
+            $box.html(html).addClass('visible');
+        }
+
+        function runOrgSearch(immediate) {
+            var term = $.trim($('#org-search').val() || '');
+            clearTimeout(searchTimer);
+            if (term.length < 2) {
+                hideSearchResults();
+                if (immediate) {
+                    $('#search-results').html('<div class="search-empty">Enter at least 2 characters to search.</div>').addClass('visible');
+                }
+                return;
+            }
+            var doSearch = function() {
+                var reqId = ++searchReq;
+                $('#btn-search-org').prop('disabled', true);
+                ajaxPost({ action: 'search_involvements', term: term }, function(data) {
+                    if (reqId !== searchReq) return;
+                    if (data && data.error) {
+                        $('#search-results').html('<div class="search-empty">Error: ' + esc(data.error) + '</div>').addClass('visible');
+                        return;
+                    }
+                    renderSearchResults(data || []);
+                }, {
+                    complete: function() {
+                        $('#btn-search-org').prop('disabled', false);
+                    }
+                });
+            };
+            if (immediate) {
+                doSearch();
+            } else {
+                searchTimer = setTimeout(doSearch, 250);
+            }
+        }
+
+        $('#org-search').on('input', function() {
+            runOrgSearch(false);
+        });
+
+        $('#btn-search-org').on('click', function() {
+            runOrgSearch(true);
+        });
+
+        $('#org-search').on('keydown', function(e) {
+            if (e.keyCode === 27) {
+                hideSearchResults();
+            } else if (e.keyCode === 13) {
+                e.preventDefault();
+                runOrgSearch(true);
+            }
+        });
+
+        $(document).on('click', '.search-result-item', function() {
+            var orgId = $(this).attr('data-org-id');
+            var name = $(this).find('.search-result-name').text();
+            hideSearchResults();
+            $('#org-search').val(name);
+            currentOrgId = orgId;
+            loadOverviewDashboard(orgId);
+        });
+
+        $(document).on('click', function(e) {
+            if (!$(e.target).closest('.search-wrap').length) {
+                hideSearchResults();
+            }
+        });
+
+        $(document).on('click', '.age-bar-clickable', function() {
+            var bracket = String($(this).attr('data-age-bracket') || '');
+            if (!currentOrgId || !bracket) return;
+            $('.age-bar-clickable').removeClass('active');
+            $(this).addClass('active');
+            showLoading('Loading people for age ' + bracket + '...', false);
+            $('#age-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_age_people',
+                org_id: currentOrgId,
+                bracket: bracket
+            }, function(data) {
+                if (data.error) {
+                    $('#age-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="finance-drill-title">';
+                html += '<span>Age ' + esc(data.label) + ' — ' + (data.count || 0) + ' people</span>';
+                html += drillActionsHtml({
+                    peopleIds: peopleIds,
+                    closeBtnId: 'btn-close-age-drill'
+                });
+                html += '</div>';
+                if (!data.people || !data.people.length) {
+                    html += '<div class="empty-state">No people found in this age group.</div>';
+                } else {
+                    html += '<table class="people-table"><thead><tr><th>Person</th><th>Age</th></tr></thead><tbody>';
+                    data.people.forEach(function(p) {
+                        html += '<tr><td>';
+                        if (p.people_id) {
+                            html += personLink(p.people_id, p.name);
+                        } else {
+                            html += esc(p.name);
+                        }
+                        html += '</td><td>' + (p.age == null ? 'Unknown' : p.age) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                $('#age-drilldown').html(html).show();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '#btn-close-age-drill', function() {
+            $('#age-drilldown').hide().empty();
+            $('.age-bar-clickable').removeClass('active');
+        });
+
+        $(document).on('click', '.stat-card-clickable[data-gender]', function() {
+            var gender = String($(this).attr('data-gender') || '');
+            if (!currentOrgId || !gender) return;
+            $('.stat-card-clickable[data-gender]').removeClass('active');
+            $(this).addClass('active');
+            var label = gender === 'female' ? 'Female' : 'Male';
+            showLoading('Loading ' + label.toLowerCase() + ' members...', false);
+            $('#gender-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_gender_people',
+                org_id: currentOrgId,
+                gender: gender
+            }, function(data) {
+                if (data.error) {
+                    $('#gender-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="section" style="margin:0;">';
+                html += '<div class="finance-drill-title">';
+                html += '<span>' + esc(data.label) + ' — ' + (data.count || 0) + ' people</span>';
+                html += drillActionsHtml({
+                    peopleIds: peopleIds,
+                    closeBtnId: 'btn-close-gender-drill'
+                });
+                html += '</div>';
+                if (!data.people || !data.people.length) {
+                    html += '<div class="empty-state">No people found for this gender.</div>';
+                } else {
+                    html += '<table class="people-table"><thead><tr><th>Person</th></tr></thead><tbody>';
+                    data.people.forEach(function(p) {
+                        html += '<tr><td>';
+                        if (p.people_id) {
+                            html += personLink(p.people_id, p.name);
+                        } else {
+                            html += esc(p.name);
+                        }
+                        html += '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                html += '</div>';
+                $('#gender-drilldown').html(html).show();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '#btn-close-gender-drill', function() {
+            $('#gender-drilldown').hide().empty();
+            $('.stat-card-clickable[data-gender]').removeClass('active');
+        });
+
+        function filterGradePeople(people, genderFilter) {
+            genderFilter = genderFilter || 'all';
+            if (genderFilter === 'all') return people || [];
+            return (people || []).filter(function(p) {
+                return (p.gender || '') === genderFilter;
+            });
+        }
+
+        function gradeFilterLabel(filter) {
+            if (filter === 'male') return 'Male';
+            if (filter === 'female') return 'Female';
+            if (filter === 'unknown') return 'Unknown';
+            return 'All';
+        }
+
+        function renderGradeDrilldown() {
+            var allPeople = gradeDrillState.people || [];
+            var filter = gradeDrillState.filter || 'all';
+            var filtered = filterGradePeople(allPeople, filter);
+            var maleCount = filterGradePeople(allPeople, 'male').length;
+            var femaleCount = filterGradePeople(allPeople, 'female').length;
+            var peopleIds = collectPeopleIds(filtered);
+            var title = 'Grade ' + esc(gradeDrillState.label);
+            if (filter !== 'all') {
+                title += ' · ' + esc(gradeFilterLabel(filter));
+            }
+            title += ' — ' + filtered.length + ' people';
+
+            var html = '<div class="finance-drill-title">';
+            html += '<span>' + title + '</span>';
+            html += drillActionsHtml({
+                peopleIds: peopleIds,
+                closeBtnId: 'btn-close-grade-drill'
+            });
+            html += '</div>';
+            html += '<div class="grade-gender-filters">';
+            html += '<button type="button" class="grade-gender-filter' + (filter === 'all' ? ' active' : '') + '" data-grade-gender="all">All (' + allPeople.length + ')</button>';
+            html += '<button type="button" class="grade-gender-filter' + (filter === 'male' ? ' active' : '') + '" data-grade-gender="male">Male (' + maleCount + ')</button>';
+            html += '<button type="button" class="grade-gender-filter' + (filter === 'female' ? ' active' : '') + '" data-grade-gender="female">Female (' + femaleCount + ')</button>';
+            html += '</div>';
+            if (!filtered.length) {
+                html += '<div class="empty-state">No people found for this grade' +
+                    (filter === 'all' ? '' : ' / ' + gradeFilterLabel(filter).toLowerCase()) + '.</div>';
+            } else {
+                html += '<table class="people-table"><thead><tr><th>Person</th><th>Grade</th><th>Gender</th></tr></thead><tbody>';
+                filtered.forEach(function(p) {
+                    html += '<tr><td>';
+                    if (p.people_id) {
+                        html += personLink(p.people_id, p.name);
+                    } else {
+                        html += esc(p.name);
+                    }
+                    html += '</td><td>' + esc(p.grade || gradeDrillState.label) + '</td>';
+                    html += '<td>' + esc(gradeFilterLabel(p.gender || 'unknown')) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+            }
+            $('#grade-drilldown').html(html).show();
+        }
+
+        $(document).on('click', '.grade-bar-clickable', function() {
+            var grade = String($(this).attr('data-grade') || '');
+            if (!currentOrgId || !grade) return;
+            $('.grade-bar-clickable').removeClass('active');
+            $(this).addClass('active');
+            showLoading('Loading people for grade ' + grade + '...', false);
+            $('#grade-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_grade_people',
+                org_id: currentOrgId,
+                grade: grade
+            }, function(data) {
+                if (data.error) {
+                    $('#grade-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                gradeDrillState = {
+                    label: data.label || grade,
+                    people: data.people || [],
+                    filter: 'all'
+                };
+                renderGradeDrilldown();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '.grade-gender-filter', function() {
+            var next = String($(this).attr('data-grade-gender') || 'all');
+            gradeDrillState.filter = next;
+            renderGradeDrilldown();
+        });
+
+        $(document).on('click', '#btn-close-grade-drill', function() {
+            $('#grade-drilldown').hide().empty();
+            $('.grade-bar-clickable').removeClass('active');
+            gradeDrillState = { label: '', people: [], filter: 'all' };
+        });
+
+        $(document).on('click', '.marital-bar-clickable', function() {
+            var status = String($(this).attr('data-marital-status') || '');
+            if (!currentOrgId || !status) return;
+            $('.marital-bar-clickable').removeClass('active');
+            $(this).addClass('active');
+            showLoading('Loading people for ' + status + '...', false);
+            $('#marital-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_marital_people',
+                org_id: currentOrgId,
+                status: status
+            }, function(data) {
+                if (data.error) {
+                    $('#marital-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="finance-drill-title">';
+                html += '<span>' + esc(data.label) + ' — ' + (data.count || 0) + ' people</span>';
+                html += drillActionsHtml({
+                    peopleIds: peopleIds,
+                    closeBtnId: 'btn-close-marital-drill'
+                });
+                html += '</div>';
+                if (!data.people || !data.people.length) {
+                    html += '<div class="empty-state">No people found for this marital status.</div>';
+                } else {
+                    html += '<table class="people-table"><thead><tr><th>Person</th><th>Marital Status</th></tr></thead><tbody>';
+                    data.people.forEach(function(p) {
+                        html += '<tr><td>';
+                        if (p.people_id) {
+                            html += personLink(p.people_id, p.name);
+                        } else {
+                            html += esc(p.name);
+                        }
+                        html += '</td><td>' + esc(p.marital_status || data.label) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                $('#marital-drilldown').html(html).show();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '#btn-close-marital-drill', function() {
+            $('#marital-drilldown').hide().empty();
+            $('.marital-bar-clickable').removeClass('active');
+        });
+
+        $(document).on('click', '.subgroup-item-clickable', function() {
+            var subgroupId = String($(this).attr('data-subgroup-id') || '');
+            var subgroupName = String($(this).attr('data-subgroup-name') || 'Subgroup');
+            if (!currentOrgId || !subgroupId) return;
+            $('.subgroup-item-clickable').removeClass('active');
+            $(this).addClass('active');
+            showLoading('Loading people for ' + subgroupName + '...', false);
+            $('#subgroup-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_subgroup_people',
+                org_id: currentOrgId,
+                subgroup_id: subgroupId
+            }, function(data) {
+                if (data.error) {
+                    $('#subgroup-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="finance-drill-title">';
+                html += '<span>' + esc(data.label) + ' — ' + (data.count || 0) + ' people</span>';
+                html += drillActionsHtml({
+                    peopleIds: peopleIds,
+                    closeBtnId: 'btn-close-subgroup-drill'
+                });
+                html += '</div>';
+                if (!data.people || !data.people.length) {
+                    html += '<div class="empty-state">No people found in this subgroup.</div>';
+                } else {
+                    html += '<table class="people-table"><thead><tr><th>Person</th></tr></thead><tbody>';
+                    data.people.forEach(function(p) {
+                        html += '<tr><td>';
+                        if (p.people_id) {
+                            html += personLink(p.people_id, p.name);
+                        } else {
+                            html += esc(p.name);
+                        }
+                        html += '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                $('#subgroup-drilldown').html(html).show();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '#btn-close-subgroup-drill', function() {
+            $('#subgroup-drilldown').hide().empty();
+            $('.subgroup-item-clickable').removeClass('active');
+        });
+
+        $(document).on('click', '.finance-stat-clickable', function() {
+            var status = String($(this).data('finance-status') || '');
+            if (!currentOrgId || !status) return;
+            $('.finance-stat-clickable').removeClass('active');
+            $(this).addClass('active');
+            showLoading('Loading people...', false);
+            $('#finance-drilldown').show().html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_finance_people',
+                org_id: currentOrgId,
+                status: status
+            }, function(data) {
+                if (data.error) {
+                    $('#finance-drilldown').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var money = function(n) {
+                    return '$' + (n || 0).toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,');
+                };
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="finance-drill-title">';
+                html += '<span>' + esc(data.label) + ' — ' + (data.count || 0) + ' people</span>';
+                html += drillActionsHtml({
+                    peopleIds: peopleIds,
+                    closeBtnId: 'btn-close-finance-drill'
+                });
+                html += '</div>';
+                if (!data.people || !data.people.length) {
+                    html += '<div class="empty-state">No people found for this category.</div>';
+                } else {
+                    html += '<table class="people-table"><thead><tr><th>Person</th><th>Paid</th><th>Balance Due</th></tr></thead><tbody>';
+                    data.people.forEach(function(p) {
+                        html += '<tr><td>';
+                        if (p.people_id) {
+                            html += personLink(p.people_id, p.name);
+                        } else {
+                            html += esc(p.name);
+                        }
+                        html += '</td><td>' + money(p.total_paid) + '</td>';
+                        html += '<td>' + money(p.balance_due) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                $('#finance-drilldown').html(html).show();
+            }, { showLoading: true });
+        });
+
+        $(document).on('click', '#btn-close-finance-drill', function() {
+            $('#finance-drilldown').hide().empty();
+            $('.finance-stat-clickable').removeClass('active');
+        });
+
+        function refreshCurrentInvolvement() {
+            if (!currentOrgId) return;
+            var activeTab = $('.dash-tab.active').data('tab') || 'overview';
+            loadOverviewDashboard(currentOrgId, { preserveTab: activeTab });
+        }
+
+        function loadOverviewDashboard(orgId, options) {
+            options = options || {};
+            var preserveTab = options.preserveTab || null;
+            showLoading(preserveTab ? 'Refreshing involvement...' : 'Loading involvement dashboard...', false);
+            ajaxPost({ action: 'get_dashboard', org_id: orgId }, function(data) {
+                if (data.error) {
+                    alert('Error: ' + data.error + (data.traceback ? '\n\n' + data.traceback : ''));
+                    return;
+                }
+
+                $('#org-name').html(
+                    '<a href="/Org/' + esc(String(currentOrgId || orgId)) + '" target="_blank" rel="noopener noreferrer">' +
+                    esc(data.org_name) +
+                    '</a>'
+                );
+                $('#org-info').text(data.program_name + ' - ' + data.division_name);
+
+                // Mobile/Sites title graphic (Photo / Sites hero) + optional channel logo
+                if (data.title_graphic_url) {
+                    $('#org-graphic')
+                        .attr('src', data.title_graphic_url)
+                        .attr('alt', (data.org_name || 'Involvement') + ' title graphic')
+                        .off('error').on('error', function() {
+                            $('#header-graphic').removeClass('visible');
+                        });
+                    $('#header-graphic').addClass('visible');
+                } else {
+                    $('#org-graphic').removeAttr('src');
+                    $('#header-graphic').removeClass('visible');
+                }
+                if (data.badge_url) {
+                    $('#org-badge')
+                        .attr('src', data.badge_url)
+                        .attr('alt', (data.org_name || 'Involvement') + ' logo')
+                        .off('error').on('error', function() {
+                            $('#header-badge').removeClass('visible');
+                        });
+                    $('#header-badge').addClass('visible');
+                } else {
+                    $('#org-badge').removeAttr('src');
+                    $('#header-badge').removeClass('visible');
+                }
+
+                $('#dashboard-header').show();
+                $('#dash-tabs').addClass('visible');
+
+                $('#selector-content').slideUp();
+                $('#selector-card h2')
+                    .addClass('selector-toggleable')
+                    .html('<i class="fa fa-search"></i> Find Involvement <span id="toggle-selector" style="float:right;"><i class="fa fa-chevron-down"></i></span>');
+
+                // Restore tab on refresh; otherwise open Overview
+                var tabToShow = preserveTab || 'overview';
+                if (tabToShow !== 'overview' && tabToShow !== 'registration' && tabToShow !== 'allergies') {
+                    tabToShow = 'overview';
+                }
+                $('.dash-tab').removeClass('active');
+                $('.dash-tab[data-tab="' + tabToShow + '"]').addClass('active');
+                $('.tab-panel').removeClass('active');
+                $('#tab-' + tabToShow).addClass('active');
+
+                var statsHtml = '';
+                statsHtml += '<div class="stat-card"><div class="stat-label">Total Members</div><div class="stat-value">' + data.total_members + '</div></div>';
+                statsHtml += '<div class="stat-card stat-card-clickable" data-gender="male">';
+                statsHtml += '<div class="stat-label">Male</div><div class="stat-value">' + data.male_count + '</div>';
+                statsHtml += '<div class="stat-drill-hint">Click to view people</div></div>';
+                statsHtml += '<div class="stat-card stat-card-clickable" data-gender="female">';
+                statsHtml += '<div class="stat-label">Female</div><div class="stat-value">' + data.female_count + '</div>';
+                statsHtml += '<div class="stat-drill-hint">Click to view people</div></div>';
+                $('#stats-grid').html(statsHtml);
+                $('#gender-drilldown').hide().empty();
+                gradeDrillState = { label: '', people: [], filter: 'all' };
+
+                var profile = data.overview_profile || {};
+                $('#age-section').hide();
+                $('#grade-section').hide();
+                $('#marital-section').hide();
+                $('#timeline-section').hide();
+
+                if (profile.show_age && data.age_groups) {
+                    var ageHtml = '';
+                    var ageOrder = ['0-5', '6-10', '11-13', '14-17', '18-24', '25-29', '30-39', '40-49', '50-64', '65+', 'Unknown'];
+                    var maxAge = Math.max.apply(null, Object.values(data.age_groups).concat([0]));
+                    ageOrder.forEach(function(ageGroup) {
+                        if (data.age_groups[ageGroup] && data.age_groups[ageGroup] > 0) {
+                            var count = data.age_groups[ageGroup];
+                            var pct = maxAge > 0 ? Math.round((count / maxAge) * 100) : 0;
+                            var totalPct = data.total_members > 0 ? Math.round((count / data.total_members) * 100) : 0;
+                            ageHtml += '<div class="chart-bar age-bar-clickable" data-age-bracket="' + esc(ageGroup) + '">';
+                            ageHtml += '<div class="chart-label">' + esc(ageGroup) + '</div>';
+                            ageHtml += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + pct + '%;">' + totalPct + '%</div></div>';
+                            ageHtml += '<div class="chart-count">' + count + '</div></div>';
+                        }
+                    });
+                    $('#distribution-title').html('<i class="fa fa-chart-bar"></i> Age Distribution');
+                    $('#age-chart').html(ageHtml);
+                    $('#age-drilldown').hide().empty();
+                    $('#age-section').show();
+                } else {
+                    $('#age-drilldown').hide().empty();
+                }
+
+                if (profile.show_grade && data.grades && data.grades.length) {
+                    var gradeHtml = '';
+                    var maxGrade = 0;
+                    data.grades.forEach(function(g) { if (g.count > maxGrade) maxGrade = g.count; });
+                    data.grades.forEach(function(g) {
+                        if (!g.count) return;
+                        var pct = maxGrade > 0 ? Math.round((g.count / maxGrade) * 100) : 0;
+                        var totalPct = data.total_members > 0 ? Math.round((g.count / data.total_members) * 100) : 0;
+                        gradeHtml += '<div class="chart-bar grade-bar-clickable" data-grade="' + esc(g.label) + '">';
+                        gradeHtml += '<div class="chart-label">' + esc(g.label) + '</div>';
+                        gradeHtml += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + pct + '%;">' + totalPct + '%</div></div>';
+                        gradeHtml += '<div class="chart-count">' + g.count + '</div></div>';
+                    });
+                    $('#grade-chart').html(gradeHtml);
+                    $('#grade-drilldown').hide().empty();
+                    $('#grade-section').show();
+                } else {
+                    $('#grade-drilldown').hide().empty();
+                }
+
+                if (profile.show_marital && data.marital_status && Object.keys(data.marital_status).length > 0) {
+                    var maritalHtml = '';
+                    var maxMarital = Math.max.apply(null, Object.values(data.marital_status));
+                    for (var status in data.marital_status) {
+                        var count = data.marital_status[status];
+                        var pct = maxMarital > 0 ? Math.round((count / maxMarital) * 100) : 0;
+                        var totalPct = data.total_members > 0 ? Math.round((count / data.total_members) * 100) : 0;
+                        maritalHtml += '<div class="chart-bar marital-bar-clickable" data-marital-status="' + esc(status) + '">';
+                        maritalHtml += '<div class="chart-label">' + esc(status) + '</div>';
+                        maritalHtml += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + pct + '%;">' + totalPct + '%</div></div>';
+                        maritalHtml += '<div class="chart-count">' + count + '</div></div>';
+                    }
+                    $('#marital-chart').html(maritalHtml);
+                    $('#marital-drilldown').hide().empty();
+                    $('#marital-section').show();
+                } else {
+                    $('#marital-drilldown').hide().empty();
+                }
+
+                if (data.transactions && data.transactions.total > 0) {
+                    var money = function(n) {
+                        return '$' + (n || 0).toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,');
+                    };
+                    var transHtml = '<div class="row" style="margin-bottom: 15px;">';
+                    transHtml += '<div class="col-md-4"><div style="background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;">';
+                    transHtml += '<div style="font-size:24px;font-weight:bold;color:#012b58;">' + data.transactions.total + '</div>';
+                    transHtml += '<div style="font-size:12px;color:#666;">Payments (Amt &gt; 0)</div></div></div>';
+                    transHtml += '<div class="col-md-4"><div style="background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;">';
+                    transHtml += '<div style="font-size:24px;font-weight:bold;color:#27ae60;">' + money(data.transactions.total_paid) + '</div>';
+                    transHtml += '<div style="font-size:12px;color:#666;">Total Paid</div></div></div>';
+                    transHtml += '<div class="col-md-4"><div style="background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;">';
+                    transHtml += '<div style="font-size:24px;font-weight:bold;color:#e74c3c;">' + money(data.transactions.total_due) + '</div>';
+                    transHtml += '<div style="font-size:12px;color:#666;">Total Due</div></div></div></div>';
+                    transHtml += '<div class="row">';
+                    transHtml += '<div class="col-md-6"><div class="finance-stat-clickable" data-finance-status="paid_in_full" style="background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;">';
+                    transHtml += '<div style="font-size:20px;font-weight:bold;color:#27ae60;">' + data.transactions.paid_in_full + '</div>';
+                    transHtml += '<div style="font-size:12px;color:#666;">Paid in Full</div>';
+                    transHtml += '<div class="finance-drill-hint">Click to view people</div></div></div>';
+                    transHtml += '<div class="col-md-6"><div class="finance-stat-clickable" data-finance-status="remaining_balance" style="background:#f8f9fa;padding:15px;border-radius:8px;text-align:center;">';
+                    transHtml += '<div style="font-size:20px;font-weight:bold;color:#f39c12;">' + data.transactions.remaining_balance + '</div>';
+                    transHtml += '<div style="font-size:12px;color:#666;">Remaining Balance</div>';
+                    transHtml += '<div class="finance-drill-hint">Click to view people</div></div></div></div>';
+                    $('#transaction-summary').html(transHtml);
+                    $('#finance-drilldown').hide().empty();
+                    $('#transaction-section').show();
+                } else {
+                    $('#transaction-section').hide();
+                    $('#finance-drilldown').hide().empty();
+                }
+
+                if (profile.show_enrollment_timeline && data.enrollment_timeline && Object.keys(data.enrollment_timeline).length > 0) {
+                    var timelineHtml = '';
+                    var maxTimeline = Math.max.apply(null, Object.values(data.enrollment_timeline));
+                    var monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                    for (var month in data.enrollment_timeline) {
+                        var count = data.enrollment_timeline[month];
+                        var pct = maxTimeline > 0 ? Math.round((count / maxTimeline) * 100) : 0;
+                        var parts = month.split('-');
+                        var monthLabel = monthNames[parseInt(parts[1], 10) - 1] + ' ' + parts[0];
+                        timelineHtml += '<div class="chart-bar"><div class="chart-label">' + esc(monthLabel) + '</div>';
+                        timelineHtml += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + pct + '%;"></div></div>';
+                        timelineHtml += '<div class="chart-count">' + count + '</div></div>';
+                    }
+                    $('#timeline-chart').html(timelineHtml);
+                    $('#timeline-section').show();
+                } else {
+                    $('#timeline-section').hide();
+                }
+
+                if (data.subgroups && data.subgroups.length > 0) {
+                    var subgroupHtml = '<ul class="subgroup-list">';
+                    data.subgroups.forEach(function(subgroup) {
+                        subgroupHtml += '<li class="subgroup-item subgroup-item-clickable" data-subgroup-id="' + esc(String(subgroup.id || '')) + '" data-subgroup-name="' + esc(subgroup.name) + '">';
+                        subgroupHtml += '<span class="subgroup-name">' + esc(subgroup.name) + '</span>';
+                        subgroupHtml += '<span class="subgroup-count">' + subgroup.count + '</span></li>';
+                    });
+                    subgroupHtml += '</ul>';
+                    $('#subgroup-list').html(subgroupHtml);
+                    $('#subgroup-drilldown').hide().empty();
+                    $('#subgroup-section').show();
+                } else {
+                    $('#subgroup-section').hide();
+                    $('#subgroup-drilldown').hide().empty();
+                }
+
+                regState = { view: 'summary', question: null, option: null, person: null, summary: null };
+                $('#reg-view').html('<div class="empty-state">Open the Registration tab to load question summaries.</div>');
+                $('#btn-reg-excel').hide();
+
+                $('#dashboard-content').fadeIn();
+
+                if (tabToShow === 'registration') {
+                    loadRegistrationSummary();
+                }
+                if (tabToShow === 'allergies') {
+                    loadAllergies();
+                }
+            }, { showLoading: true });
+        }
+
+        function renderBreadcrumb() {
+            var parts = ['<a data-nav="summary">Overview</a>'];
+            if (regState.question) {
+                parts.push('<a data-nav="question">' + esc(regState.question.label) + '</a>');
+            }
+            if (regState.option) {
+                parts.push('<a data-nav="option">' + esc(regState.option.text) + '</a>');
+            }
+            if (regState.person) {
+                parts.push('<span>' + esc(regState.person.name) + '</span>');
+            }
+            $('#reg-breadcrumb').html(parts.join(' <i class="fa fa-chevron-right"></i> '));
+        }
+
+        function loadAllergies() {
+            if (!currentOrgId) return;
+            showLoading('Loading allergies...', false);
+            $('#allergies-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_allergy_people', org_id: currentOrgId }, function(data) {
+                if (data && data.error) {
+                    $('#allergies-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                var people = (data && data.people) || [];
+                if (!people.length) {
+                    $('#allergies-view').html('<div class="empty-state">No participants with allergy notes on file.</div>');
+                    return;
+                }
+                var ids = collectPeopleIds(people);
+                var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with allergies: <strong>' +
+                    people.length + '</strong></div>';
+                html += drillActionsHtml({ peopleIds: ids });
+                html += '<table class="people-table"><thead><tr><th>Person</th><th>Allergies</th></tr></thead><tbody>';
+                people.forEach(function(p) {
+                    html += '<tr><td>' + personLink(p.people_id, p.name) + '</td><td>' + esc(p.allergy) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                $('#allergies-view').html(html);
+            }, { showLoading: true });
+        }
+
+        function loadRegistrationSummary() {
+            if (!currentOrgId) return;
+            showLoading('Loading registration questions...', true);
+            $('#reg-view').html('<div class="empty-state">Loading registration questions...</div>');
+            ajaxPost({ action: 'get_registration_summary', org_id: currentOrgId }, function(data) {
+                if (data.error) {
+                    $('#btn-reg-excel').hide();
+                    $('#reg-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                regState.summary = data;
+                regState.view = 'summary';
+                regState.question = null;
+                regState.option = null;
+                regState.person = null;
+                renderRegistrationSummary(data);
+            }, { showLoading: true });
+        }
+
+        function renderChoiceOptions(options, clickable) {
+            var html = '';
+            var maxC = 0;
+            (options || []).forEach(function(o) { if (o.count > maxC) maxC = o.count; });
+            (options || []).forEach(function(o) {
+                if (!o.count) return;
+                var barPct = maxC > 0 ? Math.round((o.count / maxC) * 100) : 0;
+                if (o.is_other_group && o.variants && o.variants.length) {
+                    html += '<div class="other-group-bar">';
+                    html += '<button type="button" class="other-group-toggle" data-expanded="0">';
+                    html += '<i class="fa fa-chevron-right other-chevron"></i>';
+                    html += '<div class="chart-label">Other</div>';
+                    html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                    html += '<div class="chart-count">' + o.count + '</div>';
+                    html += '</button>';
+                    html += '<div class="other-variants">';
+                    html += '<p class="other-variant-meta">' + (o.variant_count || o.variants.length) +
+                        ' free-text answers collapsed — expand to view, or click Other to see everyone</p>';
+                    if (clickable) {
+                        html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent('__other__') +
+                            '" data-otext="' + encodeURIComponent('Other (all)') + '">';
+                        html += '<div class="chart-label">All Other</div>';
+                        html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                        html += '<div class="chart-count">' + o.count + '</div></div>';
+                    }
+                    var maxV = 0;
+                    o.variants.forEach(function(v) { if (v.count > maxV) maxV = v.count; });
+                    o.variants.forEach(function(v) {
+                        if (!v.count) return;
+                        var vp = maxV > 0 ? Math.round((v.count / maxV) * 100) : 0;
+                        if (clickable) {
+                            html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent(v.value) +
+                                '" data-otext="' + encodeURIComponent(v.text) + '">';
+                        } else {
+                            html += '<div class="chart-bar">';
+                        }
+                        html += '<div class="chart-label">' + esc(v.text) + '</div>';
+                        html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + vp + '%;">' + (v.pct || 0) + '%</div></div>';
+                        html += '<div class="chart-count">' + v.count + '</div></div>';
+                    });
+                    html += '</div></div>';
+                    return;
+                }
+                if (clickable) {
+                    html += '<div class="chart-bar clickable-option" data-ovalue="' + encodeURIComponent(o.value) +
+                        '" data-otext="' + encodeURIComponent(o.text) + '">';
+                } else {
+                    html += '<div class="chart-bar">';
+                }
+                html += '<div class="chart-label">' + esc(o.text) + '</div>';
+                html += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + barPct + '%;">' + (o.pct || 0) + '%</div></div>';
+                html += '<div class="chart-count">' + o.count + '</div></div>';
+            });
+            return html;
+        }
+
+        function renderRegistrationSummary(data) {
+            renderBreadcrumb();
+            if (!data.is_registration_form) {
+                $('#btn-reg-excel').hide();
+                $('#reg-view').html('<div class="info-banner">' + esc(data.message) + '</div>');
+                return;
+            }
+
+            if (!data.questions || data.questions.length === 0) {
+                $('#btn-reg-excel').hide();
+                $('#reg-view').html('<div class="empty-state">' + esc(data.message || 'No registration questions found.') + '</div>');
+                return;
+            }
+
+            $('#btn-reg-excel').show();
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Completed registrants: <strong>' + data.completed_count + '</strong></div>';
+
+            if (data.message) {
+                html += '<div class="empty-state" style="margin-bottom:14px;">' + esc(data.message) + '</div>';
+            }
+
+            data.questions.forEach(function(q) {
+                html += '<div class="reg-question-card" data-qid="' + esc(q.id) + '">';
+                html += '<div class="reg-question-title">' + esc(q.label) + '</div>';
+                if (q.kind === 'choice') {
+                    html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank</div>';
+                    html += renderChoiceOptions(q.options || [], false);
+                } else {
+                    html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank</div>';
+                    if (q.preview && q.preview.length) {
+                        html += '<div class="reg-preview">' + esc(q.preview.join(' · ')) + '</div>';
+                    }
+                }
+                html += '</div>';
+            });
+            $('#reg-view').html(html);
+        }
+
+        function findQuestion(qid) {
+            if (!regState.summary || !regState.summary.questions) return null;
+            for (var i = 0; i < regState.summary.questions.length; i++) {
+                if (regState.summary.questions[i].id === qid) return regState.summary.questions[i];
+            }
+            return null;
+        }
+
+        $(document).on('click', '.reg-question-card', function() {
+            var qid = $(this).data('qid');
+            var q = findQuestion(String(qid));
+            if (!q) return;
+            openQuestion(q);
+        });
+
+        $(document).on('click', '.other-group-toggle', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var $btn = $(this);
+            var $variants = $btn.siblings('.other-variants');
+            var expanded = $btn.attr('data-expanded') === '1';
+            if (expanded) {
+                $btn.attr('data-expanded', '0');
+                $variants.removeClass('expanded');
+                $btn.find('.other-chevron').removeClass('fa-chevron-down').addClass('fa-chevron-right');
+            } else {
+                $btn.attr('data-expanded', '1');
+                $variants.addClass('expanded');
+                $btn.find('.other-chevron').removeClass('fa-chevron-right').addClass('fa-chevron-down');
+            }
+        });
+
+        $(document).on('click', '.other-variants', function(e) {
+            e.stopPropagation();
+        });
+
+        $('#btn-reg-excel').click(function() {
+            if (!currentOrgId) return;
+            var $btn = $(this);
+            $btn.prop('disabled', true);
+            showLoading('Preparing Registration Report...', true);
+            ajaxPost({ action: 'get_registration_excel_url', org_id: currentOrgId }, function(data) {
+                $btn.prop('disabled', false);
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                if (data.url) {
+                    window.open(data.url, '_blank', 'noopener');
+                }
+            }, { showLoading: true });
+        });
+
+        function openQuestion(q) {
+            regState.view = 'question';
+            regState.question = q;
+            regState.option = null;
+            regState.person = null;
+            renderBreadcrumb();
+
+            if (q.kind === 'choice') {
+                var html = '<button type="button" class="btn-back" data-nav="summary"><i class="fa fa-arrow-left"></i> Back</button>';
+                html += '<h3 style="margin:16px 0 8px;">' + esc(q.label) + '</h3>';
+                html += '<div class="reg-meta">' + q.answered + ' answered / ' + q.blank + ' blank — click an option to see who selected it</div>';
+                html += renderChoiceOptions(q.options || [], true);
+                $('#reg-view').html(html);
+            } else {
+                showLoading('Loading answers...', true);
+                $('#reg-view').html('<div class="empty-state">Loading answers...</div>');
+                ajaxPost({ action: 'get_text_answers', org_id: currentOrgId, question_id: q.id }, function(data) {
+                    if (data.error) {
+                        $('#reg-view').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                        return;
+                    }
+                    renderTextAnswers(q, data);
+                }, { showLoading: true });
+            }
+        }
+
+        function renderTextAnswers(q, data) {
+            var answeredIds = collectPeopleIds(data.answered_people);
+            var blankIds = collectPeopleIds(data.blank_people);
+            var html = '<div class="finance-drill-title">';
+            html += '<span>' + esc(q.label) + '</span>';
+            html += drillActionsHtml({ backNav: 'summary', peopleIds: answeredIds });
+            html += '</div>';
+            html += '<div class="reg-meta">' + (data.answered_people || []).length + ' answered / ' + (data.blank_people || []).length + ' blank';
+            if (answeredIds.length) {
+                html += ' — Add to Tag uses the answered list';
+            }
+            html += '</div>';
+            html += '<table class="people-table"><thead><tr><th>Person</th><th>Answer</th></tr></thead><tbody>';
+            (data.answered_people || []).forEach(function(p) {
+                html += '<tr><td>' + personLink(p.people_id, p.name);
+                html += ' <a href="#" class="person-drill" data-pid="' + p.people_id + '" data-pname="' + encodeURIComponent(p.name) + '" title="Full Q&A">Q&A</a></td>';
+                html += '<td>' + esc(p.answer) + '</td></tr>';
+            });
+            html += '</tbody></table>';
+            if (data.blank_people && data.blank_people.length) {
+                html += '<div class="finance-drill-title" style="margin-top:20px;">';
+                html += '<h4 style="margin:0;">Blank</h4>';
+                html += drillActionsHtml({ peopleIds: blankIds });
+                html += '</div>';
+                html += '<ul>';
+                data.blank_people.forEach(function(p) {
+                    html += '<li>' + personLink(p.people_id, p.name) + '</li>';
+                });
+                html += '</ul>';
+            }
+            $('#reg-view').html(html);
+        }
+
+        $(document).on('click', '.clickable-option', function() {
+            var ovalue = decodeURIComponent(String($(this).attr('data-ovalue') || ''));
+            var otext = decodeURIComponent(String($(this).attr('data-otext') || ''));
+            if (!regState.question) return;
+            loadOptionPeople({ value: ovalue, text: otext });
+        });
+
+        $(document).on('click', '.person-drill', function(e) {
+            e.preventDefault();
+            var pid = parseInt($(this).attr('data-pid'), 10);
+            var pname = decodeURIComponent(String($(this).attr('data-pname') || ''));
+            openPerson(pid, pname);
+        });
+
+        function openPerson(peopleId, name) {
+            regState.view = 'person';
+            regState.person = { people_id: peopleId, name: name };
+            renderBreadcrumb();
+            showLoading('Loading full Q&A...', true);
+            $('#reg-view').html('<div class="empty-state">Loading full Q&A...</div>');
+            ajaxPost({ action: 'get_person_answers', org_id: currentOrgId, people_id: peopleId }, function(data) {
+                if (data.error) {
+                    $('#reg-view').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var backNav = regState.option ? 'option' : (regState.question ? 'question' : 'summary');
+                var html = '<button type="button" class="btn-back" data-nav="' + backNav + '"><i class="fa fa-arrow-left"></i> Back</button>';
+                html += '<h3 style="margin:16px 0 8px;">' + personLink(data.people_id, data.name) + '</h3>';
+                html += '<table class="people-table"><thead><tr><th>Question</th><th>Answer</th></tr></thead><tbody>';
+                (data.answers || []).forEach(function(a) {
+                    html += '<tr><td>' + esc(a.label) + '</td><td>' + (a.blank ? '<em class="text-muted">Blank</em>' : esc(a.answer)) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                $('#reg-view').html(html);
+            }, { showLoading: true });
+        }
+
+        function loadOptionPeople(o) {
+            regState.option = o;
+            regState.person = null;
+            regState.view = 'option';
+            renderBreadcrumb();
+            showLoading('Loading people...', true);
+            $('#reg-view').html('<div class="empty-state">Loading people...</div>');
+            ajaxPost({
+                action: 'get_option_people',
+                org_id: currentOrgId,
+                question_id: regState.question.id,
+                option_value: o.value
+            }, function(data) {
+                if (data.error) {
+                    $('#reg-view').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                var peopleIds = collectPeopleIds(data.people);
+                var html = '<div class="finance-drill-title">';
+                html += '<span>' + esc(regState.question.label) + ' — ' + esc(o.text) + '</span>';
+                html += drillActionsHtml({ backNav: 'question', peopleIds: peopleIds });
+                html += '</div>';
+                html += '<div class="reg-meta">' + (data.people || []).length + ' people</div>';
+                html += '<table class="people-table"><thead><tr><th>Person</th><th>Answer</th></tr></thead><tbody>';
+                (data.people || []).forEach(function(p) {
+                    html += '<tr><td>' + personLink(p.people_id, p.name);
+                    html += ' <a href="#" class="person-drill" data-pid="' + p.people_id + '" data-pname="' + encodeURIComponent(p.name) + '">Q&A</a></td>';
+                    html += '<td>' + esc(p.answer) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                $('#reg-view').html(html);
+            }, { showLoading: true });
+        }
+
+        $(document).on('click', '[data-nav]', function(e) {
+            e.preventDefault();
+            var nav = $(this).data('nav');
+            if (nav === 'summary') {
+                if (regState.summary) renderRegistrationSummary(regState.summary);
+                else loadRegistrationSummary();
+            } else if (nav === 'question' && regState.question) {
+                openQuestion(regState.question);
+            } else if (nav === 'option' && regState.question && regState.option) {
+                loadOptionPeople(regState.option);
+            }
+        });
+
+        if (initialOrgId && parseInt(initialOrgId, 10) > 0) {
+            currentOrgId = String(initialOrgId);
+            $('#org-search').val(initialOrgName || ('Org #' + currentOrgId));
+            loadOverviewDashboard(currentOrgId);
+        }
+
+    }
+
+    if (window.jQuery) {
+        $(document).ready(initDashboard);
+    } else {
+        var checkJQuery = setInterval(function() {
+            if (window.jQuery) {
+                clearInterval(checkJQuery);
+                $(document).ready(initDashboard);
+            }
+        }, 50);
+    }
+})();
+</script>
+'''
+    # Inject deep-link org (safe ints / escaped name for JS string)
+    try:
+        _safe_name = _json_quote(_initial_org_name) if _initial_org_name else '""'
+    except:
+        _safe_name = '""'
+    model.Form = model.Form.replace('__INITIAL_ORG_ID__', str(int(_initial_org_id or 0)))
+    model.Form = model.Form.replace('__INITIAL_ORG_NAME__', _safe_name)
