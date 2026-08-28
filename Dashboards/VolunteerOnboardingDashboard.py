@@ -2239,7 +2239,7 @@ def _build_steps(person, area_cfg, list_cfg, is_minor):
     steps.append({'type': 'stack', 'title': 'Application', 'children': stacked})
 
     if is_minor:
-        # Interview + References (same keyword tiles as adult) + Handbook
+        # Interview + References + optional FL training (Littles) + Handbook
         kw_i = _s(list_cfg.get('kw_interview'))
         ok, when = _has_keyword_note(pid, kw_i)
         steps.append({'type': 'single', 'step': _step('interview', 'Interview', ok, when,
@@ -2248,6 +2248,11 @@ def _build_steps(person, area_cfg, list_cfg, is_minor):
         ok, when = _has_keyword_note(pid, kw_r)
         steps.append({'type': 'single', 'step': _step('references', 'References Checked', ok, when,
                      'complete' if ok else 'empty', {'keyword': kw_r})})
+        if list_cfg.get('has_fl_training'):
+            kw = _s(list_cfg.get('kw_fl_training'))
+            ok, when = _has_keyword_note(pid, kw)
+            steps.append({'type': 'single', 'step': _step('fl_training', 'FL Diapering / Potty Training', ok, when,
+                         'complete' if ok else 'empty', {'keyword': kw})})
         _append_training_handbook_steps(steps, list_cfg, pid)
         return steps
 
