@@ -1,14 +1,15 @@
 #Roles=Access
 # Script: InvolvementDashboard.py
-# Purpose: Involvement demographics/finance dashboard with Registration and Allergies
-#   tabs. Registration summarizes Registration Form (type 26) question responses
-#   with drill-down to options/people/full Q&A. Allergies lists org members with
-#   RecReg allergy notes. Find involvements via name search (OrgSearch-style
-#   LimitToRole + OrgLeadersOnly). Finance shows Amt>0 payment groups with
-#   paid-in-full vs remaining-balance counts. Overview demographics can vary by
-#   Program Id (see PROGRAM_OVERVIEW_PROFILES).
-# Author: Ben Swaby (base dashboard); Jake Pierson (Registration / Allergies tabs)
-# Date: 2026-08-07
+# Purpose: Involvement demographics/finance dashboard with Registration, Allergies,
+#   and Next Gen Contacts tabs. Registration summarizes Registration Form (type 26)
+#   question responses with drill-down to options/people/full Q&A. Allergies lists
+#   org members with RecReg allergy notes. Contacts (Next Gen only) lists parents
+#   and emergency contacts from RecReg stock fields. Find involvements via name
+#   search (OrgSearch-style LimitToRole + OrgLeadersOnly). Finance shows Amt>0
+#   payment groups with paid-in-full vs remaining-balance counts. Overview
+#   demographics can vary by Program Id (see PROGRAM_OVERVIEW_PROFILES).
+# Author: Ben Swaby (base dashboard); Jake Pierson (Registration / Allergies / Contacts)
+# Date: 2026-08-28
 # Email: bswaby@fbchtn.org
 #
 # Install: Special Content -> Python Scripts -> name InvolvementDashboard
@@ -129,6 +130,8 @@ DEFAULT_OVERVIEW_PROFILE = {
     'show_grade': False,
     'show_marital': True,
     'show_enrollment_timeline': True,
+    # Next Gen Contacts tab (parents + emergency from RecReg stock fields)
+    'show_contacts': False,
     # Future knobs (not wired yet — safe to set for later):
     # 'show_gender_stats': True,
     # 'show_finance': True,
@@ -143,6 +146,7 @@ PROGRAM_OVERVIEW_PROFILES = {
         'show_grade': True,
         'show_marital': False,
         'show_enrollment_timeline': True,
+        'show_contacts': True,
     },
     # Example for a future program:
     # 9999: {
@@ -1055,6 +1059,47 @@ ORDER BY PersonName
     }
 
 
+def _get_contact_people(org_id):
+    """Org members with parent and/or emergency contact data from RecReg stock fields."""
+    sql = """
+SELECT
+    pe.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
+    ISNULL(rr.mname, '') AS MotherName,
+    ISNULL(rr.fname, '') AS FatherName,
+    ISNULL(rr.emcontact, '') AS EmContact,
+    ISNULL(rr.emphone, '') AS EmPhone
+FROM OrganizationMembers om
+INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+LEFT JOIN RecReg rr ON rr.PeopleId = pe.PeopleId
+WHERE om.OrganizationId = @orgId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    rows = list(q.QuerySql(sql, p))
+    people = []
+    for r in rows:
+        mother = _s(r.MotherName)
+        father = _s(r.FatherName)
+        em_contact = _s(r.EmContact)
+        em_phone = _s(r.EmPhone)
+        if not (mother or father or em_contact or em_phone):
+            continue
+        people.append({
+            'people_id': _i(r.PeopleId),
+            'name': _s(r.PersonName),
+            'mother': mother,
+            'father': father,
+            'em_contact': em_contact,
+            'em_phone': em_phone,
+        })
+    return {
+        'count': len(people),
+        'people': people,
+    }
+
+
 def _get_registration_excel_url(org_id):
     """
     Build the standard Involvement Registration Report (Excel) URL.
@@ -1898,6 +1943,17 @@ ORDER BY
         except Exception, e:
             _err_out(e)
 
+    elif action == 'get_contact_people':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_contact_people(org_id))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'get_option_people':
         try:
             org_id = _i(_data('org_id'), 0)
@@ -2390,6 +2446,17 @@ else:
         border-color: #012b58;
         background: #012b58;
         color: #f5f4e8;
+    }
+    .dash-tab[data-tab="contacts"].active {
+        border-color: #012b58;
+        background: #012b58;
+        color: #f5f4e8;
+    }
+    .dash-tab.dash-tab-nextgen {
+        display: none;
+    }
+    .dash-tabs .dash-tab.dash-tab-nextgen.visible {
+        display: block;
     }
     .dash-tab-refresh {
         border: 2px solid #e2e8f0;
@@ -2971,6 +3038,7 @@ else:
             <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
             <button type="button" class="dash-tab" data-tab="registration">Registration</button>
             <button type="button" class="dash-tab" data-tab="allergies">Allergies</button>
+            <button type="button" class="dash-tab dash-tab-nextgen" data-tab="contacts" id="tab-btn-contacts">Contacts</button>
             <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh this involvement" aria-label="Refresh">
                 <i class="fa fa-refresh"></i>
             </button>
@@ -3040,6 +3108,18 @@ else:
                 <div id="allergies-view"></div>
             </div>
         </div>
+
+        <div class="tab-panel" id="tab-contacts">
+            <div class="section">
+                <div class="reg-toolbar">
+                    <h2 class="section-title" style="margin:0;"><i class="fa fa-users"></i> Parents &amp; Emergency Contacts</h2>
+                </div>
+                <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                    Next Gen stock fields from RecReg: mother, father, and emergency contact.
+                </p>
+                <div id="contacts-view"></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -3048,6 +3128,7 @@ else:
     function initDashboard() {
         var scriptUrl = window.location.pathname;
         var currentOrgId = null;
+        var currentShowContacts = false;
         var initialOrgId = __INITIAL_ORG_ID__;
         var initialOrgName = __INITIAL_ORG_NAME__;
         var regState = { view: 'summary', question: null, option: null, person: null, summary: null };
@@ -3268,6 +3349,9 @@ else:
             }
             if (tab === 'allergies' && currentOrgId) {
                 loadAllergies();
+            }
+            if (tab === 'contacts' && currentOrgId) {
+                loadContacts();
             }
         });
 
@@ -3770,9 +3854,20 @@ else:
                     .addClass('selector-toggleable')
                     .html('<i class="fa fa-search"></i> Find Involvement <span id="toggle-selector" style="float:right;"><i class="fa fa-chevron-down"></i></span>');
 
-                // Restore tab on refresh; otherwise open Overview
                 var tabToShow = preserveTab || 'overview';
-                if (tabToShow !== 'overview' && tabToShow !== 'registration' && tabToShow !== 'allergies') {
+                var profile = data.overview_profile || {};
+                currentShowContacts = !!profile.show_contacts;
+                if (currentShowContacts) {
+                    $('#tab-btn-contacts').addClass('visible');
+                } else {
+                    $('#tab-btn-contacts').removeClass('visible');
+                }
+
+                // Restore tab on refresh; otherwise open Overview
+                if (tabToShow !== 'overview' && tabToShow !== 'registration' && tabToShow !== 'allergies' && tabToShow !== 'contacts') {
+                    tabToShow = 'overview';
+                }
+                if (tabToShow === 'contacts' && !currentShowContacts) {
                     tabToShow = 'overview';
                 }
                 $('.dash-tab').removeClass('active');
@@ -3792,7 +3887,6 @@ else:
                 $('#gender-drilldown').hide().empty();
                 gradeDrillState = { label: '', people: [], filter: 'all' };
 
-                var profile = data.overview_profile || {};
                 $('#age-section').hide();
                 $('#grade-section').hide();
                 $('#marital-section').hide();
@@ -3938,6 +4032,9 @@ else:
                 if (tabToShow === 'allergies') {
                     loadAllergies();
                 }
+                if (tabToShow === 'contacts') {
+                    loadContacts();
+                }
             }, { showLoading: true });
         }
 
@@ -3979,6 +4076,41 @@ else:
                 });
                 html += '</tbody></table>';
                 $('#allergies-view').html(html);
+            }, { showLoading: true });
+        }
+
+        function loadContacts() {
+            if (!currentOrgId) return;
+            showLoading('Loading contacts...', false);
+            $('#contacts-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_contact_people', org_id: currentOrgId }, function(data) {
+                if (data && data.error) {
+                    $('#contacts-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                var people = (data && data.people) || [];
+                if (!people.length) {
+                    $('#contacts-view').html('<div class="empty-state">No participants with parent or emergency contact info on file.</div>');
+                    return;
+                }
+                var ids = collectPeopleIds(people);
+                var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with contacts: <strong>' +
+                    people.length + '</strong></div>';
+                html += drillActionsHtml({ peopleIds: ids });
+                html += '<table class="people-table"><thead><tr>';
+                html += '<th>Person</th><th>Mother</th><th>Father</th><th>Emergency Contact</th><th>Emergency Phone</th>';
+                html += '</tr></thead><tbody>';
+                people.forEach(function(p) {
+                    html += '<tr>';
+                    html += '<td>' + personLink(p.people_id, p.name) + '</td>';
+                    html += '<td>' + esc(p.mother || '') + '</td>';
+                    html += '<td>' + esc(p.father || '') + '</td>';
+                    html += '<td>' + esc(p.em_contact || '') + '</td>';
+                    html += '<td>' + esc(p.em_phone || '') + '</td>';
+                    html += '</tr>';
+                });
+                html += '</tbody></table>';
+                $('#contacts-view').html(html);
             }, { showLoading: true });
         }
 
