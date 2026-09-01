@@ -10,6 +10,8 @@
 # Run: /PyScriptForm/VolunteerOnboardingDashboard
 # Config (ONLY file needed): Special Content → Text → VolunteerOnboardingDashboardConfig
 #   Edit that JSON manually (or seed defaults from the Config tab).
+# Homepage widget: Scripts/WidgetVolunteerOnboardingCSP.py + .html (CallScripts this file).
+#   Lists with "csp": true roll into the widget (defaults: littles, kids, students, safety).
 #
 # IronPython notes (TouchPoint embeds IronPython 2.7):
 #   - print without parentheses; except Exception, ex
@@ -42,6 +44,9 @@ BRAND = {
 
 # Last config-load diagnostic shown on Config tab (parse ok / fail reason)
 _CONFIG_LOAD_INFO = ''
+
+# Packed note payload from GET do=snote (WAF-safe). Cleared each request.
+_PACKED_NOTE = None
 
 
 def _ensure_newtonsoft():
@@ -401,7 +406,7 @@ def _flash_text(code):
     else:
         # Legacy free-text flash (sanitized display only)
         msg = _s(c)
-    # Show detail on errors and on config save (so we can confirm orgids stuck)
+    # Show detail on errors and config save (so we can confirm orgids stuck)
     if _FLASH_DETAIL and (c.startswith('err_') or c == 'ok_config'):
         msg = msg + ' — ' + _FLASH_DETAIL
     return msg
@@ -412,7 +417,19 @@ def _b64url_decode(s):
     s = _s(s)
     if not s:
         return ''
+    # QueryString often turns '+' into space; strip whitespace/newlines from gateways
+    s = s.replace(' ', '+').replace('\r', '').replace('\n', '').replace('\t', '')
     s = s.replace('-', '+').replace('_', '/')
+    # Drop anything that isn't base64 alphabet (WAF/proxy noise)
+    cleaned = []
+    for ch in s:
+        o = ord(ch)
+        if ((o >= 65 and o <= 90) or (o >= 97 and o <= 122)
+                or (o >= 48 and o <= 57) or ch in '+/='):
+            cleaned.append(ch)
+    s = ''.join(cleaned)
+    if not s:
+        return ''
     pad = len(s) % 4
     if pad:
         s = s + ('=' * (4 - pad))
@@ -426,19 +443,61 @@ def _b64url_decode(s):
 
 
 def _parse_cfg_payload(p):
-    """Parse packed config payload (base64url JSON object) → dict of field→value."""
+    """Parse packed config/note payload (base64url JSON object) → dict of field→value."""
     raw = _b64url_decode(p)
     if not raw:
         return None
+    # Strip UTF-8 BOM if present
+    if len(raw) > 0 and ord(raw[0]) == 0xFEFF:
+        raw = raw[1:]
+    parsed, status = _parse_config_json(raw)
+    if isinstance(parsed, dict) and parsed:
+        return parsed
+    # Last resort: Newtonsoft alone (older path)
     try:
+        _ensure_newtonsoft()
         from Newtonsoft.Json.Linq import JObject
         obj = JObject.Parse(raw)
-        parsed = _jobj_to_py(obj)
-        if isinstance(parsed, dict):
-            return parsed
+        parsed2 = _jobj_to_py(obj)
+        if isinstance(parsed2, dict) and parsed2:
+            return parsed2
     except:
         pass
     return None
+
+
+def _qs_raw(name):
+    """Read a querystring value directly (prefer over Data binder for packed payloads)."""
+    name = _s(name)
+    if not name:
+        return ''
+    try:
+        from System.Web import HttpContext
+        qs = HttpContext.Current.Request.QueryString
+        if qs is not None:
+            v = qs[name]
+            if v is not None and not _is_null(v):
+                return _s(v)
+    except:
+        pass
+    return _s(_form_val(name))
+
+
+def _parse_note_pack(raw_p):
+    """Decode do=snote pack. Returns (dict_or_None, diagnostic)."""
+    raw_p = _s(raw_p)
+    if not raw_p:
+        return None, 'empty pack'
+    decoded = _b64url_decode(raw_p)
+    if not decoded:
+        head = raw_p[:12]
+        tail = raw_p[-8:] if len(raw_p) > 8 else raw_p
+        return None, 'b64 decode fail len=' + str(len(raw_p)) + ' head=' + head + ' tail=' + tail
+    parsed, status = _parse_config_json(decoded)
+    if isinstance(parsed, dict) and parsed:
+        return parsed, status
+    head = decoded[:40].replace('\n', ' ')
+    return None, 'json fail ' + _s(status) + ' decoded_len=' + str(len(decoded)) + ' head=' + head
 
 
 def _qs_flash(code):
@@ -544,7 +603,50 @@ def _fmt_date(val):
         return s
 
 
+def _prospect_over_months(val, months=3):
+    """True when EnrollmentDate/ProspectSince is 3+ months ago (inclusive).
+    Accepts System.DateTime or a parseable string; does not use _s() (avoids wiping values).
+    """
+    if val is None:
+        return False
+    try:
+        from System import DBNull
+        if val is DBNull.Value:
+            return False
+    except:
+        pass
+    try:
+        from System import DateTime, Convert
+        since = Convert.ToDateTime(val)
+        cutoff = DateTime.Today.AddMonths(-int(months))
+        # Compare dates only
+        return since.Date <= cutoff.Date
+    except:
+        pass
+    # Fallback: ~30 days per month (handles odd CLR date wrappers)
+    try:
+        from System import DateTime, Convert
+        since = Convert.ToDateTime(val)
+        days = (DateTime.Today.Date - since.Date).Days
+        return days >= (int(months) * 30)
+    except:
+        return False
+
+
+def _stale_legend_html():
+    """Explain the yellow stale-prospect dot (only render when criteria match)."""
+    html = '<div class="vod-legend" role="note">'
+    html += '<span class="vod-stale-dot" aria-hidden="true"></span>'
+    html += '<span>Prospects 3+ months</span>'
+    html += '</div>'
+    return html
+
+
 AREA_ORDER = ['kids', 'student', 'adult', 'mcl', 'worship', 'outreach', 'missions']
+
+# List keys that are Child Safety Protocol (CSP) / HR compliance by default.
+# Used when older JSON omits the per-list `csp` flag.
+CSP_LIST_KEYS_DEFAULT = ('littles', 'kids', 'students', 'safety')
 
 LIST_FIELD_DEFS = [
     ('label', 'Label'),
@@ -595,6 +697,8 @@ def _empty_list_cfg(label=''):
         'kw_fl_training': '',
         'track': 'full',
         'has_fl_training': False,
+        # Child Safety Protocol pipeline — homepage widget roll-up
+        'csp': False,
     }
 
 
@@ -655,6 +759,7 @@ def _default_config():
                         'kw_fl_training': 'CSP KM: Faith Littles Training Complete',
                         'track': 'full',
                         'has_fl_training': True,
+                        'csp': True,
                     },
                     'kids': {
                         'label': 'Faith Kids',
@@ -672,6 +777,7 @@ def _default_config():
                         'kw_fl_training': '',
                         'track': 'full',
                         'has_fl_training': False,
+                        'csp': True,
                     },
                 },
             },
@@ -699,6 +805,7 @@ def _default_config():
                         'kw_fl_training': '',
                         'track': 'full',
                         'has_fl_training': False,
+                        'csp': True,
                     },
                 },
             },
@@ -707,9 +814,9 @@ def _default_config():
                 'roles': ['Adult Min'],
                 'view_only_role': '',
                 'lists': {
-                    'hospitality': {'label': 'Hospitality', 'orgid': 0, 'track': 'simple'},
-                    'safety': {'label': 'Safety', 'orgid': 0, 'track': 'full'},
-                    'medical': {'label': 'Medical', 'orgid': 0, 'track': 'simple'},
+                    'hospitality': {'label': 'Hospitality', 'orgid': 0, 'track': 'simple', 'csp': False},
+                    'safety': {'label': 'Safety', 'orgid': 0, 'track': 'full', 'csp': True},
+                    'medical': {'label': 'Medical', 'orgid': 0, 'track': 'simple', 'csp': False},
                 },
             },
             'mcl': {
@@ -744,7 +851,8 @@ def _default_progress_note_cfg():
     """Church-wide Progress Note keyword + Extra Value dropdown → step bucket map."""
     return {
         'keyword': 'CSP: Progress Note',
-        'ev_question': 'CSP: Progress Note',
+        # Must match Keyword Extra Value Name on that keyword (TouchPoints label)
+        'ev_question': 'Which step would you like to make a note about?',
         'option_map': {
             'Application': 'application',
             'Background Check': 'background',
@@ -773,6 +881,9 @@ def _progress_note_cfg(cfg=None):
         'ev_question': _s(raw.get('ev_question')) or base['ev_question'],
         'option_map': {},
     }
+    # Guard: older configs set ev_question to the keyword name by mistake
+    if _s(out['ev_question']).strip().lower() == _s(out['keyword']).strip().lower():
+        out['ev_question'] = base['ev_question']
     om = raw.get('option_map')
     if not isinstance(om, dict) or not om:
         om = base['option_map']
@@ -1043,7 +1154,7 @@ def _py_to_json_walk(obj, indent=0):
                   'orgid', 'email_template', 'adult_reg_url', 'minor_reg_url',
                   'ev_app_sent', 'ev_app_reviewed', 'ev_handbook', 'ev_training',
                   'kw_interview', 'kw_references', 'kw_shadowing', 'kw_fl_training',
-                  'track', 'has_fl_training']
+                  'track', 'has_fl_training', 'csp']
         keys = list(obj.keys())
         ordered = []
         seen = set()
@@ -1075,22 +1186,22 @@ def _py_to_json_walk(obj, indent=0):
 
 
 def _json_pretty_text(raw):
-    """Pretty-print a JSON string for display/editing; returns original on failure."""
-    raw = _s(raw)
-    if not raw:
+    """Pretty-print a JSON string for display; returns original on failure.
+    Never substitutes in-memory config defaults for the Special Content body.
+    """
+    body = _content_body_as_text(raw)
+    if not body or not body.strip():
         return ''
     try:
         _ensure_newtonsoft()
         from Newtonsoft.Json import Formatting
         from Newtonsoft.Json.Linq import JToken
-        tok = JToken.Parse(raw)
-        return _s(tok.ToString(Formatting.Indented))
+        tok = JToken.Parse(body)
+        return _content_body_as_text(tok.ToString(Formatting.Indented))
     except:
         pass
-    parsed, _status = _parse_config_json(raw)
-    if isinstance(parsed, dict):
-        return _py_to_json(parsed)
-    return raw
+    # Leave original text if it isn't valid JSON — still show what Special Content has
+    return body
 
 
 def _json_quote(s):
@@ -1242,21 +1353,65 @@ def _deep_merge(base, overlay):
     return out
 
 
-def _raw_content_text(name):
-    """Read Special Content text without _s() swallowing a body equal to 'null'."""
+def _content_body_as_text(val):
+    """Convert Content.Body / TextContent result to unicode without _s() wiping 'null'."""
+    if val is None:
+        return ''
     try:
-        raw = model.TextContent(name)
+        from System import DBNull
+        if val is DBNull.Value:
+            return ''
     except:
-        return ''
-    if raw is None:
-        return ''
+        pass
     try:
-        return unicode(raw).strip()
+        return unicode(val)
     except:
         try:
-            return str(raw).strip()
+            return str(val)
         except:
             return ''
+
+
+def _raw_content_text(name):
+    """Read Special Content text body for Name (prefer Type Text=1, then any type).
+    Does not use _s() on the body (that treats the literal string 'null' as empty).
+    """
+    name = _s(name)
+    if not name:
+        return ''
+    # 1) Official API — Type Text only
+    try:
+        raw = model.TextContent(name)
+        body = _content_body_as_text(raw).strip()
+        if body:
+            return body
+    except:
+        pass
+    # 2) SQL fallback — same Name, prefer Text (1), then HTML (2), then anything
+    sql = """
+SELECT TOP 1 c.Body, c.TypeID
+FROM dbo.Content c
+WHERE LTRIM(RTRIM(c.Name)) = @name
+ORDER BY CASE c.TypeID WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 2 END, c.Id DESC
+"""
+    p = _dd()
+    p.AddValue('name', name)
+    try:
+        rows = list(q.QuerySql(sql, p))
+        if rows:
+            body = _content_body_as_text(rows[0].Body).strip()
+            if body:
+                return body
+    except:
+        pass
+    # 3) Last resort — model.Content (any type by Name)
+    try:
+        body = _content_body_as_text(model.Content(name)).strip()
+        if body:
+            return body
+    except:
+        pass
+    return ''
 
 
 def _from_person(people_id):
@@ -1458,6 +1613,11 @@ def _normalize_list_cfg(lc, key=''):
         out[k] = lc[k]
     out['orgid'] = _i(out.get('orgid'), 0)
     out['has_fl_training'] = bool(out.get('has_fl_training'))
+    # Explicit csp in JSON wins; otherwise default known CSP buckets (littles/kids/students/safety)
+    if isinstance(lc, dict) and 'csp' in lc:
+        out['csp'] = bool(lc.get('csp'))
+    else:
+        out['csp'] = _s(key) in CSP_LIST_KEYS_DEFAULT
     if not _s(out.get('track')):
         out['track'] = 'full'
     if not _s(out.get('label')):
@@ -1542,6 +1702,156 @@ def _area_metrics(cfg, area_key, area_cfg, configured):
         metrics['flagged'] += row['flagged']
         metrics['lists'].append(row)
     return metrics
+
+
+def _iter_csp_lists(cfg):
+    """Yield (area_key, area_cfg, list_key, list_cfg) for CSP-flagged lists only."""
+    areas = cfg.get('areas') or {}
+    for ak in _area_keys(cfg):
+        area = areas.get(ak) or {}
+        lists = area.get('lists') or {}
+        if not isinstance(lists, dict):
+            continue
+        for lk in _list_order(lists):
+            lc = lists.get(lk) or {}
+            if not lc.get('csp'):
+                continue
+            yield ak, area, lk, lc
+
+
+def _csp_orgids(cfg):
+    """Distinct Involvement IDs for CSP-flagged lists with orgid > 0."""
+    ids = []
+    seen = set()
+    for _ak, _area, _lk, lc in _iter_csp_lists(cfg):
+        oid = _orgid(lc)
+        if oid <= 0 or oid in seen:
+            continue
+        seen.add(oid)
+        ids.append(oid)
+    return ids
+
+
+def _count_stale_prospects_sql(orgids, months=3):
+    """Count Prospects enrolled 3+ months ago — SQL DATEADD (no Python date parsing).
+    months is inlined as an int (TouchPoint QuerySql can choke on DATEADD(@param)).
+    """
+    ids = []
+    for x in (orgids or []):
+        try:
+            i = int(x)
+        except:
+            i = 0
+        if i > 0 and i not in ids:
+            ids.append(i)
+    if not ids:
+        return 0
+    try:
+        m = int(months)
+    except:
+        m = 3
+    if m < 1:
+        m = 3
+    inlist = ','.join([str(i) for i in ids])
+    # Literal month offset — avoid @months inside DATEADD
+    sql = """
+SELECT COUNT(*) AS Cnt
+FROM dbo.OrganizationMembers om
+JOIN dbo.People p ON p.PeopleId = om.PeopleId
+WHERE om.OrganizationId IN (""" + inlist + """)
+  AND om.MemberTypeId = @prospect
+  AND ISNULL(p.IsDeceased, 0) = 0
+  AND om.EnrollmentDate IS NOT NULL
+  AND CONVERT(date, om.EnrollmentDate) <= DATEADD(month, -""" + str(m) + """, CONVERT(date, GETDATE()))
+"""
+    p = _dd()
+    p.AddValue('prospect', MEMBER_TYPE_PROSPECT)
+    try:
+        rows = list(q.QuerySql(sql, p))
+        if rows:
+            return _i(rows[0].Cnt, 0)
+    except:
+        return 0
+    return 0
+
+
+def _csp_pipeline_metrics(cfg):
+    """Roll-up Prospect / Ready-for-HR / Prospects-3+months across CSP lists (org-wide).
+    Stale count comes from SQL (same Involvements / MemberType as pipeline).
+    """
+    pipeline = 0
+    ready = 0
+    orgids = _csp_orgids(cfg)
+    stale = _count_stale_prospects_sql(orgids, 3)
+    for _ak, area_cfg, _lk, lc in _iter_csp_lists(cfg):
+        orgid = _orgid(lc)
+        if orgid <= 0:
+            continue
+        try:
+            people = _load_prospects(orgid)
+        except:
+            people = []
+        for person in people:
+            pipeline += 1
+            is_minor = _person_is_minor(person)
+            try:
+                steps = _build_steps(person, area_cfg, lc, is_minor)
+                if _required_complete(steps):
+                    ready += 1
+            except:
+                pass
+    # If SQL returned 0 but Python dots would count some, prefer the higher signal
+    if stale <= 0 and pipeline > 0:
+        py_stale = 0
+        for _ak, area_cfg, _lk, lc in _iter_csp_lists(cfg):
+            orgid = _orgid(lc)
+            if orgid <= 0:
+                continue
+            try:
+                people = _load_prospects(orgid)
+            except:
+                people = []
+            for person in people:
+                try:
+                    since = person.ProspectSince
+                except:
+                    since = None
+                if since is None:
+                    try:
+                        since = person.EnrollmentDate
+                    except:
+                        since = None
+                if _prospect_over_months(since, 3):
+                    py_stale += 1
+        if py_stale > stale:
+            stale = py_stale
+    return {'pipeline': pipeline, 'ready': ready, 'stale': stale, 'orgids': orgids}
+
+
+def _want_csp_widget_metrics():
+    """True when a homepage widget CallScript'd this script for CSP totals."""
+    try:
+        if model.DataHas('vod_csp_metrics'):
+            return _b(Data.vod_csp_metrics)
+    except:
+        pass
+    try:
+        return _b(Data.vod_csp_metrics)
+    except:
+        return False
+
+
+def _export_csp_widget_metrics():
+    """Populate Data.* for WidgetVolunteerOnboardingCSP (no HTML print)."""
+    cfg = _load_config()
+    m = _csp_pipeline_metrics(cfg)
+    Data.pipeline = int(m['pipeline'])
+    Data.ready = int(m['ready'])
+    Data.prospects_stale = int(m['stale'])
+    Data.stale = int(m['stale'])
+    Data.csp_orgids = ','.join([str(i) for i in (m.get('orgids') or [])])
+    Data.dashboard_url = SCRIPT_PATH
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -1717,6 +2027,8 @@ ORDER BY tn.CreatedDate DESC, tn.TaskNoteId DESC
             score += 8
         if ev_name and evn.lower() == ev_name.lower():
             score += 5
+        elif 'step' in evn.lower() or 'note about' in evn.lower():
+            score += 4
         elif dt == KEV_DROPDOWN:
             score += 2
         elif dt > 0:
@@ -1752,17 +2064,58 @@ ORDER BY tn.CreatedDate DESC, tn.TaskNoteId DESC
 
 
 def _posted_kev_map():
-    """Answers from hidden kev_json (preferred) or individual kev_* form fields."""
+    """Answers for Keyword Extra Values.
+    Prefer GET-packed do=snote (`_PACKED_NOTE` / `a`), then `nx`, then kev_* fields.
+    """
+    out = {}
+    # 0) Full note pack from do=snote
+    global _PACKED_NOTE
+    if isinstance(_PACKED_NOTE, dict):
+        a = _PACKED_NOTE.get('a')
+        if isinstance(a, dict):
+            for k in a.keys():
+                out[_s(k)] = _s(a.get(k))
+        for k in _PACKED_NOTE.keys():
+            ks = _s(k)
+            if ks.startswith('kev_'):
+                out[ks] = _s(_PACKED_NOTE.get(k))
+        if out:
+            return out
+    # 1) WAF-safe packed field `nx` (base64url JSON)
+    packed = _s(_form_val('nx'))
+    if packed:
+        raw = _b64url_decode(packed)
+        if raw:
+            try:
+                parsed, _status = _parse_config_json(raw)
+                if isinstance(parsed, dict):
+                    for k in parsed.keys():
+                        out[_s(k)] = _s(parsed.get(k))
+                    if out:
+                        return out
+            except:
+                pass
+            try:
+                from Newtonsoft.Json.Linq import JObject
+                obj = JObject.Parse(raw)
+                parsed = _jobj_to_py(obj)
+                if isinstance(parsed, dict):
+                    for k in parsed.keys():
+                        out[_s(k)] = _s(parsed.get(k))
+                    if out:
+                        return out
+            except:
+                pass
+    # 2) Plain JSON hidden field
     raw = _s(_form_val('kev_json'))
     if raw:
         parsed, _status = _parse_config_json(raw)
         if isinstance(parsed, dict):
-            out = {}
             for k in parsed.keys():
                 out[_s(k)] = _s(parsed.get(k))
-            return out
-    # Fallback: scan request keys
-    out = {}
+            if out:
+                return out
+    # 3) Individual fields (may be stripped by WAF)
     try:
         for k in _form_key_set():
             ks = _s(k)
@@ -1866,94 +2219,356 @@ def _questions_for_keyword(keyword_desc):
     return []
 
 
-def _insert_task_note_extra_value(task_note_id, kev_id, data_type, response, modified_by):
-    """Insert TaskNoteExtraValue; return new TaskNoteExtraValueId or 0."""
-    # Prefer ExecuteSql — QuerySql INSERT/OUTPUT is often blocked in PyScript
+def _progress_note_step_kev(cfg=None):
+    """Return (KeywordExtraValueId, {optionId: name, nameLower: optionId}) for the Progress Note step dropdown."""
+    pn = _progress_note_cfg(cfg)
+    kw = _s(pn.get('keyword'))
+    ev_name = _s(pn.get('ev_question'))
+    if not kw:
+        return 0, {}
+    kw_esc = kw.replace("'", "''")
+    sql = """
+SELECT kev.KeywordExtraValueId AS KevId,
+       kev.Name AS EvName,
+       o.KeywordExtraValueOptionId AS OptId,
+       o.Name AS OptName
+FROM dbo.Keyword k
+INNER JOIN dbo.KeywordExtraValue kev ON kev.KeywordId = k.KeywordId
+LEFT JOIN dbo.KeywordExtraValueOption o ON o.KeywordExtraValueId = kev.KeywordExtraValueId
+WHERE LTRIM(RTRIM(k.Description)) = N'""" + kw_esc + """'
+  AND kev.DataType = 5
+ORDER BY kev.SortOrder, o.KeywordExtraValueOptionId
+"""
+    rows = []
     try:
-        if response is None:
-            model.ExecuteSql(
-                "INSERT INTO dbo.TaskNoteExtraValue "
-                "(KeywordExtraValueId, TaskNoteId, ModifiedBy, ModifiedDate, DataType, Response) "
-                "VALUES (" + str(int(kev_id)) + "," + str(int(task_note_id)) + ","
-                + str(int(modified_by)) + ",GETDATE()," + str(int(data_type)) + ",NULL)"
-            )
-        else:
-            esc = _s(response).replace("'", "''")
-            model.ExecuteSql(
-                "INSERT INTO dbo.TaskNoteExtraValue "
-                "(KeywordExtraValueId, TaskNoteId, ModifiedBy, ModifiedDate, DataType, Response) "
-                "VALUES (" + str(int(kev_id)) + "," + str(int(task_note_id)) + ","
-                + str(int(modified_by)) + ",GETDATE()," + str(int(data_type)) + ",N'" + esc + "')"
-            )
-        p2 = _dd()
-        p2.AddValue('tnId', int(task_note_id))
-        p2.AddValue('kevId', int(kev_id))
-        rows = list(q.QuerySql("""
-SELECT TOP 1 TaskNoteExtraValueId AS Id
-FROM dbo.TaskNoteExtraValue
-WHERE TaskNoteId = @tnId AND KeywordExtraValueId = @kevId
-ORDER BY TaskNoteExtraValueId DESC
-""", p2))
-        if rows:
-            return _i(rows[0].Id, 0)
+        rows = list(q.QuerySql(sql))
+    except:
+        rows = []
+    if not rows:
+        return 0, {}
+    # Prefer configured EV name; else first dropdown whose name looks like the step question
+    by_kev = {}
+    for r in rows:
+        kid = _i(r.KevId, 0)
+        if kid <= 0:
+            continue
+        if kid not in by_kev:
+            by_kev[kid] = {'name': _s(r.EvName), 'opts': {}}
+        oid = _i(r.OptId, 0)
+        oname = _s(r.OptName).strip()
+        if oid > 0 and oname:
+            by_kev[kid]['opts'][oid] = oname
+    if not by_kev:
+        return 0, {}
+    chosen = 0
+    ev_low = ev_name.lower()
+    for kid in by_kev.keys():
+        n = _s(by_kev[kid]['name']).lower()
+        if ev_low and n == ev_low:
+            chosen = kid
+            break
+    if chosen <= 0:
+        for kid in by_kev.keys():
+            n = _s(by_kev[kid]['name']).lower()
+            if 'step' in n or 'note about' in n:
+                chosen = kid
+                break
+    if chosen <= 0:
+        # Only one dropdown on the keyword — use it
+        keys = list(by_kev.keys())
+        if len(keys) == 1:
+            chosen = keys[0]
+    if chosen <= 0:
+        return 0, {}
+    opts = by_kev[chosen]['opts']
+    lookup = {}
+    for oid in opts.keys():
+        name = opts[oid]
+        lookup[oid] = name
+        lookup[str(oid)] = name
+        lookup[name.lower()] = oid
+    return chosen, lookup
+
+
+def _cms_type(simple_name, sample_obj=None):
+    """Resolve CmsData.* type without `import CmsData` (not exposed to PyScript)."""
+    simple_name = _s(simple_name)
+    # 1) Same CLR type as a sample instance (best)
+    if sample_obj is not None:
+        try:
+            return sample_obj.GetType()
+        except:
+            pass
+    # 2) Load from assembly that owns TaskNoteViewModel / related API types
+    try:
+        from System import Type
+        probes = [
+            'CmsData.' + simple_name + ', CmsData',
+            'CmsData.' + simple_name + ', CmsData.Core',
+            'CmsData.' + simple_name,
+        ]
+        for aq in probes:
+            t = Type.GetType(aq)
+            if t is not None:
+                return t
     except:
         pass
-    return 0
+    try:
+        import clr
+        for asm_name in ('CmsData', 'CmsWeb', 'CmsData.Common'):
+            try:
+                clr.AddReference(asm_name)
+            except:
+                pass
+        from System import Type
+        t = Type.GetType('CmsData.' + simple_name + ', CmsData')
+        if t is not None:
+            return t
+    except:
+        pass
+    return None
 
 
-def _save_note_extra_answers(task_note_id, keyword_desc):
-    """Persist KeywordExtraValue answers posted with the note form."""
+def _clr_new(type_or_sample, **fields):
+    """Activator.CreateInstance for a CmsData DTO; set public fields/properties."""
+    from System import Activator, Type
+    if type_or_sample is None:
+        raise Exception('missing CLR type')
+    if isinstance(type_or_sample, Type):
+        t = type_or_sample
+    else:
+        t = type_or_sample.GetType()
+    obj = Activator.CreateInstance(t)
+    for k in fields.keys():
+        try:
+            setattr(obj, k, fields[k])
+        except:
+            pass
+    return obj
+
+
+def _sample_dropdown_option(questions):
+    """First TNDropdownList option from GetExtraQuestions (for type discovery / reuse)."""
+    for q in (questions or []):
+        try:
+            opts = list(q.dropdownOptions or [])
+        except:
+            opts = []
+        if opts:
+            return opts[0]
+    return None
+
+
+def _pick_dropdown_option(q, opt_id=0, name_hint=''):
+    """Return matching option object from q.dropdownOptions (reuse — no CmsData import)."""
+    try:
+        opts = list(q.dropdownOptions or [])
+    except:
+        opts = []
+    opt_id = _i(opt_id, 0)
+    hint = _s(name_hint).strip().lower()
+    if opt_id > 0:
+        for opt in opts:
+            if _i(opt.Value, 0) == opt_id:
+                return opt
+    if hint:
+        for opt in opts:
+            if _s(opt.Text).strip().lower() == hint:
+                return opt
+    return None
+
+
+def _tn_dropdown(value, text='', sample=None, type_hint=None):
+    """Build a TNDropdownList via Activator (PyScript cannot `import CmsData`)."""
+    t = type_hint or _cms_type('TNDropdownList', sample)
+    if t is None:
+        raise Exception('TNDropdownList type not found')
+    return _clr_new(t, Value=int(value), Text=_s(text))
+
+
+def _tn_list_item(value, text='', sample=None):
+    t = _cms_type('TNListItem', sample)
+    if t is None:
+        raise Exception('TNListItem type not found')
+    return _clr_new(t, Value=_s(value), Text=_s(text))
+
+
+def _save_note_extra_answers(task_note_id, keyword_desc, pn_step='', pn_opt=0):
+    """Persist Keyword Extra answers via model.TaskNoteEdit (official API).
+
+    Shared by every note keyword: Progress Note, Interview, References, Shadowing,
+    FL Training, etc. (model.ExecuteSql is debug-only — do not use for EVs.)
+    Never invent Yes/No = False when the answer was not posted.
+    """
     task_note_id = _i(task_note_id, 0)
     if task_note_id <= 0:
-        return
-    questions = _questions_for_keyword(keyword_desc)
-    if not questions:
-        return
+        return False
+    keyword_desc = _s(keyword_desc)
+    pn_step = _s(pn_step)
+    pn_opt = _i(pn_opt, 0)
     posted = _posted_kev_map()
-    owner = _user_pid()
-    if owner <= 0:
-        owner = 1
-    for qu in questions:
-        dt = _i(qu.get('dt'), 0)
-        qid = _i(qu.get('id'), 0)
+
+    try:
+        vm = model.GetTaskNote(task_note_id)
+    except:
+        return False
+    if vm is None:
+        return False
+
+    try:
+        questions = list(model.GetExtraQuestions(task_note_id) or [])
+    except:
+        return False
+
+    if not questions and not posted and not pn_step and pn_opt <= 0:
+        return True
+
+    pn_cfg = _progress_note_cfg()
+    pn_kw = _s(pn_cfg.get('keyword'))
+    pn_ev = _s(pn_cfg.get('ev_question'))
+    is_progress = bool(pn_kw and keyword_desc and keyword_desc.strip().lower() == pn_kw.strip().lower())
+    answered = 0
+    dd_sample = _sample_dropdown_option(questions)
+    dd_type = None
+    if dd_sample is not None:
+        try:
+            dd_type = dd_sample.GetType()
+        except:
+            dd_type = None
+    if dd_type is None:
+        try:
+            dd_type = vm.GetType().Assembly.GetType('CmsData.TNDropdownList')
+        except:
+            dd_type = _cms_type('TNDropdownList')
+
+    for q in questions:
+        try:
+            dt = _i(q.dataType, 0)
+            qid = _i(q.keywordExtraValueId, 0)
+        except:
+            continue
         if qid <= 0 or dt <= KEV_INSTRUCTIONS:
             continue
+
         if dt == KEV_CHECKBOXES:
-            tnev_id = _insert_task_note_extra_value(task_note_id, qid, dt, None, owner)
-            if tnev_id <= 0:
-                continue
-            for opt in (qu.get('opts') or []):
-                oid = _i(opt.get('id'), 0)
+            any_set = False
+            try:
+                opts = list(q.checkboxesList or [])
+            except:
+                opts = []
+            for opt in opts:
+                try:
+                    oid = _i(opt.keywordExtraValueOptionId, 0)
+                except:
+                    continue
                 if oid <= 0:
                     continue
                 field = 'kev_c_' + str(qid) + '_' + str(oid)
-                checked = _s(posted.get(field)) or _s(_form_val(field))
-                resp = 'True' if checked in ('1', 'true', 'True', 'on', 'yes', 'Yes') else 'False'
-                esc = resp.replace("'", "''")
+                checked = _s(posted.get(field))
+                is_yes = checked in ('1', 'true', 'True', 'on', 'yes', 'Yes')
                 try:
-                    model.ExecuteSql(
-                        "INSERT INTO dbo.TaskNoteExtraValueOption "
-                        "(TaskNoteExtraValueId, KeywordExtraValueOptionId, Response) "
-                        "VALUES (" + str(tnev_id) + "," + str(oid) + ",N'" + esc + "')"
-                    )
+                    opt.boolResponse = is_yes
+                    opt.response = 'True' if is_yes else 'False'
                 except:
                     pass
+                if is_yes:
+                    any_set = True
+            if any_set:
+                answered += 1
             continue
+
         field = 'kev_' + str(qid)
         raw = _s(posted.get(field))
-        if not raw:
-            raw = _s(_form_val(field))
+
         if dt == KEV_YESNO:
-            if raw.lower() in ('1', 'true', 'yes', 'on'):
-                raw = 'True'
-            else:
-                raw = 'False'
-        elif dt == KEV_DROPDOWN:
             if not raw:
-                raw = None
-        elif not raw:
-            raw = None
-        _insert_task_note_extra_value(task_note_id, qid, dt, raw, owner)
+                continue
+            is_yes = raw.lower() in ('1', 'true', 'yes', 'on')
+            try:
+                q.boolResponse = is_yes
+            except:
+                pass
+            answered += 1
+        elif dt == KEV_DROPDOWN:
+            qname = ''
+            try:
+                qname = _s(q.name)
+            except:
+                qname = ''
+            use_hint = ''
+            if is_progress and (pn_step or pn_opt > 0):
+                if pn_ev and qname.lower() == pn_ev.lower():
+                    use_hint = pn_step
+                elif 'step' in qname.lower() or 'note about' in qname.lower():
+                    use_hint = pn_step
+                elif not pn_ev:
+                    use_hint = pn_step
+            opt_id = _i(raw, 0)
+            if opt_id <= 0 and is_progress and pn_opt > 0:
+                if use_hint or (pn_ev and qname.lower() == pn_ev.lower()) or ('step' in qname.lower()) or ('note about' in qname.lower()):
+                    opt_id = pn_opt
+            picked = _pick_dropdown_option(q, opt_id, use_hint or raw)
+            if picked is None:
+                continue
+            try:
+                q.dropdownResponse = picked
+                q.response = str(_i(picked.Value, 0))
+            except:
+                return False
+            answered += 1
+        elif dt in (KEV_TEXT, KEV_MULTILINE, KEV_DATE):
+            if not raw:
+                continue
+            try:
+                q.response = raw
+            except:
+                pass
+            answered += 1
+
+    # TaskNoteEdit only saves extras when IncomingKeywords is set (and keyword has EVs)
+    try:
+        kid = _keyword_id(keyword_desc) if keyword_desc else 0
+        items = []
+        if kid > 0:
+            if dd_type is None and dd_sample is None:
+                return False
+            items.append(_tn_dropdown(kid, keyword_desc, sample=dd_sample, type_hint=dd_type))
+        else:
+            try:
+                for kw in (vm.Keywords or []):
+                    kv = _i(getattr(kw, 'Value', None), 0)
+                    if kv > 0:
+                        items.append(_tn_dropdown(kv, _s(getattr(kw, 'Text', '')), sample=dd_sample, type_hint=dd_type))
+            except:
+                pass
+        vm.IncomingKeywords = items
+        vm.extraQuestions = questions
+    except:
+        return False
+
+    if vm.AboutPerson is None:
+        try:
+            about_id = _i(getattr(vm, 'AboutPersonId', None), 0)
+            if about_id > 0:
+                ap_sample = None
+                try:
+                    ap_sample = getattr(vm, 'Owner', None)
+                except:
+                    ap_sample = None
+                vm.AboutPerson = _tn_list_item(str(about_id), '', sample=ap_sample)
+        except:
+            return False
+    if vm.AboutPerson is None:
+        return False
+
+    try:
+        model.TaskNoteEdit(vm)
+    except:
+        return False
+
+    if answered <= 0 and (pn_step or pn_opt > 0) and is_progress:
+        return False
+    return True
 
 
 def _ev_date(people_id, field):
@@ -2851,14 +3466,40 @@ def _action_send_application(cfg, area_key, list_key, people_id, confirm_resend)
     return 'ok_sent'
 
 
+def _staff_role_id():
+    """RoleId for the Staff role (Limit to Role on TaskNotes). 0 if not found."""
+    sql = """
+SELECT TOP 1 RoleId
+FROM dbo.Roles
+WHERE RoleName = 'Staff'
+"""
+    try:
+        rows = list(q.QuerySql(sql))
+        if rows:
+            return _i(rows[0].RoleId, 0)
+    except:
+        pass
+    return 0
+
+
 def _action_add_note(people_id, keyword_desc, note_text):
     """Create a person note. Empty keyword = progress note (does not complete step).
     Step completion is still detected only via the configured Complete keyword.
     When the keyword has KeywordExtraValue questions, answers are saved onto the note.
     Progress-note step also stored as Instructions 'VODPN:<label>' for reliable tile icons.
+    All notes are Limit-to-Role = Staff.
     """
+    global _PACKED_NOTE
     keyword_desc = _s(keyword_desc)
     note_text = _s(note_text)
+    # GET-packed do=snote may carry fields that POST WAF stripped
+    if isinstance(_PACKED_NOTE, dict):
+        if not keyword_desc:
+            keyword_desc = _s(_PACKED_NOTE.get('keyword'))
+        if not note_text:
+            note_text = _s(_PACKED_NOTE.get('note_text'))
+        if people_id <= 0:
+            people_id = _i(_PACKED_NOTE.get('people_id'), 0) or _i(_PACKED_NOTE.get('pid'), 0)
     if not note_text:
         return 'err_generic'
     kids = None
@@ -2871,10 +3512,15 @@ def _action_add_note(people_id, keyword_desc, note_text):
     owner = _user_pid()
     if owner <= 0:
         return 'err_queue_user'
-    # Progress-note step label (from form) — used for tile icons even if EV write fails
+    # Progress-note step — prefer simple fields (WAF often strips kev_* / kev_json)
+    pn_opt = _i(_form_val('pn_opt'), 0)
     pn_step = _s(_form_val('pn_step'))
-    if not pn_step:
-        # Derive from posted kev dropdown using option id lookup
+    if isinstance(_PACKED_NOTE, dict):
+        if pn_opt <= 0:
+            pn_opt = _i(_PACKED_NOTE.get('pn_opt'), 0)
+        if not pn_step:
+            pn_step = _s(_PACKED_NOTE.get('pn_step'))
+    if not pn_step and pn_opt <= 0:
         try:
             cfg = _load_config()
             lookup = _pn_option_lookup(cfg)
@@ -2885,27 +3531,51 @@ def _action_add_note(people_id, keyword_desc, note_text):
                     continue
                 if ks.startswith('kev_'):
                     val = _s(posted.get(k)).strip()
-                    if val and val in lookup:
+                    if not val:
+                        continue
+                    oid = _i(val, 0)
+                    if oid > 0:
+                        pn_opt = oid
+                        pn_step = _s(lookup.get(str(oid)) or lookup.get(oid))
+                        break
+                    if val in lookup:
                         pn_step = _s(lookup.get(val))
                         break
-                    if val and val.lower() in lookup:
-                        pn_step = _s(lookup.get(val.lower()))
+                    if val.lower() in lookup:
+                        got = lookup.get(val.lower())
+                        if _i(got, 0) > 0:
+                            pn_opt = _i(got, 0)
+                            pn_step = val
+                        else:
+                            pn_step = _s(got)
                         break
+        except:
+            pass
+    if pn_opt > 0 and not pn_step:
+        try:
+            _kev, lookup = _progress_note_step_kev()
+            pn_step = _s(lookup.get(pn_opt) or lookup.get(str(pn_opt)))
         except:
             pass
     instructions = ''
     pn_cfg = _progress_note_cfg()
-    if pn_step and keyword_desc:
-        pn_kw = _s(pn_cfg.get('keyword'))
-        if pn_kw and _s(keyword_desc).strip().lower() == pn_kw.strip().lower():
-            instructions = 'VODPN:' + pn_step
+    pn_kw = _s(pn_cfg.get('keyword'))
+    is_progress = bool(pn_kw and keyword_desc and _s(keyword_desc).strip().lower() == pn_kw.strip().lower())
+    if is_progress and pn_step:
+        instructions = 'VODPN:' + pn_step
+    staff_role = _staff_role_id()
+    role_id = staff_role if staff_role > 0 else None
     try:
+        # CreateTaskNote(owner, about, assignee, roleId, isNote, instructions, notes, dueDate, keywords, sendEmails)
         tnid = model.CreateTaskNote(
-            owner, people_id, None, None, True, instructions, note_text, None, kids, False
+            owner, people_id, None, role_id, True, instructions, note_text, None, kids, False
         )
-        if _i(tnid, 0) > 0 and keyword_desc:
+        tnid = _i(tnid, 0)
+        # All keywords (Progress Note, Interview, References, Shadowing, FL Training, …)
+        # share this path: GET-packed do=snote → CreateTaskNote → TaskNoteEdit for EVs
+        if tnid > 0 and keyword_desc:
             try:
-                _save_note_extra_answers(tnid, keyword_desc)
+                _save_note_extra_answers(tnid, keyword_desc, pn_step, pn_opt)
             except:
                 pass
         return 'ok_note'
@@ -2974,6 +3644,16 @@ def _styles():
 .vod-card.flag-red { border-color: ''' + vm + '''; background: #fff5f5; }
 .vod-card-h { display: flex; align-items: center; gap: 10px; padding: 12px 14px; cursor: pointer; flex-wrap: wrap; }
 .vod-caret { width: 18px; color: #64748b; font-weight: 700; }
+.vod-stale-dot {
+  flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%;
+  background: #EAB308; box-shadow: 0 0 0 2px rgba(234, 179, 8, .28);
+}
+.vod-legend {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 14px; padding: 8px 12px;
+  font-size: 12px; font-weight: 600; color: #64748b;
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+}
 .vod-name { font-weight: 700; font-size: 15px; color: ''' + dr + '''; text-decoration: none; }
 .vod-name:hover { color: ''' + az + '''; }
 .vod-meta { font-size: 12px; color: #64748b; margin-left: auto; }
@@ -3177,6 +3857,9 @@ def _styles():
 .vod-link { color: ''' + az + '''; text-decoration: none; font-weight: 600; background: none; border: none; padding: 0; cursor: pointer; font-size: 11px; }
 .vod-link:hover { text-decoration: underline; }
 .vod-link-muted { color: #64748b; }
+.vod-edit-reveal { display: inline-flex; flex-direction: column; align-items: center; gap: 6px; width: 100%; }
+.vod-edit-panel { display: none; width: 100%; justify-content: center; }
+.vod-edit-panel.open { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .vod-note-input {
   width: 100%;
   max-width: 180px;
@@ -3407,6 +4090,21 @@ function vodConfirmResend(formId) {
   }
   return false;
 }
+function vodRevealEdit(btn) {
+  // Show date/approval editor hidden behind a muted link on completed steps
+  if (!btn) return false;
+  var wrap = btn.parentNode;
+  if (!wrap) return false;
+  var panel = wrap.querySelector('.vod-edit-panel');
+  if (panel) {
+    var cls = panel.className || '';
+    if ((' ' + cls + ' ').indexOf(' open ') < 0) {
+      panel.className = (cls ? cls + ' ' : '') + 'open';
+    }
+  }
+  btn.style.display = 'none';
+  return false;
+}
 function vodEsc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -3414,12 +4112,18 @@ function vodEsc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+function vodIsPnEvQuestion(q) {
+  var n = (q && q.name) ? String(q.name) : '';
+  if (window.VOD_PN_EV_NAME && n === VOD_PN_EV_NAME) return true;
+  var low = n.toLowerCase();
+  return low.indexOf('step') >= 0 || low.indexOf('note about') >= 0;
+}
 function vodFilterKevOpts(q) {
   var opts = q.opts || [];
   if (!window.VOD_PN_ALLOWED || !VOD_PN_ALLOWED.length) return opts;
   var f = document.getElementById('vod-note-form');
   var kw = (f && f.keyword) ? f.keyword.value : '';
-  if (kw !== VOD_PN_KW || (q.name || '') !== VOD_PN_EV_NAME) return opts;
+  if (kw !== VOD_PN_KW || !vodIsPnEvQuestion(q)) return opts;
   var allow = {};
   var i;
   for (i = 0; i < VOD_PN_ALLOWED.length; i++) allow[VOD_PN_ALLOWED[i]] = true;
@@ -3437,7 +4141,7 @@ function vodApplyPnPreselect() {
   var i, j, q, opts, opt, el;
   for (i = 0; i < list.length; i++) {
     q = list[i];
-    if ((q.name || '') !== VOD_PN_EV_NAME || q.dt !== 5) continue;
+    if (!vodIsPnEvQuestion(q) || q.dt !== 5) continue;
     opts = vodFilterKevOpts(q);
     for (j = 0; j < opts.length; j++) {
       opt = opts[j];
@@ -3490,8 +4194,10 @@ function vodRenderKevQuestions() {
       }
       html += '</select>';
     } else if (q.dt === 6) {
+      // Blank default — do not invent No when unanswered (TouchPoints treats False as No)
       html += '<select id="' + fid + '" name="' + fid + '">';
-      html += '<option value="False">No</option><option value="True">Yes</option></select>';
+      html += '<option value="">—</option>';
+      html += '<option value="True">Yes</option><option value="False">No</option></select>';
     } else if (q.dt === 7) {
       for (j = 0; j < (q.opts || []).length; j++) {
         opt = q.opts[j];
@@ -3617,10 +4323,10 @@ function vodAddList(areaKey) {
 }
 function vodPackKevAnswers() {
   var f = document.getElementById('vod-note-form');
-  if (!f) return true;
+  if (!f) return {};
   var payload = {};
   var els = f.querySelectorAll('input[name^="kev_"], select[name^="kev_"], textarea[name^="kev_"]');
-  var i, el, n;
+  var i, el, n, v;
   for (i = 0; i < els.length; i++) {
     el = els[i];
     n = el.name;
@@ -3629,7 +4335,11 @@ function vodPackKevAnswers() {
       if (el.checked) payload[n] = el.value || '1';
       continue;
     }
-    payload[n] = el.value;
+    v = el.value;
+    if (v === null || v === undefined) continue;
+    v = String(v).replace(/^\s+|\s+$/g, '');
+    if (!v) continue;
+    payload[n] = v;
   }
   var h = f.kev_json;
   if (!h) {
@@ -3640,19 +4350,76 @@ function vodPackKevAnswers() {
     f.appendChild(h);
   }
   try { h.value = JSON.stringify(payload); } catch (e) { h.value = '{}'; }
-  // Capture selected Progress Note step label for tile icons
-  var pnStep = '';
-  var sels = f.querySelectorAll('#vod-note-questions select');
-  for (i = 0; i < sels.length; i++) {
-    el = sels[i];
-    if (el.selectedIndex > 0 && el.options[el.selectedIndex]) {
-      pnStep = (el.options[el.selectedIndex].text || '').replace(/^\s+|\s+$/g, '');
-      if (pnStep && pnStep !== '—') break;
-    }
+  var nx = f.nx;
+  if (!nx) {
+    nx = document.createElement('input');
+    nx.type = 'hidden';
+    nx.name = 'nx';
+    nx.id = 'vod-nx';
+    f.appendChild(nx);
   }
-  if (!pnStep && window.VOD_PN_PRESELECT) pnStep = VOD_PN_PRESELECT;
+  try {
+    var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    nx.value = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) {
+    nx.value = '';
+  }
+  // Capture selected Progress Note step (label + option id) — only for Progress Note keyword
+  var pnStep = '';
+  var pnOpt = '';
+  var kwNow = (f.keyword) ? f.keyword.value : '';
+  if (kwNow && window.VOD_PN_KW && kwNow === VOD_PN_KW) {
+    var sels = f.querySelectorAll('#vod-note-questions select');
+    for (i = 0; i < sels.length; i++) {
+      el = sels[i];
+      if (el.selectedIndex > 0 && el.options[el.selectedIndex]) {
+        pnOpt = String(el.options[el.selectedIndex].value || '').replace(/^\s+|\s+$/g, '');
+        pnStep = (el.options[el.selectedIndex].text || '').replace(/^\s+|\s+$/g, '');
+        if (pnStep && pnStep !== '—') break;
+      }
+    }
+    if (!pnStep && window.VOD_PN_PRESELECT) pnStep = VOD_PN_PRESELECT;
+  }
   if (f.pn_step) f.pn_step.value = pnStep || '';
-  return true;
+  if (f.pn_opt) f.pn_opt.value = pnOpt || '';
+  return payload;
+}
+function vodSubmitNote(ev) {
+  // GET-packed save (do=snote) — App Gateway WAF strips kev_*/JSON on POST
+  if (ev && ev.preventDefault) ev.preventDefault();
+  var f = document.getElementById('vod-note-form');
+  if (!f) return false;
+  var answers = vodPackKevAnswers() || {};
+  var noteText = (f.note_text && f.note_text.value) ? String(f.note_text.value) : '';
+  if (!noteText.replace(/^\s+|\s+$/g, '')) {
+    alert('Enter a note before saving.');
+    return false;
+  }
+  var pack = {
+    people_id: f.people_id ? f.people_id.value : '',
+    area: f.area ? f.area.value : '',
+    list: f.list ? f.list.value : '',
+    keyword: f.keyword ? f.keyword.value : '',
+    note_text: noteText,
+    pn_step: f.pn_step ? f.pn_step.value : '',
+    pn_opt: f.pn_opt ? f.pn_opt.value : '',
+    a: answers
+  };
+  var b64;
+  try {
+    b64 = btoa(unescape(encodeURIComponent(JSON.stringify(pack))));
+    b64 = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) {
+    alert('Could not pack note: ' + e);
+    return false;
+  }
+  if (b64.length > 6000) {
+    alert('Note is too long to save through the gateway. Shorten the note text and try again.');
+    return false;
+  }
+  var url = VOD_SCRIPT_PATH + '?do=snote&np=' + encodeURIComponent(b64);
+  window.location.replace(url);
+  return false;
 }
 function vodCloseNote(ev) {
   if (ev && ev.type === 'click' && ev.target && ev.currentTarget && ev.target !== ev.currentTarget) return;
@@ -3674,7 +4441,9 @@ function vodOpenNote(pid, area, list, stepLabel, personName, defaultKw, options,
   f.list.value = list || '';
   f.note_text.value = '';
   if (f.kev_json) f.kev_json.value = '';
+  if (f.nx) f.nx.value = '';
   if (f.pn_step) f.pn_step.value = '';
+  if (f.pn_opt) f.pn_opt.value = '';
   var title = document.getElementById('vod-note-title');
   var sub = document.getElementById('vod-note-sub');
   if (title) title.textContent = 'Add note — ' + (stepLabel || 'Step');
@@ -3695,7 +4464,7 @@ function vodOpenNote(pid, area, list, stepLabel, personName, defaultKw, options,
     sel.appendChild(opt);
   }
   sel.onchange = vodRenderKevQuestions;
-  f.onsubmit = vodPackKevAnswers;
+  f.onsubmit = vodSubmitNote;
   vodRenderKevQuestions();
   if ((' ' + m.className + ' ').indexOf(' open ') < 0) {
     m.className = (m.className ? m.className + ' ' : '') + 'open';
@@ -3751,7 +4520,9 @@ def _note_modal_html():
     html += '<input type="hidden" name="list" value="" />'
     html += '<input type="hidden" name="people_id" value="" />'
     html += '<input type="hidden" name="kev_json" id="vod-kev-json" value="" />'
+    html += '<input type="hidden" name="nx" id="vod-nx" value="" />'
     html += '<input type="hidden" name="pn_step" id="vod-pn-step" value="" />'
+    html += '<input type="hidden" name="pn_opt" id="vod-pn-opt" value="" />'
     html += '<label for="vod-note-keyword">Keyword</label>'
     html += '<select id="vod-note-keyword" name="keyword"></select>'
     html += '<div id="vod-note-questions" class="vod-kev-box"></div>'
@@ -3883,6 +4654,16 @@ def _short_label(key, label):
     return m.get(key, label)
 
 
+def _completed_edit_html(link_label, form_html):
+    """Muted link that reveals an editor (date / approval) on completed steps."""
+    html = '<div class="vod-edit-reveal">'
+    html += '<button type="button" class="vod-link vod-link-muted" onclick="return vodRevealEdit(this)">'
+    html += _html(link_label) + '</button>'
+    html += '<div class="vod-edit-panel">' + form_html + '</div>'
+    html += '</div>'
+    return html
+
+
 def _render_step_actions(st, person, area_key, list_key, list_cfg, view_only, is_admin, cfg=None, is_minor=False):
     """Primary actions only when incomplete; complete steps stay quiet."""
     key = st.get('key')
@@ -3930,34 +4711,44 @@ def _render_step_actions(st, person, area_key, list_key, list_cfg, view_only, is
         html += '</div>'
     elif key == 'app_reviewed' or key == 'handbook' or key == 'training':
         ev = _s(meta.get('ev'))
+        form = '<form method="post" action="' + SCRIPT_PATH + '" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">'
+        form += '<input type="hidden" name="action" value="set_ev_date" />'
+        form += '<input type="hidden" name="area" value="' + _html(area_key) + '" />'
+        form += '<input type="hidden" name="list" value="' + _html(list_key) + '" />'
+        form += '<input type="hidden" name="people_id" value="' + str(pid) + '" />'
+        form += '<input type="hidden" name="ev_field" value="' + _html(ev) + '" />'
+        form += '<input type="date" name="ev_date" value="' + _today_str() + '" style="max-width:132px;font-size:11px;padding:4px;" />'
+        form += '<button type="submit" class="vod-btn vod-btn-muted">' + ('Update' if done else 'Save') + '</button>'
+        form += '</form>'
         html += '<div class="vod-step-actions">'
-        html += '<form method="post" action="' + SCRIPT_PATH + '" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">'
-        html += '<input type="hidden" name="action" value="set_ev_date" />'
-        html += '<input type="hidden" name="area" value="' + _html(area_key) + '" />'
-        html += '<input type="hidden" name="list" value="' + _html(list_key) + '" />'
-        html += '<input type="hidden" name="people_id" value="' + str(pid) + '" />'
-        html += '<input type="hidden" name="ev_field" value="' + _html(ev) + '" />'
-        html += '<input type="date" name="ev_date" value="' + _today_str() + '" style="max-width:132px;font-size:11px;padding:4px;" />'
-        html += '<button type="submit" class="vod-btn vod-btn-muted">' + ('Update' if done else 'Save') + '</button>'
-        html += '</form></div>'
+        if done:
+            html += _completed_edit_html('Update Date', form)
+        else:
+            html += form
+        html += '</div>'
     elif key == 'bc_reviewed':
         bgid = _i(meta.get('bgid'), 0)
         if bgid:
-            html += '<div class="vod-step-actions">'
-            html += '<form method="post" action="' + SCRIPT_PATH + '" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">'
-            html += '<input type="hidden" name="action" value="set_approval" />'
-            html += '<input type="hidden" name="area" value="' + _html(area_key) + '" />'
-            html += '<input type="hidden" name="list" value="' + _html(list_key) + '" />'
-            html += '<input type="hidden" name="people_id" value="' + str(pid) + '" />'
-            html += '<input type="hidden" name="bg_id" value="' + str(bgid) + '" />'
-            html += '<select name="approval" style="font-size:11px;padding:4px;">'
             cur = _s(meta.get('approval')) or 'Pending'
+            form = '<form method="post" action="' + SCRIPT_PATH + '" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">'
+            form += '<input type="hidden" name="action" value="set_approval" />'
+            form += '<input type="hidden" name="area" value="' + _html(area_key) + '" />'
+            form += '<input type="hidden" name="list" value="' + _html(list_key) + '" />'
+            form += '<input type="hidden" name="people_id" value="' + str(pid) + '" />'
+            form += '<input type="hidden" name="bg_id" value="' + str(bgid) + '" />'
+            form += '<select name="approval" style="font-size:11px;padding:4px;">'
             for opt in ('Pending', 'Approved', 'Not Approved'):
                 sel = ' selected="selected"' if opt == cur else ''
-                html += '<option value="' + opt + '"' + sel + '>' + opt + '</option>'
-            html += '</select>'
-            html += '<button type="submit" class="vod-btn vod-btn-muted">Save</button>'
-            html += '</form></div>'
+                form += '<option value="' + opt + '"' + sel + '>' + opt + '</option>'
+            form += '</select>'
+            form += '<button type="submit" class="vod-btn vod-btn-muted">Save</button>'
+            form += '</form>'
+            html += '<div class="vod-step-actions">'
+            if done:
+                html += _completed_edit_html('Change Approval Status', form)
+            else:
+                html += form
+            html += '</div>'
         rc = _i(meta.get('runcount'), 0)
         if rc > 1:
             html += '<div class="vod-step-value">+' + str(rc - 1) + ' earlier run(s) on profile</div>'
@@ -4120,6 +4911,8 @@ def _render_person_card(person, area_cfg, list_cfg, area_key, list_key, view_onl
     html = '<div class="' + card_cls + '" id="' + card_id + '">'
     html += '<div class="vod-card-h" onclick="vodToggle(\'' + card_id + '\')">'
     html += '<div class="vod-caret"></div>'
+    if _prospect_over_months(person.ProspectSince, 3):
+        html += '<span class="vod-stale-dot" title="Prospect for more than 3 months" aria-label="Prospect for more than 3 months"></span>'
     html += '<a class="vod-name" href="/Person2/' + str(pid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + _html(person.Name) + '</a>'
     # Other progress notes sit next to the name (always, no step to complete)
     other_notes = pn_by_bucket.get('other') or []
@@ -4217,6 +5010,17 @@ def _render_list_page(cfg, area_key, list_key, msg, open_pid=0):
 
     html += _nav(cfg, area_key, list_key)
 
+    rows = []
+    if orgid > 0:
+        rows = _load_prospects(orgid)
+    has_stale = False
+    for person in rows:
+        if _prospect_over_months(person.ProspectSince, 3):
+            has_stale = True
+            break
+    if has_stale:
+        html += _stale_legend_html()
+
     if msg:
         html += '<div class="vod-msg">' + _html(msg) + '</div>'
 
@@ -4264,7 +5068,6 @@ def _render_list_page(cfg, area_key, list_key, msg, open_pid=0):
     html += '<button type="submit" class="vod-btn vod-btn-muted">Apply</button>'
     html += '</form></div>'
 
-    rows = _load_prospects(orgid)
     pn_map = {}
     if rows:
         pn_map = _progress_notes_for_people([_i(p.PeopleId) for p in rows], cfg)
@@ -4294,6 +5097,10 @@ def _render_list_page(cfg, area_key, list_key, msg, open_pid=0):
     return html
 
 
+# Top work tabs only — short list labels (Home / Config stay separate).
+NAV_WORK_LIST_KEYS = ('littles', 'kids', 'students')
+
+
 def _nav(cfg, area_key, list_key):
     html = '<div class="vod-tabs">'
     cls = 'vod-tab'
@@ -4303,12 +5110,11 @@ def _nav(cfg, area_key, list_key):
     for ak, area, configured in _visible_areas(cfg):
         ordered = _list_order(configured)
         for lk in ordered:
+            if lk not in NAV_WORK_LIST_KEYS:
+                continue
             lc = configured[lk]
+            # Prefer short list names: Faith Littles / Faith Kids / Student Ministry
             label = _s(lc.get('label')) or lk
-            if len(ordered) > 1 or ak in ('kids', 'student'):
-                label = _s(area.get('label')) + ': ' + label
-            else:
-                label = _s(area.get('label')) or label
             cls = 'vod-tab'
             if ak == area_key and lk == list_key:
                 cls += ' active'
@@ -4428,46 +5234,11 @@ def _render_config_page(cfg, msg):
     html += '<h2 style="margin:0 0 8px;font-size:18px;color:#012B58">Special Content config file</h2>'
     html += '<p style="font-size:14px;line-height:1.45;color:#334155">Edit the Text document named <code>' + CONFIG_CONTENT_NAME + '</code> '
     html += 'under <b>Administration → Special Content → Text</b>. The dashboard reads that JSON on every page load. '
-    html += 'Empty Involvement # (<code>orgid: 0</code>) hides that list from the work tabs.</p>'
+    html += 'Empty Involvement # (<code>orgid: 0</code>) hides that list from the work tabs. '
+    html += 'Set <code>"csp": true</code> on lists that belong in the CSP homepage widget '
+    html += '(Faith Littles, Faith Kids, Student Ministry, Safety).</p>'
 
-    html += '<p style="font-size:12px;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px">'
-    html += 'Store: '
-    if not raw:
-        html += '<b>empty</b> (script defaults only)'
-    else:
-        html += '<b>' + str(len(raw)) + '</b> chars in <code>' + CONFIG_CONTENT_NAME + '</code>'
-    st = ((areas.get('student') or {}).get('lists') or {}).get('students') or {}
-    kid_l = ((areas.get('kids') or {}).get('lists') or {}).get('littles') or {}
-    html += ' · loaded student orgid=<b>' + str(_i(st.get('orgid'), 0)) + '</b>'
-    html += ' · littles orgid=<b>' + str(_i(kid_l.get('orgid'), 0)) + '</b>'
-    if _CONFIG_LOAD_INFO:
-        html += '<br/>Load: ' + _html(_CONFIG_LOAD_INFO)
-    html += '</p>'
-
-    html += '<p style="font-size:12px;color:#64748b;margin:8px 0 0">Keep only <code>' + CONFIG_CONTENT_NAME + '</code>. Delete ConfigProbe, SenderAddr, SenderName, and SenderPid if present — leftovers.</p>'
-
-    html += '<p style="margin:10px 0">'
-    html += '<a class="vod-btn vod-btn-primary" href="' + SCRIPT_PATH + '?do=cfgseed">Write default JSON into Special Content</a> '
-    html += '<a class="vod-btn vod-btn-muted" href="' + SCRIPT_PATH + '?do=cfgpretty">Re-save as pretty-printed</a>'
-    html += '</p>'
-    html += '<p style="font-size:12px;color:#64748b">After seeding (or if the file already exists), open Special Content → Text → <code>' + CONFIG_CONTENT_NAME + '</code>, '
-    html += 'set <code>areas.student.lists.students.orgid</code> to your Involvement # (e.g. <code>85</code>), Save there, then reload this page.</p>'
-
-    # Read-only summary of what the script currently loaded
-    html += '<h3 style="margin:18px 0 8px;font-size:15px;color:#012B58">Currently loaded (read-only)</h3>'
-    pn = _progress_note_cfg(cfg)
-    html += '<div style="margin:0 0 14px;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;font-size:13px;color:#334155">'
-    html += '<div style="font-weight:700;color:#012B58;margin-bottom:4px">Progress notes</div>'
-    html += 'Keyword: <code>' + _html(pn.get('keyword')) + '</code>'
-    html += ' · EV question: <code>' + _html(pn.get('ev_question')) + '</code>'
-    html += '<div style="font-size:12px;color:#64748b;margin-top:6px">option_map: '
-    bits = []
-    for lab, bucket in (pn.get('option_map') or {}).items():
-        bits.append(_html(lab) + '→' + _html(bucket))
-    html += ', '.join(bits) if bits else '—'
-    html += '</div>'
-    html += '<div style="font-size:12px;color:#64748b;margin-top:4px">Edit under <code>progress_note</code> in the Special Content JSON.</div>'
-    html += '</div>'
+    html += '<h3 style="margin:18px 0 8px;font-size:15px;color:#012B58">Currently loaded</h3>'
     for ak in _area_keys(cfg):
         area = areas.get(ak) or {}
         lists = area.get('lists') or {}
@@ -4490,22 +5261,29 @@ def _render_config_page(cfg, msg):
             html += '<div style="font-size:13px;margin-top:4px">Involvement # <b>' + str(orgid) + '</b>'
             if orgid <= 0:
                 html += ' <span style="color:#E52300">(hidden until orgid &gt; 0)</span>'
+            if lc.get('csp'):
+                html += ' <span style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:#CCEBFF;color:#012B58;font-size:11px;font-weight:700">CSP</span>'
+            else:
+                html += ' <span style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:#e2e8f0;color:#64748b;font-size:11px;font-weight:700">Ministry only</span>'
             html += '</div>'
             html += '<div style="font-size:12px;color:#64748b;margin-top:4px">template: ' + _html(lc.get('email_template') or '—') + '</div>'
             html += '</div>'
         html += '</details>'
 
-    # Show raw file for copy/paste editing convenience (pretty-printed)
     html += '<h3 style="margin:18px 0 8px;font-size:15px;color:#012B58">Raw file contents</h3>'
+    html += '<p style="font-size:12px;color:#64748b;margin:0 0 8px">Source: Special Content Text <code>' + _html(CONFIG_CONTENT_NAME) + '</code>'
     if raw:
+        html += ' · ' + str(len(raw)) + ' characters</p>'
         pretty = _json_pretty_text(raw)
-        html += '<p style="font-size:12px;color:#64748b"><a href="' + SCRIPT_PATH + '?do=cfgpretty">Re-save Special Content as pretty-printed JSON</a></p>'
-        html += '<textarea readonly rows="22" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#0f172a;color:#e2e8f0">' + _html(pretty) + '</textarea>'
+        if not pretty:
+            pretty = raw
+        # Escape for HTML textarea — do not run through _s() (would wipe body == "null")
+        shown = _content_body_as_text(pretty)
+        shown = shown.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        html += '<textarea readonly rows="22" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#0f172a;color:#e2e8f0">' + shown + '</textarea>'
     else:
-        html += '<p style="color:#64748b">File is empty. Click <b>Write default JSON</b> above, then edit in Special Content.</p>'
-        sample = _py_to_json(_default_config())
-        html += '<p style="font-size:12px;color:#64748b">Preview of defaults that will be written:</p>'
-        html += '<textarea readonly rows="12" style="width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:10px;border:1px solid #e2e8f0;border-radius:8px">' + _html(sample) + '</textarea>'
+        html += '</p>'
+        html += '<p style="color:#64748b">No body found for <code>' + _html(CONFIG_CONTENT_NAME) + '</code> in Special Content — script defaults are in use.</p>'
 
     html += '</div></div>'
     return html
@@ -4610,6 +5388,32 @@ def main():
             _continue_page(next_url, result)
             return
 
+        # Save note via GET packed payload (do=snote) — WAF strips kev_*/JSON on POST
+        if do == 'snote':
+            global _PACKED_NOTE
+            _PACKED_NOTE = None
+            # Prefer dedicated `np` (avoid colliding with other `p` binders); fall back to `p`
+            raw_p = _qs_raw('np') or _qs_raw('p')
+            posted, pack_diag = _parse_note_pack(raw_p)
+            if not isinstance(posted, dict):
+                _flash_detail_set(_s(pack_diag) or ('note pack invalid (len=' + str(len(_s(raw_p))) + ')'))
+                _continue_page(SCRIPT_PATH + '?area=home', 'err_generic')
+                return
+            _PACKED_NOTE = posted
+            area = _s(posted.get('area')) or _s(area)
+            list_key = _s(posted.get('list')) or _s(list_key)
+            pid = _i(posted.get('people_id'), 0) or _i(posted.get('pid'), 0)
+            if _is_view_only(cfg, area):
+                result = 'err_view'
+            else:
+                result = _action_add_note(pid, _s(posted.get('keyword')), _s(posted.get('note_text')))
+            _PACKED_NOTE = None
+            next_url = SCRIPT_PATH + '?area=' + _s(area) + '&list=' + _s(list_key)
+            if pid > 0:
+                next_url += '&open=' + str(pid)
+            _continue_page(next_url, result)
+            return
+
         # Save area config via GET fields (do=scfg) — kept as fallback for older paste
         if do == 'scfg':
             if not _is_admin():
@@ -4617,7 +5421,7 @@ def main():
                 return
             ak = _form_val('area_key')
             posted = None
-            raw_p = _form_val('p')
+            raw_p = _qs_raw('p')
             if raw_p:
                 posted = _parse_cfg_payload(raw_p)
                 if posted is None:
@@ -4721,4 +5525,7 @@ def main():
         _show(html)
 
 
-main()
+if _want_csp_widget_metrics():
+    _export_csp_widget_metrics()
+else:
+    main()
