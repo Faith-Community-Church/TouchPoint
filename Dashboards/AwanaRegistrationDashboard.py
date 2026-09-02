@@ -275,16 +275,24 @@ def _club_shell():
             'clubbers_count': 0,
             'volunteer_count': 0,
             'org_id': 0,
+            'configured_org_id': 0,
+            'org_name': '',
             'subgroup_id': 0,
             'dedicated_org': False,
             'has_source': False,
+            'access_denied': False,
         })
     return clubs
 
 
+def _club_raw_org_id(club_key):
+    """Config value for this club (0 = unset / use Clubbers subgroup)."""
+    return _i(CLUB_ORG_IDS.get(club_key), 0)
+
+
 def _club_configured_org_id(club_key):
     """Configured club org, or Clubbers parent when unset (0)."""
-    oid = _i(CLUB_ORG_IDS.get(club_key), 0)
+    oid = _club_raw_org_id(club_key)
     if oid > 0:
         return oid
     return CLUBBERS_ORG_ID
@@ -565,12 +573,14 @@ def _query_source_demo(org_id, tag_id):
 def _build_clubs():
     """
     Resolve each club's source org + optional subgroup.
-    - Config org 0 → Clubbers parent.
-    - If a matching subgroup exists on that org, always use it (Sparks / T&T
-      share Clubbers and must be subgroup-filtered even when Config repeats
-      the same involvement number).
-    - If no subgroup and the org is used by only this club (and is not
-      Clubbers/Volunteers), treat as a dedicated involvement (Puggles/Cubbies).
+
+    Config club org:
+      0 or Clubbers ID → MemberTag named like the club on Clubbers.
+      any other unique ID → that involvement, all members (Puggles/Cubbies).
+      same non-Clubbers ID on two clubs → subgroup filter on that org.
+
+    A matching "Puggles" tag on a dedicated org is ignored so Config mapping
+    is not overridden by leftover Clubbers-style subgroups.
     """
     clubs = _club_shell()
     by_key = {}
@@ -585,9 +595,12 @@ def _build_clubs():
                 by_key[key]['volunteer_count'] = _i(sg.get('count'), 0)
 
     org_ids_by_club = {}
+    raw_ids_by_club = {}
     org_use_count = {}
     for c in clubs:
+        raw = _club_raw_org_id(c['key'])
         oid = _club_configured_org_id(c['key'])
+        raw_ids_by_club[c['key']] = raw
         org_ids_by_club[c['key']] = oid
         org_use_count[oid] = org_use_count.get(oid, 0) + 1
 
@@ -596,6 +609,17 @@ def _build_clubs():
         if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
             subgroups_by_org[oid] = {}
             continue
+        if oid == CLUBBERS_ORG_ID:
+            pass
+        else:
+            # Dedicated unique orgs do not need subgroup lookup.
+            clubs_on_oid = 0
+            for ck, coid in org_ids_by_club.items():
+                if coid == oid:
+                    clubs_on_oid += 1
+            if clubs_on_oid == 1:
+                subgroups_by_org[oid] = {}
+                continue
         if not _user_can_access_org(oid):
             subgroups_by_org[oid] = {}
             continue
@@ -603,19 +627,43 @@ def _build_clubs():
         subgroups_by_org[oid] = mapped
 
     for c in clubs:
+        raw = raw_ids_by_club[c['key']]
         oid = org_ids_by_club[c['key']]
         c['org_id'] = oid
+        c['configured_org_id'] = raw
         c['subgroup_id'] = 0
         c['clubbers_tag_id'] = 0
         c['dedicated_org'] = False
         c['has_source'] = False
+        c['access_denied'] = False
         c['clubbers_count'] = 0
+        c['org_name'] = ''
+
+        explicit_dedicated = (
+            raw > 0
+            and raw != CLUBBERS_ORG_ID
+            and raw != VOLUNTEERS_ORG_ID
+            and org_use_count.get(oid, 0) == 1
+        )
+
+        brief = _org_brief(oid) if oid > 0 else None
+        if brief:
+            c['org_name'] = _s(brief.get('name'))
 
         if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
             continue
         if not _user_can_access_org(oid):
+            c['access_denied'] = True
+            if explicit_dedicated:
+                c['dedicated_org'] = True
             continue
-        if not _org_brief(oid):
+        if not brief:
+            continue
+
+        if explicit_dedicated:
+            c['dedicated_org'] = True
+            c['has_source'] = True
+            c['clubbers_count'] = _count_clubber_members(oid, 0)
             continue
 
         sg = subgroups_by_org.get(oid, {}).get(c['key'])
@@ -629,7 +677,6 @@ def _build_clubs():
             c['has_source'] = True
             c['clubbers_count'] = _count_clubber_members(oid, tag_id)
         elif not shared:
-            # Unique dedicated involvement (typical Puggles / Cubbies).
             c['subgroup_id'] = 0
             c['clubbers_tag_id'] = 0
             c['dedicated_org'] = True
@@ -5902,17 +5949,50 @@ else:
             applyHero(clubbers);
         }
 
+        function syncClubExportButton() {
+            var $btn = $('#btn-reg-excel');
+            if (!currentClubKey || !currentOrgId) {
+                $btn.hide();
+                return;
+            }
+            var label = 'Export Clubbers';
+            if (currentSubtab === 'allergies') label = 'Export Allergies';
+            else if (currentSubtab === 'contacts') label = 'Export Contacts';
+            $btn.html('<i class="fa fa-download"></i> ' + label).show();
+        }
+
         function setClubSubtab(sub, load) {
             currentSubtab = sub || 'club-overview';
             $('#club-subtabs .club-subtab').removeClass('active');
             $('#club-subtabs .club-subtab[data-subtab="' + currentSubtab + '"]').addClass('active');
             $('#club-detail .tab-panel').removeClass('active');
             $('#tab-' + currentSubtab).addClass('active');
+            syncClubExportButton();
             if (!load || !currentOrgId) return;
             if (currentSubtab === 'club-overview') loadClubOverview();
             else if (currentSubtab === 'registration') loadRegistrationSummary();
             else if (currentSubtab === 'allergies') loadAllergies();
             else if (currentSubtab === 'contacts') loadContacts();
+        }
+
+        function clubEmptyHtml(club, label) {
+            var clubbersId = (awanaData && awanaData.clubbers_org && awanaData.clubbers_org.id) || '1916';
+            var orgId = club && (club.org_id || club.configured_org_id);
+            var orgName = (club && club.org_name) || label;
+            if (club && club.access_denied) {
+                return 'No access to <strong>' + esc(orgName) +
+                    '</strong> (involvement #' + esc(String(orgId || '')) + ').';
+            }
+            if (club && club.dedicated_org) {
+                return 'No access to <strong>' + esc(orgName) +
+                    '</strong> (involvement #' + esc(String(orgId || '')) + ').';
+            }
+            if (orgId && String(orgId) !== String(clubbersId)) {
+                return 'No members found on <strong>' + esc(orgName) +
+                    '</strong> (involvement #' + esc(String(orgId)) + ').';
+            }
+            return 'No subgroup named <strong>' + esc(label) +
+                '</strong> on Clubbers (involvement #' + esc(String(clubbersId)) + ').';
         }
 
         function selectClub(club, opts) {
@@ -5929,7 +6009,6 @@ else:
             $('#club-org-picker').removeClass('visible').empty();
             $('#club-empty').hide();
             $('#club-detail').show();
-            if (currentClubKey) $('#btn-reg-excel').show();
             var sub = opts.subtab || currentSubtab || 'club-overview';
             setClubSubtab(sub, true);
         }
@@ -5950,16 +6029,7 @@ else:
                 $('#club-detail').hide();
                 $('#btn-reg-excel').hide();
                 $('#club-org-picker').removeClass('visible').empty();
-                var emptyMsg;
-                if (club && club.dedicated_org) {
-                    emptyMsg = 'No access to <strong>' + esc(label) +
-                        '</strong> (involvement #' + esc(String(club.org_id || '')) + ').';
-                } else {
-                    emptyMsg = 'No subgroup named <strong>' + esc(label) +
-                        '</strong> on Clubbers (involvement #' +
-                        esc(String((awanaData && awanaData.clubbers_org && awanaData.clubbers_org.id) || '1916')) + ').';
-                }
-                $('#club-empty').show().html(emptyMsg);
+                $('#club-empty').show().html(clubEmptyHtml(club, label));
                 return;
             }
             if (forceReload) {
@@ -5979,7 +6049,8 @@ else:
             (rows || []).forEach(function(row) {
                 lines.push(row.map(csvEscape).join(','));
             });
-            var blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+            // BOM so Excel opens UTF-8 names correctly.
+            var blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
             var url = (window.URL || window.webkitURL).createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
@@ -5990,6 +6061,38 @@ else:
             setTimeout(function() {
                 try { (window.URL || window.webkitURL).revokeObjectURL(url); } catch (e) {}
             }, 500);
+        }
+
+        function exportAllergyPeople(people, filename, includeClubs) {
+            var header = ['PeopleId', 'Name'];
+            if (includeClubs) header.push('Clubs');
+            header.push('Allergies');
+            var rows = [];
+            (people || []).forEach(function(p) {
+                var row = [p.people_id, p.name];
+                if (includeClubs) row.push(p.clubs_label || '');
+                row.push(p.allergy || '');
+                rows.push(row);
+            });
+            downloadCsv(filename, header, rows);
+        }
+
+        function exportContactPeople(people, filename, includeClubs) {
+            var header = ['PeopleId', 'Name'];
+            if (includeClubs) header.push('Clubs');
+            header.push('Mother', 'Mother Phone', 'Father', 'Father Phone', 'Emergency Contact', 'Emergency Phone');
+            var rows = [];
+            (people || []).forEach(function(p) {
+                var row = [p.people_id, p.name];
+                if (includeClubs) row.push(p.clubs_label || '');
+                row.push(
+                    p.mother || '', p.mother_phone || '',
+                    p.father || '', p.father_phone || '',
+                    p.em_contact || '', p.em_phone || ''
+                );
+                rows.push(row);
+            });
+            downloadCsv(filename, header, rows);
         }
 
         function rosterNormGender(g) {
@@ -6073,11 +6176,11 @@ else:
             $('#roster-grade-filters').html(gradeHtml);
 
             if (!allPeople.length) {
-                $('#btn-roster-export').hide();
+                syncRosterExportButton();
                 $('#roster-view').html('<div class="empty-state">No clubbers on the master roster.</div>');
                 return;
             }
-            $('#btn-roster-export').show();
+            syncRosterExportButton();
             var ids = collectPeopleIds(people);
             var html = '<div class="reg-meta" style="margin-bottom:14px;">Clubbers: <strong>' +
                 people.length + '</strong>';
@@ -6122,7 +6225,9 @@ else:
             $('#roster-view').html('<div class="empty-state">Loading...</div>');
             ajaxPost({ action: 'get_master_roster' }, function(data) {
                 if (data && data.error) {
-                    $('#btn-roster-export').hide();
+                    masterRosterState.people = [];
+                    masterRosterState.loaded = false;
+                    syncRosterExportButton();
                     $('#roster-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
@@ -6130,6 +6235,37 @@ else:
                 masterRosterState.loaded = true;
                 renderMasterRoster();
             }, { showLoading: true });
+        }
+
+        function syncRosterExportButton() {
+            var key = masterRosterState.subtab || 'roster';
+            var $btn = $('#btn-roster-export');
+            var label = 'Export Roster';
+            var count = 0;
+            if (key === 'allergies') {
+                label = 'Export Allergies';
+                if (!masterAllergyState.loaded) {
+                    $btn.hide();
+                    return;
+                }
+                count = (masterAllergyState.people || []).length;
+            } else if (key === 'contacts') {
+                label = 'Export Contacts';
+                if (!masterContactState.loaded) {
+                    $btn.hide();
+                    return;
+                }
+                count = (masterContactState.people || []).length;
+            } else {
+                if (!masterRosterState.loaded) {
+                    $btn.hide();
+                    return;
+                }
+                count = (masterRosterState.people || []).length;
+            }
+            $btn.html('<i class="fa fa-download"></i> ' + label);
+            if (count > 0) $btn.show();
+            else $btn.hide();
         }
 
         function renderAllergyTable(people, opts) {
@@ -6188,36 +6324,46 @@ else:
         function loadMasterAllergies(force) {
             if (!force && masterAllergyState.loaded) {
                 $('#roster-allergies-view').html(renderAllergyTable(masterAllergyState.people, { showClubs: true }));
+                syncRosterExportButton();
                 return;
             }
             showLoading('Loading allergies...', false);
             $('#roster-allergies-view').html('<div class="empty-state">Loading...</div>');
             ajaxPost({ action: 'get_master_allergies' }, function(data) {
                 if (data && data.error) {
+                    masterAllergyState.people = [];
+                    masterAllergyState.loaded = false;
+                    syncRosterExportButton();
                     $('#roster-allergies-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
                 masterAllergyState.people = (data && data.people) || [];
                 masterAllergyState.loaded = true;
                 $('#roster-allergies-view').html(renderAllergyTable(masterAllergyState.people, { showClubs: true }));
+                syncRosterExportButton();
             }, { showLoading: true });
         }
 
         function loadMasterContacts(force) {
             if (!force && masterContactState.loaded) {
                 $('#roster-contacts-view').html(renderContactTable(masterContactState.people, { showClubs: true }));
+                syncRosterExportButton();
                 return;
             }
             showLoading('Loading contacts...', false);
             $('#roster-contacts-view').html('<div class="empty-state">Loading...</div>');
             ajaxPost({ action: 'get_master_contacts' }, function(data) {
                 if (data && data.error) {
+                    masterContactState.people = [];
+                    masterContactState.loaded = false;
+                    syncRosterExportButton();
                     $('#roster-contacts-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
                 masterContactState.people = (data && data.people) || [];
                 masterContactState.loaded = true;
                 $('#roster-contacts-view').html(renderContactTable(masterContactState.people, { showClubs: true }));
+                syncRosterExportButton();
             }, { showLoading: true });
         }
 
@@ -6227,7 +6373,7 @@ else:
             $('#roster-subtabs .club-subtab').removeClass('active');
             $('#roster-subtabs .club-subtab[data-roster-subtab="' + key + '"]').addClass('active');
             $('#roster-panel-roster, #roster-panel-allergies, #roster-panel-contacts').hide();
-            if (key !== 'roster') $('#btn-roster-export').hide();
+            syncRosterExportButton();
             if (key === 'allergies') {
                 $('#roster-panel-allergies').show();
                 loadMasterAllergies(false);
@@ -6769,23 +6915,74 @@ else:
                     alert('Select a club first.');
                     return;
                 }
+                showLoading('Preparing export...', false);
+                clubPost({ action: 'get_club_roster' }, function(data) {
+                    if (data && data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    var rows = [];
+                    var header = ['PeopleId', 'Name', 'Age', 'Grade', 'Gender', 'Email', 'Emergency Contact', 'Parents'];
+                    (data.people || []).forEach(function(p) {
+                        rows.push([
+                            p.people_id, p.name,
+                            (p.age === 0 || p.age) ? p.age : '',
+                            p.grade, p.gender, p.email, p.emergency, p.parents
+                        ]);
+                    });
+                    downloadCsv(filename, header, rows);
+                }, { showLoading: true });
+                return;
             }
+
+            // Volunteers: must use get_volunteer_roster (not get_club_roster).
+            // get_club_roster members_only excludes anyone on Volunteers — empty CSV.
+            var mode = 'club';
+            if (currentVolClubKey === 'overview') mode = 'overview';
+            else if (currentVolClubKey === 'staff') mode = 'staff';
             showLoading('Preparing export...', false);
-            clubPost({ action: 'get_club_roster' }, function(data) {
+            clubPost({ action: 'get_volunteer_roster', mode: mode }, function(data) {
                 if (data && data.error) {
                     alert(data.error);
                     return;
                 }
+                var people = data.people || [];
+                if (mode === 'staff') {
+                    people = staffFilterPeople(people, staffRosterState.filter || 'all');
+                }
                 var rows = [];
                 var header;
-                if (kind === 'clubbers') {
-                    header = ['PeopleId', 'Name', 'Grade', 'Gender', 'Email', 'Emergency Contact', 'Parents'];
-                    (data.people || []).forEach(function(p) {
-                        rows.push([p.people_id, p.name, p.grade, p.gender, p.email, p.emergency, p.parents]);
+                if (mode === 'staff') {
+                    header = [
+                        'PeopleId', 'Last', 'First', 'Name', 'Age', 'Minor', 'Clubs', 'Email',
+                        'Application', 'Background Check', 'Video Training',
+                        'In-Person Training', 'Handbook'
+                    ];
+                    people.forEach(function(p) {
+                        var app = p.app_date || (p.has_application ? 'On file' : '');
+                        var bg = p.is_minor ? 'n/a' : (p.bg_date || '');
+                        var video = p.is_minor ? 'n/a' : (p.video_date || '');
+                        var handbook = p.is_minor ? 'n/a' : (p.handbook_date || '');
+                        rows.push([
+                            p.people_id, p.last, p.first, p.name,
+                            (p.age === 0 || p.age) ? p.age : '',
+                            p.is_minor ? 'Yes' : 'No',
+                            p.clubs_label || '', p.email,
+                            app, bg, video, p.inperson_date || '', handbook
+                        ]);
+                    });
+                } else if (mode === 'overview') {
+                    header = ['PeopleId', 'Last', 'First', 'Name', 'Age', 'Clubs', 'Email'];
+                    people.forEach(function(p) {
+                        rows.push([
+                            p.people_id, p.last, p.first, p.name,
+                            (p.age === 0 || p.age) ? p.age : '',
+                            p.clubs_label || '', p.email
+                        ]);
                     });
                 } else {
                     header = ['PeopleId', 'Last', 'First', 'Name', 'Grade', 'Gender', 'Email'];
-                    (data.people || []).forEach(function(p) {
+                    people.forEach(function(p) {
                         rows.push([p.people_id, p.last, p.first, p.name, p.grade, p.gender, p.email]);
                     });
                 }
@@ -6810,6 +7007,15 @@ else:
         });
 
         $(document).on('click', '#btn-roster-export', function() {
+            var key = masterRosterState.subtab || 'roster';
+            if (key === 'allergies') {
+                exportAllergyPeople(masterAllergyState.people, 'Awana-Master-Allergies.csv', true);
+                return;
+            }
+            if (key === 'contacts') {
+                exportContactPeople(masterContactState.people, 'Awana-Master-Contacts.csv', true);
+                return;
+            }
             var people = filterMasterRoster(masterRosterState.people || []);
             var rows = [];
             (people || []).forEach(function(p) {
@@ -6857,8 +7063,10 @@ else:
                 html += '<div class="club-card' + (empty ? ' empty' : '') + '" data-club="' + esc(club.key) + '">';
                 html += '<div class="club-card-label">' + esc(club.label) + '</div>';
                 if (empty) {
-                    if (club.dedicated_org) {
-                        html += '<p class="club-card-meta">Involvement #' + esc(String(club.org_id || '')) + '</p>';
+                    if (club.access_denied) {
+                        html += '<p class="club-card-meta">No access · Inv #' + esc(String(club.org_id || club.configured_org_id || '')) + '</p>';
+                    } else if (club.dedicated_org || (club.org_id && club.configured_org_id)) {
+                        html += '<p class="club-card-meta">Involvement #' + esc(String(club.org_id || club.configured_org_id || '')) + '</p>';
                     } else {
                         html += '<p class="club-card-meta">No matching subgroup on Clubbers</p>';
                     }
@@ -7392,7 +7600,9 @@ else:
                 var html = '<div class="reg-meta" style="margin-bottom:14px;">Clubbers: <strong>' +
                     people.length + '</strong></div>';
                 html += drillActionsHtml({ peopleIds: ids });
-                html += '<table class="people-table"><thead><tr><th>Person</th><th>Age</th><th>Grade</th></tr></thead><tbody>';
+                html += '<table class="people-table"><thead><tr>';
+                html += '<th>Person</th><th>Age</th><th>Grade</th><th>Gender</th>';
+                html += '</tr></thead><tbody>';
                 people.forEach(function(p) {
                     html += '<tr><td>' + personLink(p.people_id, p.name);
                     if (p.has_allergy) {
@@ -7400,7 +7610,8 @@ else:
                     }
                     html += '</td>';
                     html += '<td>' + esc(p.age === 0 || p.age ? String(p.age) : '') + '</td>';
-                    html += '<td>' + esc(p.grade || '') + '</td></tr>';
+                    html += '<td>' + esc(p.grade || '') + '</td>';
+                    html += '<td>' + esc(p.gender || '') + '</td></tr>';
                 });
                 html += '</tbody></table>';
                 $('#club-overview-view').html(html);
@@ -7524,7 +7735,7 @@ else:
 
         function renderRegistrationSummary(data) {
             renderBreadcrumb();
-            if (currentClubKey) $('#btn-reg-excel').show();
+            syncClubExportButton();
             if (!data.is_registration_form) {
                 $('#reg-view').html('<div class="info-banner">' + esc(data.message) + '</div>');
                 return;
@@ -7603,6 +7814,28 @@ else:
             if (!currentOrgId) return;
             var club = findClub(currentClubKey);
             var name = (club && club.label) ? club.label : 'Clubbers';
+            if (currentSubtab === 'allergies') {
+                showLoading('Preparing export...', false);
+                clubPost({ action: 'get_allergy_people' }, function(data) {
+                    if (data && data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    exportAllergyPeople((data && data.people) || [], name + '-Allergies.csv', false);
+                }, { showLoading: true });
+                return;
+            }
+            if (currentSubtab === 'contacts') {
+                showLoading('Preparing export...', false);
+                clubPost({ action: 'get_contact_people' }, function(data) {
+                    if (data && data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    exportContactPeople((data && data.people) || [], name + '-Contacts.csv', false);
+                }, { showLoading: true });
+                return;
+            }
             exportRosterCsv(name + '-Clubbers.csv', 'clubbers');
         });
 
