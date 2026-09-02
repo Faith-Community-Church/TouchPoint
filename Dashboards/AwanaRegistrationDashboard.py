@@ -1,9 +1,10 @@
 #Roles=Access
 # Script: AwanaRegistrationDashboard.py
-# Purpose: Awana dashboard for Clubbers (Inv 1916) and Volunteers (Inv 1929).
-#   Overview of both involvements, a Volunteers tab (org 1929: Overview, club
-#   filters, Volunteer Management for Admin or Staff+Next Gen), then one tab
-#   per club. Club tabs: Overview roster, Registration, Allergies, Contacts.
+# Purpose: Awana dashboard for Clubbers and Volunteers.
+#   Overview, master Roster, Volunteers (Overview / club filters / Volunteer
+#   Management for Admin or Staff+Next Gen), then one tab per club. Club tabs:
+#   Overview roster, Registration, Allergies, Contacts. Admins get a Config
+#   tab to remap involvements (Puggles/Cubbies may be their own org IDs).
 # Author: Jake Pierson (Awana shell); Ben Swaby (base dashboard);
 #   Jake Pierson (Registration / Allergies / Contacts)
 # Date: 2026-08-28
@@ -11,10 +12,10 @@
 # Install: Special Content -> Python Scripts -> name AwanaRegistrationDashboard
 # Run: /PyScriptForm/AwanaRegistrationDashboard
 #
-# Scope (edit IDs / AWANA_CLUBS below):
-#   Clubbers org 1916 ("Awana Registration")
+# Scope (defaults; override on the Admin Config tab):
+#   Clubbers org 1916 ("Awana Registration") — Sparks / T&T subgroups
 #   Volunteers org 1929
-#   Club tabs match subgroup names on those involvements.
+#   Club org ID 0 = subgroup on Clubbers; >0 = dedicated involvement.
 #
 # IronPython notes (TouchPoint embeds IronPython 2.7):
 #   - Use print without parentheses; except Exception, ex
@@ -67,10 +68,33 @@ BRAND = {
 }
 
 # ---------------------------------------------------------------------------
-# Awana scope — Clubbers + Volunteers involvements; clubs = subgroups
+# Awana scope — Clubbers + Volunteers; clubs = subgroup OR dedicated org
+# Defaults below; Admin Config stores overrides in JsonDocumentRecords.
 # ---------------------------------------------------------------------------
-CLUBBERS_ORG_ID = 1916
-VOLUNTEERS_ORG_ID = 1929
+JSON_SECTION = 'AwanaDashboard'
+SETTINGS_ID1 = 'settings'
+DEFAULT_CLUBBERS_ORG_ID = 1916
+DEFAULT_VOLUNTEERS_ORG_ID = 1929
+CLUBBERS_ORG_ID = DEFAULT_CLUBBERS_ORG_ID
+VOLUNTEERS_ORG_ID = DEFAULT_VOLUNTEERS_ORG_ID
+# Per-club dedicated OrganizationId; 0 = use MemberTag on Clubbers org
+CLUB_ORG_IDS = {
+    'puggles': 0,
+    'cubbies': 0,
+    'sparks': 0,
+    'tnt-girls': 0,
+    'tnt-boys': 0,
+}
+CLUB_ORG_CFG_KEYS = {
+    'puggles': 'puggles_org',
+    'cubbies': 'cubbies_org',
+    'sparks': 'sparks_org',
+    'tnt-girls': 'tnt_girls_org',
+    'tnt-boys': 'tnt_boys_org',
+}
+# MeetingIds (comma-separated in Config) that count as in-person training.
+# Present attendance on any of these fills Volunteer Management + Extra Values.
+INPERSON_MEETING_IDS = []
 # Application involvements (IsMemberOf any of these = application on file)
 APP_ORG_IDS = (502, 529, 1742, 1780)
 EV_AWANA_HANDBOOK = 'Awana Handbook Signed'
@@ -80,20 +104,22 @@ BG_REPORT_PMM = 1
 BG_REPORT_MS_TRAINING = 3
 BG_STATUS_COMPLETE = 3
 MINOR_MAX_AGE = 17
+# lookup.AttendType: Leader=10, Volunteer=20, Member=30
+ATTEND_TYPE_MEMBER = 30
 # First matching substring in MemberTag.Name (lowercased) wins.
-# Exact match on label is preferred. Put TnT Girls/Boys before any generic TnT.
+# Exact match on label is preferred. Put T&T Girls/Boys before any generic T&T.
 AWANA_CLUBS = [
     {'key': 'puggles', 'label': 'Puggles', 'match': ['puggles']},
     {'key': 'cubbies', 'label': 'Cubbies', 'match': ['cubbies']},
     {'key': 'sparks', 'label': 'Sparks', 'match': ['sparks']},
     {
         'key': 'tnt-girls',
-        'label': 'TnT Girls',
+        'label': 'T&T Girls',
         'match': ['tnt girls', 't&t girls', 't and t girls', 'tnt-girls', 't&t-girls'],
     },
     {
         'key': 'tnt-boys',
-        'label': 'TnT Boys',
+        'label': 'T&T Boys',
         'match': ['tnt boys', 't&t boys', 't and t boys', 'tnt-boys', 't&t-boys'],
     },
 ]
@@ -248,8 +274,20 @@ def _club_shell():
             'volunteer_tag_id': 0,
             'clubbers_count': 0,
             'volunteer_count': 0,
+            'org_id': 0,
+            'subgroup_id': 0,
+            'dedicated_org': False,
+            'has_source': False,
         })
     return clubs
+
+
+def _club_configured_org_id(club_key):
+    """Configured club org, or Clubbers parent when unset (0)."""
+    oid = _i(CLUB_ORG_IDS.get(club_key), 0)
+    if oid > 0:
+        return oid
+    return CLUBBERS_ORG_ID
 
 
 def _org_brief(org_id):
@@ -298,12 +336,142 @@ WHERE o.OrganizationId = @orgId
     }
 
 
-def _org_subgroups(org_id):
+def _sql_clubber_members_only():
+    """OrganizationMembers alias om: Member attend type, not on Volunteers org."""
+    return """
+  AND EXISTS (
+        SELECT 1
+        FROM lookup.MemberType mt
+        WHERE mt.Id = om.MemberTypeId
+          AND ISNULL(mt.AttendanceTypeId, 0) = @memberAttendType
+  )
+  AND NOT EXISTS (
+        SELECT 1
+        FROM dbo.OrganizationMembers vom
+        WHERE vom.PeopleId = om.PeopleId
+          AND vom.OrganizationId = @volunteersOrgId
+  )
+"""
+
+
+def _sql_person_is_clubber_member(people_id_expr):
+    """Person is a Member on this org (@orgId) and not on Volunteers."""
+    return """
+      AND EXISTS (
+            SELECT 1
+            FROM dbo.OrganizationMembers om
+            INNER JOIN lookup.MemberType mt ON mt.Id = om.MemberTypeId
+            WHERE om.OrganizationId = @orgId
+              AND om.PeopleId = """ + people_id_expr + """
+              AND ISNULL(mt.AttendanceTypeId, 0) = @memberAttendType
+      )
+      AND NOT EXISTS (
+            SELECT 1
+            FROM dbo.OrganizationMembers vom
+            WHERE vom.PeopleId = """ + people_id_expr + """
+              AND vom.OrganizationId = @volunteersOrgId
+      )
+"""
+
+
+def _bind_clubber_only(params):
+    params.AddValue('memberAttendType', ATTEND_TYPE_MEMBER)
+    params.AddValue('volunteersOrgId', VOLUNTEERS_ORG_ID)
+    return params
+
+
+def _volunteer_people_id_set():
+    """PeopleIds enrolled on the Volunteers involvement (any member type)."""
+    oid = _i(VOLUNTEERS_ORG_ID, 0)
+    ids = {}
+    if oid <= 0:
+        return ids
+    sql = """
+SELECT om.PeopleId
+FROM dbo.OrganizationMembers om
+WHERE om.OrganizationId = @orgId
+"""
+    p = _dd()
+    p.AddValue('orgId', oid)
+    try:
+        for r in list(q.QuerySql(sql, p)):
+            pid = _i(r.PeopleId, 0)
+            if pid > 0:
+                ids[pid] = True
+    except:
+        pass
+    return ids
+
+
+def _count_clubber_members(org_id, tag_id=0):
+    """Living Member-type people on an involvement (optional subgroup), excluding Volunteers org."""
+    org_id = _i(org_id, 0)
+    tag_id = _i(tag_id, 0)
+    if org_id <= 0:
+        return 0
+    sql = """
+SELECT COUNT(*) AS MemberCount
+FROM OrganizationMembers om
+INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
+  AND (
+        @tagId = 0
+        OR EXISTS (
+            SELECT 1
+            FROM dbo.OrgMemMemTags omt
+            WHERE omt.OrgId = @orgId
+              AND omt.MemberTagId = @tagId
+              AND omt.PeopleId = om.PeopleId
+        )
+      )
+""" + _sql_clubber_members_only()
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
+    try:
+        rows = list(q.QuerySql(sql, p))
+        if not rows:
+            return 0
+        return _i(rows[0].MemberCount, 0)
+    except:
+        return 0
+
+
+def _org_subgroups(org_id, clubbers_only=False):
     """MemberTags on an involvement, with current member counts."""
     org_id = _i(org_id, 0)
     if org_id <= 0:
         return []
-    sql = """
+    if clubbers_only:
+        # Join-filter only — SQL Server rejects NOT EXISTS inside COUNT().
+        sql = """
+SELECT
+    mt.Id AS SubgroupId,
+    mt.Name AS SubgroupName,
+    COUNT(DISTINCT om.PeopleId) AS MemberCount
+FROM MemberTags mt
+INNER JOIN OrgMemMemTags omt ON omt.MemberTagId = mt.Id AND omt.OrgId = @orgId
+INNER JOIN People pe ON pe.PeopleId = omt.PeopleId AND pe.IsDeceased = 0
+INNER JOIN OrganizationMembers om
+    ON om.OrganizationId = @orgId AND om.PeopleId = omt.PeopleId
+INNER JOIN lookup.MemberType mtype
+    ON mtype.Id = om.MemberTypeId
+   AND ISNULL(mtype.AttendanceTypeId, 0) = @memberAttendType
+LEFT JOIN OrganizationMembers vom
+    ON vom.PeopleId = om.PeopleId
+   AND vom.OrganizationId = @volunteersOrgId
+WHERE mt.OrgId = @orgId
+  AND vom.PeopleId IS NULL
+GROUP BY mt.Id, mt.Name
+ORDER BY mt.Name
+"""
+        p = _dd()
+        p.AddValue('orgId', org_id)
+        _bind_clubber_only(p)
+    else:
+        sql = """
 SELECT
     mt.Id AS SubgroupId,
     mt.Name AS SubgroupName,
@@ -315,8 +483,8 @@ WHERE mt.OrgId = @orgId
 GROUP BY mt.Id, mt.Name
 ORDER BY mt.Name
 """
-    p = _dd()
-    p.AddValue('orgId', org_id)
+        p = _dd()
+        p.AddValue('orgId', org_id)
     rows = list(q.QuerySql(sql, p))
     out = []
     for r in rows:
@@ -349,61 +517,15 @@ def _map_subgroups_to_clubs(subgroups):
     return mapped, unmatched
 
 
-def _awana_overview_payload():
-    """Club cards from subgroups on Clubbers 1916 + Volunteers 1929."""
-    denied = _require_org_access(CLUBBERS_ORG_ID)
-    if denied:
-        return denied
-
-    clubbers = _org_brief(CLUBBERS_ORG_ID)
-    volunteers = None
-    if _user_can_access_org(VOLUNTEERS_ORG_ID):
-        volunteers = _org_brief(VOLUNTEERS_ORG_ID)
-
-    program_id = _i(clubbers.get('program_id'), 0) if clubbers else 0
-    profile = _overview_profile(program_id or 1112)
-    clubs = _club_shell()
-    by_key = {}
-    for c in clubs:
-        by_key[c['key']] = c
-
-    if clubbers:
-        mapped, unmatched = _map_subgroups_to_clubs(_org_subgroups(CLUBBERS_ORG_ID))
-        for key, sg in mapped.items():
-            if key in by_key:
-                by_key[key]['clubbers_tag_id'] = _i(sg.get('id'), 0)
-                by_key[key]['clubbers_count'] = _i(sg.get('count'), 0)
-    if volunteers:
-        mapped_v, unmatched_v = _map_subgroups_to_clubs(_org_subgroups(VOLUNTEERS_ORG_ID))
-        for key, sg in mapped_v.items():
-            if key in by_key:
-                by_key[key]['volunteer_tag_id'] = _i(sg.get('id'), 0)
-                by_key[key]['volunteer_count'] = _i(sg.get('count'), 0)
-
-    result = {
-        'clubbers_org': clubbers,
-        'volunteers_org': volunteers,
-        'profile_name': profile.get('profile_name') or 'Next Generation',
-        'overview_profile': profile,
-        'clubs': clubs,
-        'total_members': 0,
-        'volunteer_members': _i(volunteers.get('member_count'), 0) if volunteers else 0,
-        'show_staff_tab': _user_can_see_staff_tab(),
-        'male_count': 0,
-        'female_count': 0,
-        'grades': [],
-        'enrollment_timeline': {},
-        'transactions': {
-            'total': 0,
-            'paid_in_full': 0,
-            'remaining_balance': 0,
-            'total_paid': 0.0,
-            'total_due': 0.0,
-        },
-    }
-
-    demo_sql = """
+def _query_source_demo(org_id, tag_id):
+    """Gender / grade / enrollment rows for one club source (org + optional subgroup)."""
+    org_id = _i(org_id, 0)
+    tag_id = _i(tag_id, 0)
+    if org_id <= 0:
+        return []
+    sql = """
         SELECT
+            pe.PeopleId,
             pe.GenderId,
             COALESCE(
                 NULLIF(LTRIM(RTRIM(gl_om.Description)), ''),
@@ -418,23 +540,192 @@ def _awana_overview_payload():
         LEFT JOIN lookup.GradeLevel gl_om ON om.GradeLevelId = gl_om.Id
         WHERE om.OrganizationId = @orgId
             AND pe.IsDeceased = 0
+            AND (
+                @tagId = 0
+                OR EXISTS (
+                    SELECT 1
+                    FROM dbo.OrgMemMemTags omt
+                    WHERE omt.OrgId = @orgId
+                      AND omt.MemberTagId = @tagId
+                      AND omt.PeopleId = om.PeopleId
+                )
+            )
+""" + _sql_clubber_members_only() + """
     """
     p = _dd()
-    p.AddValue('orgId', CLUBBERS_ORG_ID)
-    members = list(q.QuerySql(demo_sql, p))
+    p.AddValue('orgId', org_id)
+    p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
+    try:
+        return list(q.QuerySql(sql, p))
+    except:
+        return []
+
+
+def _build_clubs():
+    """
+    Resolve each club's source org + optional subgroup.
+    - Config org 0 → Clubbers parent.
+    - If a matching subgroup exists on that org, always use it (Sparks / T&T
+      share Clubbers and must be subgroup-filtered even when Config repeats
+      the same involvement number).
+    - If no subgroup and the org is used by only this club (and is not
+      Clubbers/Volunteers), treat as a dedicated involvement (Puggles/Cubbies).
+    """
+    clubs = _club_shell()
+    by_key = {}
+    for c in clubs:
+        by_key[c['key']] = c
+
+    if _user_can_access_org(VOLUNTEERS_ORG_ID):
+        mapped_v, unmatched_v = _map_subgroups_to_clubs(_org_subgroups(VOLUNTEERS_ORG_ID))
+        for key, sg in mapped_v.items():
+            if key in by_key:
+                by_key[key]['volunteer_tag_id'] = _i(sg.get('id'), 0)
+                by_key[key]['volunteer_count'] = _i(sg.get('count'), 0)
+
+    org_ids_by_club = {}
+    org_use_count = {}
+    for c in clubs:
+        oid = _club_configured_org_id(c['key'])
+        org_ids_by_club[c['key']] = oid
+        org_use_count[oid] = org_use_count.get(oid, 0) + 1
+
+    subgroups_by_org = {}
+    for oid in org_use_count.keys():
+        if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
+            subgroups_by_org[oid] = {}
+            continue
+        if not _user_can_access_org(oid):
+            subgroups_by_org[oid] = {}
+            continue
+        mapped, unmatched = _map_subgroups_to_clubs(_org_subgroups(oid, clubbers_only=True))
+        subgroups_by_org[oid] = mapped
+
+    for c in clubs:
+        oid = org_ids_by_club[c['key']]
+        c['org_id'] = oid
+        c['subgroup_id'] = 0
+        c['clubbers_tag_id'] = 0
+        c['dedicated_org'] = False
+        c['has_source'] = False
+        c['clubbers_count'] = 0
+
+        if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
+            continue
+        if not _user_can_access_org(oid):
+            continue
+        if not _org_brief(oid):
+            continue
+
+        sg = subgroups_by_org.get(oid, {}).get(c['key'])
+        tag_id = _i(sg.get('id'), 0) if sg else 0
+        shared = org_use_count.get(oid, 0) > 1 or oid == CLUBBERS_ORG_ID
+
+        if tag_id > 0:
+            c['subgroup_id'] = tag_id
+            c['clubbers_tag_id'] = tag_id
+            c['dedicated_org'] = False
+            c['has_source'] = True
+            c['clubbers_count'] = _count_clubber_members(oid, tag_id)
+        elif not shared:
+            # Unique dedicated involvement (typical Puggles / Cubbies).
+            c['subgroup_id'] = 0
+            c['clubbers_tag_id'] = 0
+            c['dedicated_org'] = True
+            c['has_source'] = True
+            c['clubbers_count'] = _count_clubber_members(oid, 0)
+    return clubs
+
+
+def _awana_overview_payload():
+    """Club cards, roster-union demographics, Volunteers counts."""
+    denied = _require_org_access(CLUBBERS_ORG_ID)
+    if denied:
+        return denied
+
+    clubbers = _org_brief(CLUBBERS_ORG_ID)
+    volunteers = None
+    if _user_can_access_org(VOLUNTEERS_ORG_ID):
+        volunteers = _org_brief(VOLUNTEERS_ORG_ID)
+
+    program_id = _i(clubbers.get('program_id'), 0) if clubbers else 0
+    profile = _overview_profile(program_id or 1112)
+    clubs = _build_clubs()
+
+    result = {
+        'clubbers_org': clubbers,
+        'volunteers_org': volunteers,
+        'profile_name': profile.get('profile_name') or 'Next Generation',
+        'overview_profile': profile,
+        'clubs': clubs,
+        'total_members': 0,
+        'volunteer_members': _i(volunteers.get('member_count'), 0) if volunteers else 0,
+        'show_staff_tab': _user_can_see_staff_tab(),
+        'show_finance': _user_can_see_finance(),
+        'show_config_tab': _user_is_admin(),
+        'male_count': 0,
+        'female_count': 0,
+        'grades': [],
+        'enrollment_timeline': {},
+        'transactions': {
+            'total': 0,
+            'paid_in_full': 0,
+            'remaining_balance': 0,
+            'total_paid': 0.0,
+            'total_due': 0.0,
+        },
+    }
+    if result['show_config_tab']:
+        result['settings'] = _settings_payload()
+
+    by_pid = {}
+    for c in clubs:
+        if not c.get('has_source'):
+            continue
+        oid = _i(c.get('org_id'), 0)
+        tag = _i(c.get('subgroup_id'), 0)
+        if oid <= 0 or not _user_can_access_org(oid):
+            continue
+        for member in _query_source_demo(oid, tag):
+            pid = _i(member.PeopleId, 0) if hasattr(member, 'PeopleId') else 0
+            if pid <= 0:
+                continue
+            gid = _i(member.GenderId, 0) if hasattr(member, 'GenderId') else 0
+            label = _s(member.GradeLabel, 'Unknown') if hasattr(member, 'GradeLabel') else 'Unknown'
+            if not label or label.lower() == 'unknown':
+                label = 'Unknown'
+            gsort = _i(member.GradeSort, 99999) if hasattr(member, 'GradeSort') else 99999
+            enroll = member.EnrollmentDate if hasattr(member, 'EnrollmentDate') else None
+            existing = by_pid.get(pid)
+            if existing is None:
+                by_pid[pid] = {
+                    'gender_id': gid,
+                    'grade_label': label,
+                    'grade_sort': gsort,
+                    'enrollment': enroll,
+                }
+            else:
+                if existing['gender_id'] == 0 and gid:
+                    existing['gender_id'] = gid
+                if existing['grade_label'] == 'Unknown' and label != 'Unknown':
+                    existing['grade_label'] = label
+                    existing['grade_sort'] = gsort
+                if enroll and (existing['enrollment'] is None or enroll < existing['enrollment']):
+                    existing['enrollment'] = enroll
+
+    members = by_pid.values()
     result['total_members'] = len(members)
-    result['male_count'] = len([m for m in members if m.GenderId == 1])
-    result['female_count'] = len([m for m in members if m.GenderId == 2])
+    result['male_count'] = len([m for m in members if m['gender_id'] == 1])
+    result['female_count'] = len([m for m in members if m['gender_id'] == 2])
 
     grade_counts = {}
     grade_sort = {}
     for member in members:
-        label = _s(member.GradeLabel, 'Unknown') if hasattr(member, 'GradeLabel') else 'Unknown'
-        if not label or label.lower() == 'unknown':
-            label = 'Unknown'
+        label = member['grade_label']
         grade_counts[label] = grade_counts.get(label, 0) + 1
         if label not in grade_sort:
-            grade_sort[label] = _i(member.GradeSort, 99999) if hasattr(member, 'GradeSort') else 99999
+            grade_sort[label] = member['grade_sort']
 
     def _grade_key(item):
         label = item[0]
@@ -449,14 +740,16 @@ def _awana_overview_payload():
 
     enrollment_timeline = {}
     for member in members:
-        if hasattr(member, 'EnrollmentDate') and member.EnrollmentDate:
-            date_key = "{0:04d}-{1:02d}".format(member.EnrollmentDate.Year, member.EnrollmentDate.Month)
+        enroll = member.get('enrollment')
+        if enroll:
+            date_key = "{0:04d}-{1:02d}".format(enroll.Year, enroll.Month)
             enrollment_timeline[date_key] = enrollment_timeline.get(date_key, 0) + 1
     sorted_timeline = sorted(enrollment_timeline.items(), key=lambda x: x[0], reverse=True)[:12]
     sorted_timeline.reverse()
     result['enrollment_timeline'] = dict(sorted_timeline)
 
-    transaction_sql = """
+    if _user_can_see_finance():
+        transaction_sql = """
     ;WITH Raw AS (
         SELECT
             ISNULL(t.OriginalId, t.Id) AS GroupId,
@@ -495,18 +788,18 @@ def _awana_overview_payload():
     FROM Grouped g
     INNER JOIN Latest l ON l.GroupId = g.GroupId AND l.rn = 1
     """
-    p4 = _dd()
-    p4.AddValue('orgId', CLUBBERS_ORG_ID)
-    transaction_result = list(q.QuerySql(transaction_sql, p4))
-    transactions = transaction_result[0] if transaction_result else None
-    if transactions:
-        result['transactions'] = {
-            'total': int(transactions.TotalTransactions) if transactions.TotalTransactions else 0,
-            'paid_in_full': int(transactions.PaidInFullCount) if transactions.PaidInFullCount else 0,
-            'remaining_balance': int(transactions.RemainingBalanceCount) if transactions.RemainingBalanceCount else 0,
-            'total_paid': float(transactions.TotalPaid) if transactions.TotalPaid else 0,
-            'total_due': float(transactions.TotalDue) if transactions.TotalDue else 0,
-        }
+        p4 = _dd()
+        p4.AddValue('orgId', CLUBBERS_ORG_ID)
+        transaction_result = list(q.QuerySql(transaction_sql, p4))
+        transactions = transaction_result[0] if transaction_result else None
+        if transactions:
+            result['transactions'] = {
+                'total': int(transactions.TotalTransactions) if transactions.TotalTransactions else 0,
+                'paid_in_full': int(transactions.PaidInFullCount) if transactions.PaidInFullCount else 0,
+                'remaining_balance': int(transactions.RemainingBalanceCount) if transactions.RemainingBalanceCount else 0,
+                'total_paid': float(transactions.TotalPaid) if transactions.TotalPaid else 0,
+                'total_due': float(transactions.TotalDue) if transactions.TotalDue else 0,
+            }
     return result
 
 
@@ -591,6 +884,67 @@ def _s(val, default=''):
             return default
 
 
+def _fmt_phone(raw):
+    """US display: (555) 123-4567. Leaves odd lengths unchanged."""
+    s = _s(raw)
+    if not s:
+        return ''
+    digits = []
+    for ch in s:
+        try:
+            o = ord(ch)
+        except:
+            continue
+        if 48 <= o <= 57:
+            digits.append(ch)
+    d = ''.join(digits)
+    if len(d) == 11 and d[0] == '1':
+        d = d[1:]
+    if len(d) == 10:
+        return '(' + d[0:3] + ') ' + d[3:6] + '-' + d[6:10]
+    if len(d) == 7:
+        return d[0:3] + '-' + d[3:7]
+    return s
+
+
+def _sql_family_adult_phone(alias, gender_id, name_expr):
+    """OUTER APPLY: cell/home/work for a same-family adult (10=primary, 20=secondary)."""
+    gid = str(_i(gender_id, 0))
+    return """
+OUTER APPLY (
+    SELECT TOP 1
+        COALESCE(
+            NULLIF(LTRIM(RTRIM(ad.CellPhone)), ''),
+            NULLIF(LTRIM(RTRIM(ad.HomePhone)), ''),
+            NULLIF(LTRIM(RTRIM(ad.WorkPhone)), '')
+        ) AS Phone
+    FROM People ad
+    WHERE ad.FamilyId = pe.FamilyId
+      AND ad.PeopleId <> pe.PeopleId
+      AND ISNULL(ad.IsDeceased, 0) = 0
+      AND ad.PositionInFamilyId IN (10, 20)
+      AND ad.GenderId = """ + gid + """
+    ORDER BY
+      CASE
+        WHEN LEN(LTRIM(RTRIM(ISNULL(""" + name_expr + """, '')))) > 0
+         AND (
+              ad.Name2 = LTRIM(RTRIM(""" + name_expr + """))
+              OR (LTRIM(RTRIM(ISNULL(ad.FirstName,''))) + ' ' + LTRIM(RTRIM(ISNULL(ad.LastName,''))))
+                 = LTRIM(RTRIM(""" + name_expr + """))
+              OR ad.FirstName = CASE
+                    WHEN CHARINDEX(' ', LTRIM(RTRIM(ISNULL(""" + name_expr + """, '')))) > 0
+                    THEN LEFT(LTRIM(RTRIM(""" + name_expr + """)),
+                              CHARINDEX(' ', LTRIM(RTRIM(""" + name_expr + """))) - 1)
+                    ELSE LTRIM(RTRIM(""" + name_expr + """))
+                 END
+         ) THEN 0
+        ELSE 1
+      END,
+      ad.PositionInFamilyId
+) """ + alias + """
+"""
+
+
 def _i(val, default=0):
     s = _s(val)
     if not s:
@@ -667,6 +1021,224 @@ def _user_can_see_staff_tab():
         if model.UserIsInRole('Admin'):
             return True
         return bool(model.UserIsInRole('Staff')) and bool(model.UserIsInRole('Next Gen'))
+    except:
+        return False
+
+
+def _user_can_see_finance():
+    """Financial Transactions on Overview — Staff role only."""
+    try:
+        return bool(model.UserIsInRole('Staff'))
+    except:
+        return False
+
+
+def _user_is_admin():
+    try:
+        return bool(model.UserIsInRole('Admin'))
+    except:
+        return False
+
+
+def _parse_meeting_ids(raw):
+    """Comma/semicolon-separated MeetingIds → unique positive ints (order kept)."""
+    out = []
+    seen = {}
+    text = _s(raw).replace(';', ',')
+    for part in text.split(','):
+        n = _i(part.strip(), 0)
+        if n > 0 and n not in seen:
+            seen[n] = True
+            out.append(n)
+    return out
+
+
+def _meeting_ids_csv(ids):
+    return ','.join([str(_i(x, 0)) for x in (ids or []) if _i(x, 0) > 0])
+
+
+def _meeting_ids_sql_in(ids):
+    """Safe IN-list for SQL (ints only). Uses 0 when empty so the query matches nothing."""
+    clean = [str(_i(x, 0)) for x in (ids or []) if _i(x, 0) > 0]
+    if not clean:
+        return '0'
+    return ','.join(clean)
+
+
+def _default_config():
+    return {
+        'clubbers_org': DEFAULT_CLUBBERS_ORG_ID,
+        'volunteers_org': DEFAULT_VOLUNTEERS_ORG_ID,
+        'puggles_org': 0,
+        'cubbies_org': 0,
+        'sparks_org': 0,
+        'tnt_girls_org': 0,
+        'tnt_boys_org': 0,
+        'inperson_meeting_ids': '',
+    }
+
+
+def _current_config():
+    cfg = _default_config()
+    cfg['clubbers_org'] = CLUBBERS_ORG_ID
+    cfg['volunteers_org'] = VOLUNTEERS_ORG_ID
+    for key, cfg_key in CLUB_ORG_CFG_KEYS.items():
+        cfg[cfg_key] = _i(CLUB_ORG_IDS.get(key), 0)
+    cfg['inperson_meeting_ids'] = _meeting_ids_csv(INPERSON_MEETING_IDS)
+    return cfg
+
+
+def _apply_config(cfg):
+    """Refresh module-level org IDs and in-person meeting list."""
+    global CLUBBERS_ORG_ID, VOLUNTEERS_ORG_ID, CLUB_ORG_IDS, INPERSON_MEETING_IDS
+    defaults = _default_config()
+    if not cfg:
+        cfg = defaults
+    coid = _i(cfg.get('clubbers_org'), defaults['clubbers_org'])
+    void = _i(cfg.get('volunteers_org'), defaults['volunteers_org'])
+    CLUBBERS_ORG_ID = coid if coid > 0 else defaults['clubbers_org']
+    VOLUNTEERS_ORG_ID = void if void > 0 else defaults['volunteers_org']
+    next_ids = {}
+    for key, cfg_key in CLUB_ORG_CFG_KEYS.items():
+        val = _i(cfg.get(cfg_key), 0)
+        next_ids[key] = val if val > 0 else 0
+    CLUB_ORG_IDS = next_ids
+    INPERSON_MEETING_IDS = _parse_meeting_ids(cfg.get('inperson_meeting_ids'))
+
+
+def _load_settings():
+    """Load involvement IDs from JsonDocumentRecords (falls back to defaults)."""
+    cfg = _default_config()
+    try:
+        sql = """
+SELECT TOP 1 [Json]
+FROM custom.JsonDocumentRecords
+WHERE Section = @section AND Id1 = @id1 AND Id2 = '' AND Id3 = '' AND Id4 = ''
+"""
+        p = _dd()
+        p.AddValue('section', JSON_SECTION)
+        p.AddValue('id1', SETTINGS_ID1)
+        rows = list(q.QuerySql(sql, p))
+    except:
+        return cfg
+    if not rows:
+        return cfg
+    raw = _s(rows[0].Json)
+    if not raw:
+        return cfg
+    try:
+        data = json.loads(raw)
+    except:
+        return cfg
+    parent_map = {
+        'clubbers_org': ('ClubbersOrg', 'clubbers_org', 'CLUBBERS_ORG_ID'),
+        'volunteers_org': ('VolunteersOrg', 'volunteers_org', 'VOLUNTEERS_ORG_ID'),
+    }
+    for dest, aliases in parent_map.items():
+        for ak in aliases:
+            if ak in data:
+                val = _i(data.get(ak), 0)
+                if val > 0:
+                    cfg[dest] = val
+                    break
+    club_map = {
+        'puggles_org': ('PugglesOrg', 'puggles_org'),
+        'cubbies_org': ('CubbiesOrg', 'cubbies_org'),
+        'sparks_org': ('SparksOrg', 'sparks_org'),
+        'tnt_girls_org': ('TntGirlsOrg', 'tnt_girls_org', 'TAndTGirlsOrg'),
+        'tnt_boys_org': ('TntBoysOrg', 'tnt_boys_org', 'TAndTBoysOrg'),
+    }
+    for dest, aliases in club_map.items():
+        for ak in aliases:
+            if ak in data:
+                val = _i(data.get(ak), -1)
+                if val >= 0:
+                    cfg[dest] = val
+                    break
+    for ak in ('InPersonMeetingIds', 'inperson_meeting_ids', 'InPersonMeetings'):
+        if ak in data:
+            cfg['inperson_meeting_ids'] = _meeting_ids_csv(_parse_meeting_ids(data.get(ak)))
+            break
+    return cfg
+
+
+def _persist_settings(cfg):
+    try:
+        dd = _dd()
+        dd.AddValue('ClubbersOrg', cfg['clubbers_org'])
+        dd.AddValue('VolunteersOrg', cfg['volunteers_org'])
+        dd.AddValue('PugglesOrg', cfg['puggles_org'])
+        dd.AddValue('CubbiesOrg', cfg['cubbies_org'])
+        dd.AddValue('SparksOrg', cfg['sparks_org'])
+        dd.AddValue('TntGirlsOrg', cfg['tnt_girls_org'])
+        dd.AddValue('TntBoysOrg', cfg['tnt_boys_org'])
+        dd.AddValue('InPersonMeetingIds', _s(cfg.get('inperson_meeting_ids')))
+        model.AddUpdateJsonRecord(dd, JSON_SECTION, SETTINGS_ID1)
+        return True, 'Settings saved.'
+    except Exception, ex:
+        return False, 'Settings save failed: ' + _s(ex)
+
+
+def _org_name(org_id):
+    brief = _org_brief(org_id)
+    if brief:
+        return _s(brief.get('name'))
+    return ''
+
+
+def _settings_payload():
+    cfg = _current_config()
+    names = {}
+    org_keys = (
+        'clubbers_org', 'volunteers_org',
+        'puggles_org', 'cubbies_org', 'sparks_org',
+        'tnt_girls_org', 'tnt_boys_org',
+    )
+    for k in org_keys:
+        oid = _i(cfg.get(k), 0)
+        names[k] = _org_name(oid) if oid > 0 else ''
+    return {
+        'values': cfg,
+        'org_names': names,
+        'section': JSON_SECTION,
+        'id1': SETTINGS_ID1,
+    }
+
+
+def _save_settings_from_request():
+    """Admin-only: persist Config form values and apply for this request."""
+    if not _user_is_admin():
+        return {'error': 'Not authorized'}
+    defaults = _default_config()
+    cfg = _default_config()
+    coid = _i(_data('clubbers_org'), defaults['clubbers_org'])
+    void = _i(_data('volunteers_org'), defaults['volunteers_org'])
+    cfg['clubbers_org'] = coid if coid > 0 else defaults['clubbers_org']
+    cfg['volunteers_org'] = void if void > 0 else defaults['volunteers_org']
+    for cfg_key in ('puggles_org', 'cubbies_org', 'sparks_org', 'tnt_girls_org', 'tnt_boys_org'):
+        val = _i(_data(cfg_key), 0)
+        cfg[cfg_key] = val if val > 0 else 0
+    cfg['inperson_meeting_ids'] = _meeting_ids_csv(_parse_meeting_ids(_data('inperson_meeting_ids')))
+    ok, msg = _persist_settings(cfg)
+    if not ok:
+        return {'error': msg}
+    _apply_config(cfg)
+    return {
+        'ok': True,
+        'message': msg,
+        'settings': _settings_payload(),
+    }
+
+
+def _sync_inperson_ev_from_meeting(people_id, is_minor, attend_dt):
+    """Write meeting attendance date into the age-appropriate Extra Value."""
+    people_id = _i(people_id, 0)
+    if people_id <= 0 or attend_dt is None or _is_null(attend_dt):
+        return False
+    field = EV_MINOR_INPERSON if is_minor else EV_AWANA_INPERSON
+    try:
+        model.AddExtraValueDate(people_id, field, attend_dt)
+        return True
     except:
         return False
 
@@ -1039,7 +1611,7 @@ def _answer_display(val, question_type_id, sub_type_id, options):
     if question_type_id == QTYPE_EMERGENCY:
         parts = _s(val).split('\n')
         name = _s(parts[0] if parts else '')
-        phone = _s(parts[1] if len(parts) > 1 else '')
+        phone = _fmt_phone(parts[1] if len(parts) > 1 else '')
         if name and phone:
             return name + ' / ' + phone
         return name or phone
@@ -1101,11 +1673,13 @@ def _parse_options(options_json):
         text = _s(o.get('text') or o.get('Text'))
         value = _s(o.get('value') or o.get('Value') or text)
         lookup = _s(o.get('lookup') or o.get('Lookup'))
+        skip_to = _s(o.get('skipToId') or o.get('SkipToId'))
         result.append({
             'text': text or value or lookup,
             'value': value or text or lookup,
             'lookup': lookup,
             'other': bool(o.get('other') or o.get('Other')),
+            'skip_to_id': skip_to,
         })
     return result
 
@@ -1173,6 +1747,134 @@ def _choice_selected_values(parsed, options, sub_type_id):
     return selected
 
 
+def _norm_qid(v):
+    return _s(v).replace('{', '').replace('}', '').lower()
+
+
+def _question_has_skip(options):
+    for o in options:
+        if o.get('skip_to_id'):
+            return True
+    return False
+
+
+def _skip_to_for_answer(parsed, options, question_type_id):
+    """Match TouchPoint RegistrationForm.refreshVisibleQuestions skip-to."""
+    if parsed is None:
+        return None
+    tokens = parsed if isinstance(parsed, list) else [parsed]
+    token_set = {}
+    for t in tokens:
+        sv = _s(t)
+        if sv:
+            token_set[sv] = True
+    if not token_set:
+        return None
+    is_choice = question_type_id in (QTYPE_SINGLE, QTYPE_MULTI, QTYPE_DROPDOWN)
+    matched_option = False
+    for o in options:
+        if (_s(o.get('text')) in token_set
+                or _s(o.get('value')) in token_set
+                or _s(o.get('lookup')) in token_set):
+            matched_option = True
+            break
+    is_other = is_choice and not matched_option
+    for o in options:
+        sid = _s(o.get('skip_to_id'))
+        if not sid:
+            continue
+        if (_s(o.get('text')) in token_set
+                or _s(o.get('value')) in token_set
+                or _s(o.get('lookup')) in token_set
+                or (o.get('other') and is_other)):
+            return _norm_qid(sid)
+    return None
+
+
+def _visible_question_ids(questions, parsed_by_qid):
+    """Replay TouchPoint skip-to / skip-all visibility for one registrant."""
+    visible = set()
+    skip_to = None
+    skip_all = False
+    for qrow in questions:
+        qid = _s(qrow.RegQuestionId)
+        qid_n = _norm_qid(qid)
+        if _i(qrow.IsDisabled, 0):
+            continue
+        if skip_all or (skip_to and qid_n != skip_to):
+            continue
+        options = _parse_options(qrow.Options)
+        parsed = parsed_by_qid.get(qid)
+        if parsed is None:
+            parsed = parsed_by_qid.get(qid_n)
+        if _question_has_skip(options):
+            if _is_blank_answer(parsed):
+                skip_all = True
+            else:
+                skip_to = _skip_to_for_answer(
+                    parsed, options, _i(qrow.QuestionTypeId, 0))
+        else:
+            skip_to = None
+        visible.add(qid)
+        visible.add(qid_n)
+    return visible
+
+
+def _is_expected_shared_question(qrow):
+    """Family-level questions that legitimately match across siblings."""
+    qt = _i(qrow.QuestionTypeId, 0)
+    if qt in (QTYPE_EMERGENCY, QTYPE_PARENTS):
+        return True
+    label = _s(qrow.Label).lower()
+    for needle in ('how did you hear', 'hear about', 'emergency contact',
+                   'parent', 'mother', 'father'):
+        if needle in label:
+            return True
+    return False
+
+
+def _load_reg_answer_index(org_id, subgroup_id=0):
+    """Registrants, answers, and skip-to visibility keyed by PeopleId."""
+    questions_all = _questions_for_org(org_id, True)
+    questions = [q for q in questions_all if not _i(q.IsDisabled, 0)]
+    registrants = _completed_registrants(org_id, subgroup_id)
+    qids = [_s(q.RegQuestionId) for q in questions]
+    answers = _answers_for_registrants(org_id, qids, subgroup_id) if qids else []
+    by_rp_q = {}
+    for a in answers:
+        by_rp_q[(_s(a.RegPeopleId), _s(a.RegQuestionId))] = a
+        by_rp_q[(_s(a.RegPeopleId), _norm_qid(a.RegQuestionId))] = a
+    parsed_by_pid = {}
+    visible_by_pid = {}
+    for reg in registrants:
+        pid = _i(reg.PeopleId)
+        rp = _s(reg.RegPeopleId)
+        parsed = {}
+        for qrow in questions:
+            qid = _s(qrow.RegQuestionId)
+            a = by_rp_q.get((rp, qid))
+            if a is None:
+                a = by_rp_q.get((rp, _norm_qid(qid)))
+            parsed[qid] = _parse_answer(a.AnswerValue) if a else None
+            parsed[_norm_qid(qid)] = parsed[qid]
+        parsed_by_pid[pid] = parsed
+        visible_by_pid[pid] = _visible_question_ids(questions_all, parsed)
+    return {
+        'questions_all': questions_all,
+        'questions': questions,
+        'registrants': registrants,
+        'by_rp_q': by_rp_q,
+        'parsed_by_pid': parsed_by_pid,
+        'visible_by_pid': visible_by_pid,
+    }
+
+
+def _qid_visible_for(ctx, people_id, question_id):
+    vis = ctx['visible_by_pid'].get(_i(people_id), set())
+    qid = _s(question_id)
+    return (qid in vis) or (_norm_qid(qid) in vis)
+
+
 def _org_meta(org_id):
     sql = """
 SELECT o.OrganizationId, o.OrganizationName, o.RegistrationTypeId,
@@ -1198,6 +1900,8 @@ def _completed_registrants(org_id, subgroup_id=0):
     SELECT
         rp.RegPeopleId,
         rp.PeopleId,
+        rp.RegistrationId,
+        pe.FamilyId,
         rp.CompletedDate,
         ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(rp.FirstName,'') + ' ' + ISNULL(rp.LastName,'')))) AS PersonName,
         ROW_NUMBER() OVER (
@@ -1221,8 +1925,9 @@ def _completed_registrants(org_id, subgroup_id=0):
                   AND omt.PeopleId = rp.PeopleId
             )
           )
+""" + _sql_person_is_clubber_member('rp.PeopleId') + """
 )
-SELECT RegPeopleId, PeopleId, CompletedDate, PersonName
+SELECT RegPeopleId, PeopleId, RegistrationId, FamilyId, CompletedDate, PersonName
 FROM Ranked
 WHERE rn = 1
 ORDER BY PersonName
@@ -1231,16 +1936,20 @@ ORDER BY PersonName
     p.AddValue('orgId', org_id)
     p.AddValue('status', STATUS_COMPLETED)
     p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
     return list(q.QuerySql(sql, p))
 
 
-def _questions_for_org(org_id):
+def _questions_for_org(org_id, include_disabled=False):
+    disabled_sql = ''
+    if not include_disabled:
+        disabled_sql = '  AND ISNULL(IsDisabled, 0) = 0\n'
     sql = """
 SELECT RegQuestionId, [Order], Label, QuestionTypeId, QuestionSubTypeId,
        IsRequired, IsDisabled, Options
 FROM dbo.RegQuestion
 WHERE OrganizationId = @orgId
-  AND ISNULL(IsDisabled, 0) = 0
+""" + disabled_sql + """
 ORDER BY [Order], Label
 """
     p = _dd()
@@ -1280,6 +1989,7 @@ def _answers_for_registrants(org_id, question_ids, subgroup_id=0):
                   AND omt.PeopleId = rp.PeopleId
             )
           )
+""" + _sql_person_is_clubber_member('rp.PeopleId') + """
 )
 SELECT ra.RegQuestionId, ra.RegPeopleId, ra.AnswerValue,
        rk.PeopleId,
@@ -1294,6 +2004,7 @@ WHERE rk.rn = 1
     p.AddValue('orgId', org_id)
     p.AddValue('status', STATUS_COMPLETED)
     p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
     return list(q.QuerySql(sql, p))
 
 
@@ -1313,9 +2024,10 @@ def _build_registration_summary(org_id, subgroup_id=0):
             'empty': True,
         }
 
-    registrants = _completed_registrants(org_id, subgroup_id)
+    ctx = _load_reg_answer_index(org_id, subgroup_id)
+    registrants = ctx['registrants']
     completed_count = len(registrants)
-    questions = _questions_for_org(org_id)
+    questions = ctx['questions']
 
     overview_qs = []
     for qrow in questions:
@@ -1335,15 +2047,19 @@ def _build_registration_summary(org_id, subgroup_id=0):
         }
 
     qids = [_s(qrow.RegQuestionId) for qrow in overview_qs]
-    answers = _answers_for_registrants(org_id, qids, subgroup_id)
-
-    # Index answers by question
+    # Answers already loaded in ctx; keep local lookup for this question set
     by_q = {}
-    for a in answers:
-        qid = _s(a.RegQuestionId)
-        if qid not in by_q:
-            by_q[qid] = []
-        by_q[qid].append(a)
+    for qid in qids:
+        by_q[qid] = []
+    for qrow in overview_qs:
+        qid = _s(qrow.RegQuestionId)
+        for reg in ctx['registrants']:
+            rp = _s(reg.RegPeopleId)
+            a = ctx['by_rp_q'].get((rp, qid))
+            if a is None:
+                a = ctx['by_rp_q'].get((rp, _norm_qid(qid)))
+            if a is not None:
+                by_q[qid].append(a)
 
     result_questions = []
 
@@ -1365,15 +2081,18 @@ def _build_registration_summary(org_id, subgroup_id=0):
             ans_by_rp[_s(a.RegPeopleId)] = a
 
         for reg in registrants:
+            pid = _i(reg.PeopleId)
+            if not _qid_visible_for(ctx, pid, qid):
+                continue
             rp_id = _s(reg.RegPeopleId)
             a = ans_by_rp.get(rp_id)
             parsed = _parse_answer(a.AnswerValue) if a else None
             if _is_blank_answer(parsed):
                 blank_count += 1
             else:
-                answered_people.add(_i(reg.PeopleId))
+                answered_people.add(pid)
                 parsed_by_person.append({
-                    'people_id': _i(reg.PeopleId),
+                    'people_id': pid,
                     'name': _s(reg.PersonName),
                     'parsed': parsed,
                     'raw_display': _answer_display(parsed, qt, st, options),
@@ -1496,7 +2215,8 @@ def _build_registration_summary(org_id, subgroup_id=0):
 
 
 def _get_option_people(org_id, question_id, option_value, subgroup_id=0):
-    questions = _questions_for_org(org_id)
+    ctx = _load_reg_answer_index(org_id, subgroup_id)
+    questions = ctx['questions']
     qrow = None
     for q in questions:
         if _s(q.RegQuestionId) == _s(question_id):
@@ -1508,11 +2228,15 @@ def _get_option_people(org_id, question_id, option_value, subgroup_id=0):
     qt = _i(qrow.QuestionTypeId, 0)
     st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
     options = _parse_options(qrow.Options)
-    registrants = _completed_registrants(org_id, subgroup_id)
-    answers = _answers_for_registrants(org_id, [_s(question_id)], subgroup_id)
+    registrants = ctx['registrants']
+    qid = _s(question_id)
     ans_by_rp = {}
-    for a in answers:
-        ans_by_rp[_s(a.RegPeopleId)] = a
+    for reg in registrants:
+        a = ctx['by_rp_q'].get((_s(reg.RegPeopleId), qid))
+        if a is None:
+            a = ctx['by_rp_q'].get((_s(reg.RegPeopleId), _norm_qid(qid)))
+        if a is not None:
+            ans_by_rp[_s(reg.RegPeopleId)] = a
 
     target = _s(option_value)
     configured_other = {}
@@ -1525,6 +2249,8 @@ def _get_option_people(org_id, question_id, option_value, subgroup_id=0):
 
     people = []
     for reg in registrants:
+        if not _qid_visible_for(ctx, _i(reg.PeopleId), qid):
+            continue
         a = ans_by_rp.get(_s(reg.RegPeopleId))
         parsed = _parse_answer(a.AnswerValue) if a else None
         if _is_blank_answer(parsed):
@@ -1564,6 +2290,7 @@ FROM OrganizationMembers om
 INNER JOIN People pe ON pe.PeopleId = om.PeopleId
 LEFT JOIN RecReg rr ON rr.PeopleId = pe.PeopleId
 WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
   AND (
         @tagId = 0
         OR EXISTS (
@@ -1574,11 +2301,13 @@ WHERE om.OrganizationId = @orgId
               AND omt.PeopleId = om.PeopleId
         )
       )
+""" + _sql_clubber_members_only() + """
 ORDER BY PersonName
 """
     p = _dd()
     p.AddValue('orgId', org_id)
     p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
     rows = list(q.QuerySql(sql, p))
     people = []
     for r in rows:
@@ -1606,11 +2335,15 @@ SELECT
     ISNULL(rr.mname, '') AS MotherName,
     ISNULL(rr.fname, '') AS FatherName,
     ISNULL(rr.emcontact, '') AS EmContact,
-    ISNULL(rr.emphone, '') AS EmPhone
+    ISNULL(rr.emphone, '') AS EmPhone,
+    ISNULL(mother_ph.Phone, '') AS MotherPhone,
+    ISNULL(father_ph.Phone, '') AS FatherPhone
 FROM OrganizationMembers om
 INNER JOIN People pe ON pe.PeopleId = om.PeopleId
 LEFT JOIN RecReg rr ON rr.PeopleId = pe.PeopleId
+""" + _sql_family_adult_phone('mother_ph', 2, 'rr.mname') + _sql_family_adult_phone('father_ph', 1, 'rr.fname') + """
 WHERE om.OrganizationId = @orgId
+  AND pe.IsDeceased = 0
   AND (
         @tagId = 0
         OR EXISTS (
@@ -1621,25 +2354,31 @@ WHERE om.OrganizationId = @orgId
               AND omt.PeopleId = om.PeopleId
         )
       )
+""" + _sql_clubber_members_only() + """
 ORDER BY PersonName
 """
     p = _dd()
     p.AddValue('orgId', org_id)
     p.AddValue('tagId', tag_id)
+    _bind_clubber_only(p)
     rows = list(q.QuerySql(sql, p))
     people = []
     for r in rows:
         mother = _s(r.MotherName)
         father = _s(r.FatherName)
         em_contact = _s(r.EmContact)
-        em_phone = _s(r.EmPhone)
-        if not (mother or father or em_contact or em_phone):
+        em_phone = _fmt_phone(r.EmPhone)
+        mother_phone = _fmt_phone(r.MotherPhone) if hasattr(r, 'MotherPhone') else ''
+        father_phone = _fmt_phone(r.FatherPhone) if hasattr(r, 'FatherPhone') else ''
+        if not (mother or father or em_contact or em_phone or mother_phone or father_phone):
             continue
         people.append({
             'people_id': _i(r.PeopleId),
             'name': _s(r.PersonName),
             'mother': mother,
             'father': father,
+            'mother_phone': mother_phone,
+            'father_phone': father_phone,
             'em_contact': em_contact,
             'em_phone': em_phone,
         })
@@ -1688,12 +2427,13 @@ WHERE omt.OrgId = @orgId
     return out
 
 
-def _get_club_roster(org_id, subgroup_id=0, include_staff=False):
+def _get_club_roster(org_id, subgroup_id=0, include_staff=False, members_only=False):
     """Org members (optionally one subgroup) for clubber/volunteer lists and CSV."""
     tag_id = _i(subgroup_id, 0)
     staff_select = ''
     staff_join = ''
     if include_staff:
+        meeting_in = _meeting_ids_sql_in(INPERSON_MEETING_IDS)
         staff_select = """,
     pmm.CompletedDate AS BgDate,
     mst.CompletedDate AS VideoDate,
@@ -1704,7 +2444,9 @@ def _get_club_roster(org_id, subgroup_id=0, include_staff=False):
     ev_tr_min.DateValue AS MinorInPersonDate,
     ev_tr_min.StrValue AS MinorInPersonStr,
     ev_hb.DateValue AS HandbookDate,
-    ev_hb.StrValue AS HandbookStr
+    ev_hb.StrValue AS HandbookStr,
+    ipa.AttendMeetingDate AS InPersonAttendDate,
+    ipa.AttendMeetingId AS InPersonAttendMeetingId
 """
         staff_join = """
 OUTER APPLY (
@@ -1730,6 +2472,17 @@ OUTER APPLY (
       AND omapp.OrganizationId IN (""" + _app_org_in_sql() + """)
     ORDER BY omapp.EnrollmentDate DESC
 ) app
+OUTER APPLY (
+    SELECT TOP 1
+        CAST(COALESCE(m.MeetingDate, a.MeetingDate) AS date) AS AttendMeetingDate,
+        a.MeetingId AS AttendMeetingId
+    FROM dbo.Attend a
+    LEFT JOIN dbo.Meetings m ON m.MeetingId = a.MeetingId
+    WHERE a.PeopleId = pe.PeopleId
+      AND a.MeetingId IN (""" + meeting_in + """)
+      AND a.AttendanceFlag = 1
+    ORDER BY COALESCE(m.MeetingDate, a.MeetingDate) DESC, a.MeetingId DESC
+) ipa
 LEFT JOIN dbo.PeopleExtra ev_tr
     ON ev_tr.PeopleId = pe.PeopleId AND ev_tr.Field = @inPersonField
 LEFT JOIN dbo.PeopleExtra ev_tr_min
@@ -1775,11 +2528,17 @@ WHERE om.OrganizationId = @orgId
               AND omt.PeopleId = om.PeopleId
         )
       )
+"""
+    if members_only:
+        sql += _sql_clubber_members_only()
+    sql += """
 ORDER BY PersonName
 """
     p = _dd()
     p.AddValue('orgId', org_id)
     p.AddValue('tagId', tag_id)
+    if members_only:
+        _bind_clubber_only(p)
     if include_staff:
         p.AddValue('pmmType', BG_REPORT_PMM)
         p.AddValue('msTrainType', BG_REPORT_MS_TRAINING)
@@ -1788,8 +2547,12 @@ ORDER BY PersonName
         p.AddValue('minorInPersonField', EV_MINOR_INPERSON)
         p.AddValue('handbookField', EV_AWANA_HANDBOOK)
     rows = list(q.QuerySql(sql, p))
+    volunteer_ids = _volunteer_people_id_set() if members_only else {}
     people = []
     for r in rows:
+        pid = _i(r.PeopleId)
+        if members_only and pid in volunteer_ids:
+            continue
         age_val = r.Age if hasattr(r, 'Age') else None
         if age_val is None or _is_null(age_val):
             age = None
@@ -1805,12 +2568,12 @@ ORDER BY PersonName
         mother = _s(r.MotherName) if hasattr(r, 'MotherName') else ''
         father = _s(r.FatherName) if hasattr(r, 'FatherName') else ''
         em_contact = _s(r.EmContact) if hasattr(r, 'EmContact') else ''
-        em_phone = _s(r.EmPhone) if hasattr(r, 'EmPhone') else ''
+        em_phone = _fmt_phone(r.EmPhone) if hasattr(r, 'EmPhone') else ''
         emergency = em_contact
         if em_phone:
             emergency = (emergency + ' (' + em_phone + ')') if emergency else em_phone
         item = {
-            'people_id': _i(r.PeopleId),
+            'people_id': pid,
             'name': _s(r.PersonName, '(Unknown)'),
             'first': _s(r.FirstName),
             'last': _s(r.LastName),
@@ -1834,27 +2597,40 @@ ORDER BY PersonName
             item['app_date'] = _fmt_date(r.AppDate) if hasattr(r, 'AppDate') else ''
             item['has_application'] = _i(r.AppOrgId, 0) > 0 if hasattr(r, 'AppOrgId') else bool(item['app_date'])
             if is_minor:
-                item['inperson_date'] = _fmt_date_or_str(
-                    r.MinorInPersonDate if hasattr(r, 'MinorInPersonDate') else None,
-                    r.MinorInPersonStr if hasattr(r, 'MinorInPersonStr') else '')
-                item['inperson_iso'] = _fmt_iso(
-                    r.MinorInPersonDate if hasattr(r, 'MinorInPersonDate') else None,
-                    r.MinorInPersonStr if hasattr(r, 'MinorInPersonStr') else '')
+                ev_date = r.MinorInPersonDate if hasattr(r, 'MinorInPersonDate') else None
+                ev_str = r.MinorInPersonStr if hasattr(r, 'MinorInPersonStr') else ''
                 item['handbook_date'] = ''
                 item['handbook_iso'] = ''
             else:
-                item['inperson_date'] = _fmt_date_or_str(
-                    r.InPersonDate if hasattr(r, 'InPersonDate') else None,
-                    r.InPersonStr if hasattr(r, 'InPersonStr') else '')
-                item['inperson_iso'] = _fmt_iso(
-                    r.InPersonDate if hasattr(r, 'InPersonDate') else None,
-                    r.InPersonStr if hasattr(r, 'InPersonStr') else '')
+                ev_date = r.InPersonDate if hasattr(r, 'InPersonDate') else None
+                ev_str = r.InPersonStr if hasattr(r, 'InPersonStr') else ''
                 item['handbook_date'] = _fmt_date_or_str(
                     r.HandbookDate if hasattr(r, 'HandbookDate') else None,
                     r.HandbookStr if hasattr(r, 'HandbookStr') else '')
                 item['handbook_iso'] = _fmt_iso(
                     r.HandbookDate if hasattr(r, 'HandbookDate') else None,
                     r.HandbookStr if hasattr(r, 'HandbookStr') else '')
+            attend_dt = r.InPersonAttendDate if hasattr(r, 'InPersonAttendDate') else None
+            if attend_dt is not None and _is_null(attend_dt):
+                attend_dt = None
+            ev_iso = _fmt_iso(ev_date, ev_str)
+            if attend_dt is not None:
+                item['inperson_from_meeting'] = True
+                item['inperson_meeting_id'] = (
+                    _i(r.InPersonAttendMeetingId, 0)
+                    if hasattr(r, 'InPersonAttendMeetingId') else 0)
+                item['inperson_date'] = _fmt_date(attend_dt)
+                try:
+                    item['inperson_iso'] = attend_dt.ToString('yyyy-MM-dd')
+                except:
+                    item['inperson_iso'] = _fmt_iso(attend_dt, '')
+                if item['inperson_iso'] and item['inperson_iso'] != ev_iso:
+                    _sync_inperson_ev_from_meeting(pid, is_minor, attend_dt)
+            else:
+                item['inperson_from_meeting'] = False
+                item['inperson_meeting_id'] = 0
+                item['inperson_date'] = _fmt_date_or_str(ev_date, ev_str)
+                item['inperson_iso'] = ev_iso
         people.append(item)
     return {
         'org_id': _i(org_id, 0),
@@ -1862,6 +2638,101 @@ ORDER BY PersonName
         'people': people,
         'count': len(people),
     }
+
+
+def _get_master_roster():
+    """Union of all club sources (Puggles through T&T), distinct PeopleId."""
+    by_pid = {}
+    clubs = _build_clubs()
+    volunteer_ids = _volunteer_people_id_set()
+    for c in clubs:
+        if not c.get('has_source'):
+            continue
+        oid = _i(c.get('org_id'), 0)
+        tag = _i(c.get('subgroup_id'), 0)
+        if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
+            continue
+        denied = _require_org_access(oid)
+        if denied:
+            continue
+        data = _get_club_roster(oid, tag, members_only=True)
+        label = _s(c.get('label'))
+        for person in data.get('people') or []:
+            pid = _i(person.get('people_id'), 0)
+            if pid <= 0 or pid in volunteer_ids:
+                continue
+            existing = by_pid.get(pid)
+            if existing is None:
+                person['clubs'] = [label] if label else []
+                person['clubs_label'] = label
+                by_pid[pid] = person
+            else:
+                clubs_list = existing.get('clubs') or []
+                if label and label not in clubs_list:
+                    clubs_list.append(label)
+                    existing['clubs'] = clubs_list
+                    existing['clubs_label'] = ', '.join(clubs_list)
+                if not existing.get('grade') and person.get('grade'):
+                    existing['grade'] = person.get('grade')
+                if not existing.get('gender') and person.get('gender'):
+                    existing['gender'] = person.get('gender')
+                if person.get('has_allergy'):
+                    existing['has_allergy'] = True
+    people = sorted(by_pid.values(), key=lambda x: _s(x.get('name')).lower())
+    return {
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _union_across_clubs(fetch):
+    """Distinct clubbers across all club sources; fetch(org_id, tag_id) -> {people: [...]}."""
+    by_pid = {}
+    clubs = _build_clubs()
+    volunteer_ids = _volunteer_people_id_set()
+    for c in clubs:
+        if not c.get('has_source'):
+            continue
+        oid = _i(c.get('org_id'), 0)
+        tag = _i(c.get('subgroup_id'), 0)
+        if oid <= 0 or oid == VOLUNTEERS_ORG_ID:
+            continue
+        denied = _require_org_access(oid)
+        if denied:
+            continue
+        payload = fetch(oid, tag)
+        label = _s(c.get('label'))
+        for person in payload.get('people') or []:
+            pid = _i(person.get('people_id'), 0)
+            if pid <= 0 or pid in volunteer_ids:
+                continue
+            existing = by_pid.get(pid)
+            if existing is None:
+                row = {}
+                for k in person:
+                    row[k] = person[k]
+                row['clubs'] = [label] if label else []
+                row['clubs_label'] = label
+                by_pid[pid] = row
+            else:
+                clubs_list = existing.get('clubs') or []
+                if label and label not in clubs_list:
+                    clubs_list.append(label)
+                    existing['clubs'] = clubs_list
+                    existing['clubs_label'] = ', '.join(clubs_list)
+    people = sorted(by_pid.values(), key=lambda x: _s(x.get('name')).lower())
+    return {
+        'people': people,
+        'count': len(people),
+    }
+
+
+def _get_master_allergies():
+    return _union_across_clubs(_get_allergy_people)
+
+
+def _get_master_contacts():
+    return _union_across_clubs(_get_contact_people)
 
 
 def _get_registration_excel_url(org_id):
@@ -1917,7 +2788,8 @@ WHERE o.OrganizationId = @orgId
 
 
 def _get_text_answers(org_id, question_id, subgroup_id=0):
-    questions = _questions_for_org(org_id)
+    ctx = _load_reg_answer_index(org_id, subgroup_id)
+    questions = ctx['questions']
     qrow = None
     for q in questions:
         if _s(q.RegQuestionId) == _s(question_id):
@@ -1929,15 +2801,14 @@ def _get_text_answers(org_id, question_id, subgroup_id=0):
     qt = _i(qrow.QuestionTypeId, 0)
     st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
     options = _parse_options(qrow.Options)
-    registrants = _completed_registrants(org_id, subgroup_id)
-    answers = _answers_for_registrants(org_id, [_s(question_id)], subgroup_id)
-    ans_by_rp = {}
-    for a in answers:
-        ans_by_rp[_s(a.RegPeopleId)] = a
-
+    qid = _s(question_id)
     rows = []
-    for reg in registrants:
-        a = ans_by_rp.get(_s(reg.RegPeopleId))
+    for reg in ctx['registrants']:
+        if not _qid_visible_for(ctx, _i(reg.PeopleId), qid):
+            continue
+        a = ctx['by_rp_q'].get((_s(reg.RegPeopleId), qid))
+        if a is None:
+            a = ctx['by_rp_q'].get((_s(reg.RegPeopleId), _norm_qid(qid)))
         parsed = _parse_answer(a.AnswerValue) if a else None
         if _is_blank_answer(parsed):
             continue
@@ -1947,11 +2818,48 @@ def _get_text_answers(org_id, question_id, subgroup_id=0):
             'answer': _answer_display(parsed, qt, st, options),
         })
     return {
-        'question_id': _s(question_id),
+        'question_id': qid,
         'question_label': _s(qrow.Label),
         'kind': 'text',
         'answered_people': rows,
     }
+
+
+def _registration_mates(org_id, registration_id, exclude_people_id=0):
+    """Everyone completed on the same Registration (all clubs), for family audit."""
+    if not registration_id:
+        return []
+    sql = """
+SELECT
+    rp.RegPeopleId,
+    rp.PeopleId,
+    ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(rp.FirstName,'') + ' ' + ISNULL(rp.LastName,'')))) AS PersonName
+FROM dbo.RegPeople rp
+INNER JOIN dbo.Registration r ON r.RegistrationId = rp.RegistrationId
+LEFT JOIN dbo.People pe ON pe.PeopleId = rp.PeopleId
+WHERE r.OrganizationId = @orgId
+  AND CONVERT(nvarchar(36), rp.RegistrationId) = @regId
+  AND rp.Status = @status
+  AND rp.CompletedDate IS NOT NULL
+  AND rp.PeopleId IS NOT NULL
+  AND rp.PeopleId <> @excludeId
+ORDER BY PersonName
+"""
+    p = _dd()
+    p.AddValue('orgId', org_id)
+    p.AddValue('regId', _s(registration_id))
+    p.AddValue('status', STATUS_COMPLETED)
+    p.AddValue('excludeId', _i(exclude_people_id, 0))
+    return list(q.QuerySql(sql, p))
+
+
+def _answer_compare_key(parsed):
+    if parsed is None:
+        return ''
+    try:
+        return json.dumps(parsed, sort_keys=True)
+    except:
+        return _s(parsed)
 
 
 def _get_person_answers(org_id, people_id, subgroup_id=0):
@@ -1959,49 +2867,189 @@ def _get_person_answers(org_id, people_id, subgroup_id=0):
     if not org:
         return {'error': 'Organization not found'}
 
-    registrants = _completed_registrants(org_id, subgroup_id)
+    ctx = _load_reg_answer_index(org_id, subgroup_id)
     reg = None
-    for r in registrants:
+    for r in ctx['registrants']:
         if _i(r.PeopleId) == people_id:
             reg = r
             break
     if not reg:
+        ctx = _load_reg_answer_index(org_id, 0)
+        for r in ctx['registrants']:
+            if _i(r.PeopleId) == people_id:
+                reg = r
+                break
+    if not reg:
         return {'error': 'No completed registration found for this person'}
 
-    questions = _questions_for_org(org_id)
-    # Include overview types + emergency/parents for person view; skip other structural
     show_types = OVERVIEW_CHOICE_TYPES + OVERVIEW_TEXT_TYPES + PERSON_EXTRA_TYPES
-    visible = [q for q in questions if _i(q.QuestionTypeId, 0) in show_types]
-    qids = [_s(q.RegQuestionId) for q in visible]
-    answers = _answers_for_registrants(org_id, qids, subgroup_id)
-    ans_by_q = {}
-    for a in answers:
-        if _s(a.RegPeopleId) == _s(reg.RegPeopleId):
-            ans_by_q[_s(a.RegQuestionId)] = a
+    visible_qs = [q for q in ctx['questions'] if _i(q.QuestionTypeId, 0) in show_types]
+    is_admin = _user_is_admin()
+    parsed_map = ctx['parsed_by_pid'].get(people_id, {})
+    mates = _registration_mates(org_id, getattr(reg, 'RegistrationId', None), people_id)
+    mate_answers = {}
+    if mates:
+        mate_ctx = ctx
+        if _i(subgroup_id, 0) != 0:
+            mate_ctx = _load_reg_answer_index(org_id, 0)
+        for m in mates:
+            mid = _i(m.PeopleId)
+            mate_answers[mid] = {
+                'name': _s(m.PersonName),
+                'parsed': mate_ctx['parsed_by_pid'].get(mid, {}),
+            }
 
     items = []
-    for qrow in visible:
+    hidden_items = []
+    for qrow in visible_qs:
         qid = _s(qrow.RegQuestionId)
         qt = _i(qrow.QuestionTypeId, 0)
         st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
         options = _parse_options(qrow.Options)
-        a = ans_by_q.get(qid)
-        parsed = _parse_answer(a.AnswerValue) if a else None
+        parsed = parsed_map.get(qid)
+        if parsed is None:
+            parsed = parsed_map.get(_norm_qid(qid))
         if _is_blank_answer(parsed):
             continue
-        items.append({
+        disp = _answer_display(parsed, qt, st, options)
+        cmp = _answer_compare_key(parsed)
+        sibling_match = ''
+        for mid, minfo in mate_answers.items():
+            other = minfo['parsed'].get(qid)
+            if other is None:
+                other = minfo['parsed'].get(_norm_qid(qid))
+            if _is_blank_answer(other):
+                continue
+            if _answer_compare_key(other) == cmp:
+                sibling_match = minfo['name']
+                break
+        asked = _qid_visible_for(ctx, people_id, qid)
+        row = {
             'question_id': qid,
             'label': _s(qrow.Label, '(Untitled)'),
             'type_id': qt,
-            'answer': _answer_display(parsed, qt, st, options),
+            'answer': disp,
             'blank': False,
-        })
+            'skip_hidden': not asked,
+            'sibling_match': sibling_match,
+        }
+        if asked:
+            items.append(row)
+        else:
+            hidden_items.append(row)
 
-    return {
+    family = [{'people_id': _i(m.PeopleId), 'name': _s(m.PersonName)} for m in mates]
+    result = {
         'people_id': people_id,
         'name': _s(reg.PersonName),
         'profile_url': '/Person2/' + str(people_id),
         'answers': items,
+        'family_on_registration': family,
+        'hidden_count': len(hidden_items),
+    }
+    if is_admin:
+        result['hidden_answers'] = hidden_items
+        result['show_audit'] = True
+        result['registration_id'] = _s(getattr(reg, 'RegistrationId', ''))
+    return result
+
+
+def _audit_family_answers(org_id, subgroup_id=0):
+    """Admin diagnostic: stored answers that skip-to would not have asked."""
+    if not _user_is_admin():
+        return {'error': 'Admin role required'}
+    ctx = _load_reg_answer_index(org_id, subgroup_id)
+    show_types = OVERVIEW_CHOICE_TYPES + OVERVIEW_TEXT_TYPES + PERSON_EXTRA_TYPES
+    has_any_skip = False
+    for qrow in ctx['questions']:
+        if _question_has_skip(_parse_options(qrow.Options)):
+            has_any_skip = True
+            break
+
+    skip_hidden_rows = []
+    identical_rows = []
+    if _i(subgroup_id, 0) == 0:
+        org_wide = ctx
+    else:
+        org_wide = _load_reg_answer_index(org_id, 0)
+    people_by_reg = {}
+    for r in org_wide['registrants']:
+        rid = _s(getattr(r, 'RegistrationId', ''))
+        if not rid:
+            continue
+        if rid not in people_by_reg:
+            people_by_reg[rid] = []
+        people_by_reg[rid].append(r)
+
+    for reg in ctx['registrants']:
+        pid = _i(reg.PeopleId)
+        parsed_map = ctx['parsed_by_pid'].get(pid, {})
+        rid = _s(getattr(reg, 'RegistrationId', ''))
+        mates = people_by_reg.get(rid, [])
+        for qrow in ctx['questions']:
+            if _i(qrow.QuestionTypeId, 0) not in show_types:
+                continue
+            qid = _s(qrow.RegQuestionId)
+            parsed = parsed_map.get(qid)
+            if parsed is None:
+                parsed = parsed_map.get(_norm_qid(qid))
+            if _is_blank_answer(parsed):
+                continue
+            qt = _i(qrow.QuestionTypeId, 0)
+            st = _i(qrow.QuestionSubTypeId, 0) if not _is_null(qrow.QuestionSubTypeId) else 0
+            options = _parse_options(qrow.Options)
+            disp = _answer_display(parsed, qt, st, options)
+            asked = _qid_visible_for(ctx, pid, qid)
+            sibling_name = ''
+            cmp = _answer_compare_key(parsed)
+            for m in mates:
+                mid = _i(m.PeopleId)
+                if mid == pid:
+                    continue
+                other = org_wide['parsed_by_pid'].get(mid, {}).get(qid)
+                if other is None:
+                    other = org_wide['parsed_by_pid'].get(mid, {}).get(_norm_qid(qid))
+                if _is_blank_answer(other):
+                    continue
+                if _answer_compare_key(other) == cmp:
+                    sibling_name = _s(m.PersonName)
+                    break
+            if not asked:
+                skip_hidden_rows.append({
+                    'people_id': pid,
+                    'name': _s(reg.PersonName),
+                    'question': _s(qrow.Label, '(Untitled)'),
+                    'answer': disp,
+                    'sibling_match': sibling_name,
+                    'reason': 'Stored on this person, but skip-to would not have shown this question.',
+                })
+            elif sibling_name and not _is_expected_shared_question(qrow):
+                identical_rows.append({
+                    'people_id': pid,
+                    'name': _s(reg.PersonName),
+                    'question': _s(qrow.Label, '(Untitled)'),
+                    'answer': disp,
+                    'sibling_match': sibling_name,
+                    'reason': 'Same answer as another person on the same registration.',
+                })
+
+    seen = {}
+    unique_identical = []
+    for row in identical_rows:
+        pair = tuple(sorted([row['name'], row['sibling_match']]))
+        dkey = pair + (row['question'], row['answer'])
+        if dkey in seen:
+            continue
+        seen[dkey] = True
+        unique_identical.append(row)
+
+    return {
+        'has_skip_logic': has_any_skip,
+        'skip_hidden_count': len(skip_hidden_rows),
+        'identical_count': len(unique_identical),
+        'skip_hidden': skip_hidden_rows,
+        'identical': unique_identical,
+        'completed_count': len(ctx['registrants']),
     }
 
 
@@ -2316,7 +3364,7 @@ def _get_finance_people(org_id, status):
     Performance notes:
     - Filters to OrgId first, then only groups with Amt>0 and matching balance.
     - Prefers TransactionPeople; LoginPeopleId only when a group has no TP rows.
-    - No role checks here — speed is SQL shape / data volume, not roles.
+    - Role: Staff only (checked by the ajax action).
     """
     status = _s(status)
     if status not in ('paid_in_full', 'remaining_balance'):
@@ -2424,6 +3472,8 @@ ORDER BY PersonName
 # ---------------------------------------------------------------------------
 # AJAX / page entry
 # ---------------------------------------------------------------------------
+
+_apply_config(_load_settings())
 
 model.Header = 'Awana Registration'
 
@@ -2642,6 +3692,15 @@ if is_ajax:
                             'total_due': float(transactions.TotalDue) if transactions and transactions.TotalDue else 0,
                         }
                     }
+                    if not _user_can_see_finance():
+                        result['transactions'] = {
+                            'total': 0,
+                            'paid_in_full': 0,
+                            'remaining_balance': 0,
+                            'total_paid': 0.0,
+                            'total_due': 0.0,
+                        }
+                    result['show_finance'] = _user_can_see_finance()
                     _json_out(result)
         except Exception, e:
             _err_out(e)
@@ -2716,6 +3775,17 @@ if is_ajax:
         except Exception, e:
             _err_out(e)
 
+    elif action == 'audit_family_answers':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_audit_family_answers(org_id, _i(_data('subgroup_id'), 0)))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'get_age_people':
         try:
             org_id = _i(_data('org_id'), 0)
@@ -2778,13 +3848,16 @@ if is_ajax:
 
     elif action == 'get_finance_people':
         try:
-            org_id = _i(_data('org_id'), 0)
-            denied = _require_org_access(org_id)
-            if denied:
-                _json_out(denied)
+            if not _user_can_see_finance():
+                _json_out({'error': 'Not authorized'})
             else:
-                status = _s(_data('status'))
-                _json_out(_get_finance_people(org_id, status))
+                org_id = _i(_data('org_id'), 0)
+                denied = _require_org_access(org_id)
+                if denied:
+                    _json_out(denied)
+                else:
+                    status = _s(_data('status'))
+                    _json_out(_get_finance_people(org_id, status))
         except Exception, e:
             _err_out(e)
 
@@ -2795,7 +3868,43 @@ if is_ajax:
             if denied:
                 _json_out(denied)
             else:
-                _json_out(_get_club_roster(org_id, _i(_data('subgroup_id'), 0)))
+                _json_out(_get_club_roster(org_id, _i(_data('subgroup_id'), 0), members_only=True))
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_master_roster':
+        try:
+            denied = _require_org_access(CLUBBERS_ORG_ID)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_master_roster())
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_master_allergies':
+        try:
+            denied = _require_org_access(CLUBBERS_ORG_ID)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_master_allergies())
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'get_master_contacts':
+        try:
+            denied = _require_org_access(CLUBBERS_ORG_ID)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_master_contacts())
+        except Exception, e:
+            _err_out(e)
+
+    elif action == 'save_settings':
+        try:
+            _json_out(_save_settings_from_request())
         except Exception, e:
             _err_out(e)
 
@@ -3229,13 +4338,15 @@ else:
         color: #F5F4E8;
     }
     .dash-tab[data-tab="allergies"].active,
-    .club-subtab[data-subtab="allergies"].active {
+    .club-subtab[data-subtab="allergies"].active,
+    #roster-subtabs .club-subtab[data-roster-subtab="allergies"].active {
         border-color: #012B58;
         background: #012B58;
         color: #F5F4E8;
     }
     .dash-tab[data-tab="contacts"].active,
-    .club-subtab[data-subtab="contacts"].active {
+    .club-subtab[data-subtab="contacts"].active,
+    #roster-subtabs .club-subtab[data-roster-subtab="contacts"].active {
         border-color: #012B58;
         background: #012B58;
         color: #F5F4E8;
@@ -3245,6 +4356,89 @@ else:
         background: #012B58;
         color: #F5F4E8;
     }
+    .dash-tab[data-tab="roster"].active {
+        border-color: #012B58;
+        background: #012B58;
+        color: #F5F4E8;
+    }
+    .dash-tab[data-tab="config"] {
+        display: none;
+        background: #CCEBFF;
+        border-color: #019CFF;
+        color: #012B58;
+    }
+    .dash-tabs .dash-tab[data-tab="config"].visible {
+        display: inline-block;
+    }
+    .dash-tab[data-tab="config"].active {
+        background: #019CFF;
+        color: #ffffff;
+        border-color: #019CFF;
+    }
+    .cfg-field {
+        margin-bottom: 16px;
+        max-width: 420px;
+    }
+    .cfg-field label {
+        display: block;
+        font-weight: 600;
+        color: #012B58;
+        margin-bottom: 6px;
+        font-size: 14px;
+    }
+    .cfg-field input[type="number"],
+    .cfg-field input[type="text"] {
+        width: 100%;
+        padding: 10px 12px;
+        border: 2px solid #e2e8f0;
+        border-radius: 8px;
+        font-size: 15px;
+        box-sizing: border-box;
+    }
+    .cfg-field input[type="number"]:focus,
+    .cfg-field input[type="text"]:focus {
+        outline: none;
+        border-color: #019CFF;
+    }
+    .meeting-attend-date {
+        font-weight: 600;
+        color: #012B58;
+    }
+    .meeting-attend-pill {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #CCEBFF;
+        color: #012B58;
+        font-size: 11px;
+        font-weight: 700;
+        vertical-align: middle;
+    }
+    .cfg-hint {
+        font-size: 13px;
+        color: #64748b;
+        margin: 6px 0 0 0;
+    }
+    .cfg-status {
+        margin: 12px 0 0 0;
+        font-size: 14px;
+        font-weight: 600;
+    }
+    .cfg-status.ok { color: #005C3B; }
+    .cfg-status.err { color: #E52300; }
+    .btn-cfg-save {
+        background: #012B58;
+        color: #F5F4E8;
+        border: none;
+        border-radius: 8px;
+        padding: 12px 22px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-cfg-save:hover { opacity: 0.92; }
+    .btn-cfg-save:disabled { opacity: 0.55; cursor: not-allowed; }
     .club-subtab.vol-staff {
         margin-left: auto;
         background: #CCEBFF;
@@ -3297,6 +4491,50 @@ else:
         outline: none;
         border-color: #019CFF;
     }
+    .staff-date-done {
+        min-width: 120px;
+    }
+    .staff-date-value {
+        font-size: 13px;
+        font-style: italic;
+        color: #64748b;
+        line-height: 1.3;
+    }
+    .staff-date-update {
+        background: none;
+        border: none;
+        color: #64748b;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        padding: 0;
+        margin-top: 4px;
+    }
+    .staff-date-update:hover {
+        color: #019CFF;
+        text-decoration: underline;
+    }
+    .staff-date-panel {
+        display: none;
+        margin-top: 6px;
+    }
+    .staff-date-panel.open {
+        display: block;
+    }
+    .people-table th.sortable {
+        cursor: pointer;
+        user-select: none;
+        white-space: nowrap;
+    }
+    .people-table th.sortable:hover {
+        color: #019CFF;
+    }
+    .people-table th.sortable .sort-ind {
+        font-size: 10px;
+        margin-left: 4px;
+        opacity: 0.55;
+        font-weight: 700;
+    }
     .staff-filters {
         display: flex;
         flex-wrap: wrap;
@@ -3318,6 +4556,44 @@ else:
         background: #012B58;
         color: #F5F4E8;
     }
+    .staff-filter-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        margin: 0 0 14px 0;
+    }
+    .staff-filter-bar label {
+        font-weight: 600;
+        color: #012B58;
+        font-size: 13px;
+        margin: 0;
+    }
+    .staff-filter-bar select {
+        min-width: 280px;
+        max-width: 100%;
+        padding: 8px 12px;
+        border: 2px solid #e2e8f0;
+        border-radius: 8px;
+        font-size: 14px;
+        color: #001429;
+        background: #ffffff;
+    }
+    .staff-filter-bar select:focus {
+        outline: none;
+        border-color: #019CFF;
+    }
+    .btn-staff-filter {
+        background: #012B58;
+        color: #F5F4E8;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .btn-staff-filter:hover { opacity: 0.92; }
     .club-subtabs {
         display: flex;
         flex-wrap: wrap;
@@ -3413,6 +4689,13 @@ else:
     .dash-tabs .dash-tab.dash-tab-nextgen.visible {
         display: block;
     }
+    .dash-tabs-end {
+        margin-left: auto;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+    }
     .dash-tab-refresh {
         border: 2px solid #e2e8f0;
         background: white;
@@ -3421,7 +4704,6 @@ else:
         border-radius: 8px;
         font-weight: 600;
         cursor: pointer;
-        margin-left: auto;
     }
     .dash-tab-refresh:hover {
         border-color: #019cff;
@@ -3450,7 +4732,9 @@ else:
     #tab-registration .people-table a,
     #tab-registration .btn-back,
     #tab-registration .empty-state,
-    #tab-registration .info-banner {
+    #tab-registration .info-banner,
+    #tab-registration .reg-flag,
+    #tab-registration .reg-audit-note {
         color: #012b58;
     }
     #tab-registration .section {
@@ -3502,6 +4786,45 @@ else:
     .btn-reg-excel:disabled {
         opacity: 0.55;
         cursor: not-allowed;
+    }
+    .btn-reg-audit {
+        background: #012B58;
+        color: #F5F4E8;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    #tab-registration .btn-reg-audit {
+        color: #F5F4E8;
+        background: #012B58;
+    }
+    .btn-reg-audit:hover { opacity: 0.92; }
+    .reg-flag {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #CCEBFF;
+        color: #012B58;
+        font-size: 11px;
+        font-weight: 700;
+        vertical-align: middle;
+    }
+    .reg-flag.warn {
+        background: #FF7941;
+        color: #ffffff;
+    }
+    .reg-audit-note {
+        font-size: 13px;
+        margin: 0 0 14px 0;
+        line-height: 1.45;
+    }
+    tr.reg-hidden-row td {
+        background: #fff4ee;
+        font-style: italic;
     }
     .other-group-bar {
         border-radius: 6px;
@@ -3699,6 +5022,15 @@ else:
         text-decoration: none;
     }
     .people-table a:hover { text-decoration: underline; }
+    .contact-phone {
+        display: block;
+        margin-top: 4px;
+        font-size: 13px;
+        font-weight: 500;
+    }
+    .contact-phone a {
+        font-weight: 600;
+    }
     .finance-stat-clickable {
         cursor: pointer;
         transition: box-shadow 0.15s ease, transform 0.15s ease;
@@ -3974,15 +5306,19 @@ else:
 
         <div class="dash-tabs visible" id="dash-tabs">
             <button type="button" class="dash-tab active" data-tab="overview">Overview</button>
+            <button type="button" class="dash-tab" data-tab="roster">Roster</button>
             <button type="button" class="dash-tab" data-tab="volunteers">Volunteers</button>
             <button type="button" class="dash-tab" data-tab="puggles">Puggles</button>
             <button type="button" class="dash-tab" data-tab="cubbies">Cubbies</button>
             <button type="button" class="dash-tab" data-tab="sparks">Sparks</button>
-            <button type="button" class="dash-tab" data-tab="tnt-girls">TnT Girls</button>
-            <button type="button" class="dash-tab" data-tab="tnt-boys">TnT Boys</button>
-            <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh" aria-label="Refresh">
-                <i class="fa fa-refresh"></i>
-            </button>
+            <button type="button" class="dash-tab" data-tab="tnt-girls">T&amp;T Girls</button>
+            <button type="button" class="dash-tab" data-tab="tnt-boys">T&amp;T Boys</button>
+            <div class="dash-tabs-end">
+                <button type="button" class="dash-tab" data-tab="config">Config</button>
+                <button type="button" class="dash-tab-refresh" id="btn-refresh-dashboard" title="Refresh" aria-label="Refresh">
+                    <i class="fa fa-refresh"></i>
+                </button>
+            </div>
         </div>
 
         <div class="tab-panel active" id="tab-overview">
@@ -3997,7 +5333,7 @@ else:
             </div>
             <div class="section" id="grade-section" style="display:none;">
                 <h2 class="section-title"><i class="fa fa-graduation-cap"></i> Grade Distribution</h2>
-                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">All Clubbers combined. Open a club tab for people lists.</p>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a grade to open the roster for that grade.</p>
                 <div id="grade-chart"></div>
                 <div id="grade-drilldown" style="display:none; margin-top: 18px;"></div>
             </div>
@@ -4021,6 +5357,57 @@ else:
                 <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click a subgroup to view people</p>
                 <div id="subgroup-list"></div>
                 <div id="subgroup-drilldown" style="display:none; margin-top: 18px;"></div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-roster">
+            <div class="reg-toolbar" style="margin-bottom:12px;">
+                <div class="club-subtabs" id="roster-subtabs" style="margin:0;">
+                    <button type="button" class="club-subtab active" data-roster-subtab="roster">Roster</button>
+                    <button type="button" class="club-subtab" data-roster-subtab="allergies">Allergies</button>
+                    <button type="button" class="club-subtab" data-roster-subtab="contacts">Contacts</button>
+                </div>
+                <div>
+                    <button type="button" class="btn-reg-excel" id="btn-roster-export" style="display:none;">
+                        <i class="fa fa-download"></i> Export Roster
+                    </button>
+                </div>
+            </div>
+            <div class="roster-subpanel" id="roster-panel-roster">
+                <div class="section">
+                    <div class="reg-toolbar">
+                        <h2 class="section-title" style="margin:0;"><i class="fa fa-list"></i> Master Roster</h2>
+                    </div>
+                    <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                        All Puggles, Cubbies, Sparks, T&amp;T Girls, and T&amp;T Boys. Filter by gender or grade, then Add to Tag.
+                        A red A means an allergy is on file — click it to open Allergies.
+                    </p>
+                    <div class="staff-filters" id="roster-gender-filters"></div>
+                    <div class="staff-filters" id="roster-grade-filters"></div>
+                    <div id="roster-view"></div>
+                </div>
+            </div>
+            <div class="roster-subpanel" id="roster-panel-allergies" style="display:none;">
+                <div class="section">
+                    <div class="reg-toolbar">
+                        <h2 class="section-title" style="margin:0;"><i class="fa fa-medkit"></i> Allergies</h2>
+                    </div>
+                    <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                        Clubbers across all clubs with an allergy note on file.
+                    </p>
+                    <div id="roster-allergies-view"></div>
+                </div>
+            </div>
+            <div class="roster-subpanel" id="roster-panel-contacts" style="display:none;">
+                <div class="section">
+                    <div class="reg-toolbar">
+                        <h2 class="section-title" style="margin:0;"><i class="fa fa-users"></i> Parents &amp; Emergency Contacts</h2>
+                    </div>
+                    <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
+                        Clubbers across all clubs with parent or emergency contact info on file.
+                    </p>
+                    <div id="roster-contacts-view"></div>
+                </div>
             </div>
         </div>
 
@@ -4093,11 +5480,74 @@ else:
                             <h2 class="section-title" style="margin:0;"><i class="fa fa-users"></i> Parents &amp; Emergency Contacts</h2>
                         </div>
                         <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
-                            Next Gen stock fields from RecReg: mother, father, and emergency contact.
+                            Next Gen RecReg mother, father, and emergency contact. Parent phones come from the family adult records.
                         </p>
                         <div id="contacts-view"></div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div class="tab-panel" id="tab-config">
+            <div class="section">
+                <h2 class="section-title"><i class="fa fa-cog"></i> Involvements</h2>
+                <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:16px;">
+                    Admins only. Clubbers and Volunteers are the parent involvements.
+                    Leave a club at 0 (or set it to the Clubbers involvement) to use that club&apos;s subgroup.
+                    Sparks / T&amp;T Girls / T&amp;T Boys stay on Clubbers and are always subgroup-filtered.
+                    Puggles and Cubbies may use their own unique involvement numbers (all members of that org).
+                </p>
+                <form id="cfg-form" autocomplete="off">
+                    <div class="cfg-field">
+                        <label for="cfg-clubbers-org">Clubbers involvement</label>
+                        <input type="number" min="1" step="1" id="cfg-clubbers-org" name="clubbers_org" />
+                        <p class="cfg-hint" id="cfg-clubbers-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-volunteers-org">Volunteers involvement</label>
+                        <input type="number" min="1" step="1" id="cfg-volunteers-org" name="volunteers_org" />
+                        <p class="cfg-hint" id="cfg-volunteers-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-puggles-org">Puggles involvement (0 = subgroup on Clubbers)</label>
+                        <input type="number" min="0" step="1" id="cfg-puggles-org" name="puggles_org" />
+                        <p class="cfg-hint" id="cfg-puggles-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-cubbies-org">Cubbies involvement (0 = subgroup on Clubbers)</label>
+                        <input type="number" min="0" step="1" id="cfg-cubbies-org" name="cubbies_org" />
+                        <p class="cfg-hint" id="cfg-cubbies-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-sparks-org">Sparks involvement (0 = subgroup on Clubbers)</label>
+                        <input type="number" min="0" step="1" id="cfg-sparks-org" name="sparks_org" />
+                        <p class="cfg-hint" id="cfg-sparks-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-tnt-girls-org">T&amp;T Girls involvement (0 = subgroup on Clubbers)</label>
+                        <input type="number" min="0" step="1" id="cfg-tnt-girls-org" name="tnt_girls_org" />
+                        <p class="cfg-hint" id="cfg-tnt-girls-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-tnt-boys-org">T&amp;T Boys involvement (0 = subgroup on Clubbers)</label>
+                        <input type="number" min="0" step="1" id="cfg-tnt-boys-org" name="tnt_boys_org" />
+                        <p class="cfg-hint" id="cfg-tnt-boys-org-name"></p>
+                    </div>
+                    <div class="cfg-field">
+                        <label for="cfg-inperson-meetings">In-person training meeting IDs</label>
+                        <input type="text" id="cfg-inperson-meetings" name="inperson_meeting_ids"
+                               placeholder="e.g. 12345, 12346" />
+                        <p class="cfg-hint">
+                            Comma-separated MeetingIds. Present attendance on any of these fills the
+                            Volunteer Management In-Person Training column (latest meeting date) and
+                            writes the Extra Value. Adults use <strong>Awana In Person Training</strong>;
+                            minors use <strong>Minor_Child_Protection_Training_Date</strong>.
+                            People with no attendance still get a date picker. Update these IDs each year.
+                        </p>
+                    </div>
+                    <button type="submit" class="btn-cfg-save" id="btn-cfg-save">Save settings</button>
+                    <p class="cfg-status" id="cfg-status"></p>
+                </form>
             </div>
         </div>
 </div>
@@ -4112,13 +5562,21 @@ else:
         var currentClubKey = null;
         var currentVolClubKey = null;
         var currentSubtab = 'club-overview';
-        var staffRosterState = { people: [], filter: 'all' };
+        var staffRosterState = { people: [], filter: 'all', sortKey: 'last', sortDir: 'asc' };
+        var volRosterState = { people: [], key: 'overview', sortKey: 'last', sortDir: 'asc' };
+        var masterRosterState = {
+            people: [], gender: 'all', grade: 'all', loaded: false,
+            sortKey: 'last', sortDir: 'asc', subtab: 'roster'
+        };
+        var masterAllergyState = { people: [], loaded: false };
+        var masterContactState = { people: [], loaded: false };
+        var clubOverviewState = { people: [], sortKey: 'last', sortDir: 'asc' };
         var awanaData = null;
         var initialOrgId = __INITIAL_ORG_ID__;
         var initialOrgName = __INITIAL_ORG_NAME__;
         var initialClub = __INITIAL_CLUB__;
         var clubKeys = ['puggles', 'cubbies', 'sparks', 'tnt-girls', 'tnt-boys'];
-        var regState = { view: 'summary', question: null, option: null, person: null, summary: null };
+        var regState = { view: 'summary', question: null, option: null, person: null, summary: null, audit: null, _fromAudit: false };
         var gradeDrillState = { label: '', people: [], filter: 'all' };
         var currentXhr = null;
         var loadGeneration = 0;
@@ -4133,6 +5591,15 @@ else:
 
         function personLink(peopleId, name) {
             return '<a href="/Person2/' + encodeURIComponent(peopleId) + '" target="_blank" rel="noopener">' + esc(name) + '</a>';
+        }
+
+        function contactNamePhone(name, phone) {
+            var html = esc(name || '');
+            if (phone) {
+                var href = String(phone).replace(/[^0-9+]/g, '');
+                html += '<span class="contact-phone"><a href="tel:' + esc(href) + '">' + esc(phone) + '</a></span>';
+            }
+            return html;
         }
 
         var pendingTagPeopleIds = [];
@@ -4339,8 +5806,12 @@ else:
             $(this).addClass('active');
             if (tab === 'overview') {
                 showOverviewTab();
+            } else if (tab === 'roster') {
+                openRosterTab({ gender: 'all', grade: 'all', subtab: 'roster' });
             } else if (tab === 'volunteers') {
                 openVolunteersTab();
+            } else if (tab === 'config') {
+                openConfigTab();
             } else if (clubKeys.indexOf(tab) >= 0) {
                 openClubTab(tab);
             }
@@ -4354,6 +5825,10 @@ else:
         $(document).on('click', '#btn-refresh-dashboard', function() {
             if ($('#tab-volunteers').hasClass('active')) {
                 openVolunteersTab(true);
+            } else if ($('#tab-roster').hasClass('active')) {
+                openRosterTab({ forceReload: true, keepSubtab: true });
+            } else if ($('#tab-config').hasClass('active')) {
+                loadAwanaOverview('', 'config');
             } else if (currentClubKey) {
                 openClubTab(currentClubKey, true);
             } else {
@@ -4409,13 +5884,16 @@ else:
             }
         }
 
+        function hideAllMainTabs() {
+            $('#tab-overview, #tab-roster, #tab-volunteers, #tab-club, #tab-config').removeClass('active');
+        }
+
         function showOverviewTab() {
             currentClubKey = null;
             currentVolClubKey = null;
             currentOrgId = null;
             currentSubgroupId = 0;
-            $('#tab-club').removeClass('active');
-            $('#tab-volunteers').removeClass('active');
+            hideAllMainTabs();
             $('#tab-overview').addClass('active');
             var clubbers = awanaData && awanaData.clubbers_org;
             var subtitle = (awanaData && awanaData.profile_name ? awanaData.profile_name + ' · ' : '');
@@ -4440,12 +5918,13 @@ else:
         function selectClub(club, opts) {
             opts = opts || {};
             var clubbers = (awanaData && awanaData.clubbers_org) || {};
-            currentOrgId = String(clubbers.id || '');
-            currentSubgroupId = club.clubbers_tag_id || 0;
+            var orgId = club.org_id || clubbers.id || '';
+            currentOrgId = String(orgId || '');
+            currentSubgroupId = club.dedicated_org ? 0 : (club.subgroup_id || club.clubbers_tag_id || 0);
             var parts = [];
             parts.push((club.clubbers_count || 0) + ' clubbers');
-            if (clubbers.id) parts.push('Inv #' + clubbers.id);
-            setHeader(club.label, parts.join(' · '), clubbers.id);
+            if (orgId) parts.push('Inv #' + orgId);
+            setHeader(club.label, parts.join(' · '), orgId);
             applyHero(awanaData && awanaData.clubbers_org);
             $('#club-org-picker').removeClass('visible').empty();
             $('#club-empty').hide();
@@ -4458,25 +5937,29 @@ else:
         function openClubTab(key, forceReload) {
             currentClubKey = key;
             currentVolClubKey = null;
-            $('#tab-overview').removeClass('active');
-            $('#tab-volunteers').removeClass('active');
+            hideAllMainTabs();
             $('#tab-club').addClass('active');
             $('.dash-tab').removeClass('active');
             $('.dash-tab[data-tab="' + key + '"]').addClass('active');
 
             var club = findClub(key);
             var label = club ? club.label : key;
-            if (!club || !club.clubbers_tag_id) {
+            if (!club || !club.has_source) {
                 currentOrgId = null;
                 currentSubgroupId = 0;
                 $('#club-detail').hide();
                 $('#btn-reg-excel').hide();
                 $('#club-org-picker').removeClass('visible').empty();
-                $('#club-empty').show().html(
-                    'No subgroup named <strong>' + esc(label) +
-                    '</strong> on Clubbers (involvement #' +
-                    esc(String((awanaData && awanaData.clubbers_org && awanaData.clubbers_org.id) || '1916')) + ').'
-                );
+                var emptyMsg;
+                if (club && club.dedicated_org) {
+                    emptyMsg = 'No access to <strong>' + esc(label) +
+                        '</strong> (involvement #' + esc(String(club.org_id || '')) + ').';
+                } else {
+                    emptyMsg = 'No subgroup named <strong>' + esc(label) +
+                        '</strong> on Clubbers (involvement #' +
+                        esc(String((awanaData && awanaData.clubbers_org && awanaData.clubbers_org.id) || '1916')) + ').';
+                }
+                $('#club-empty').show().html(emptyMsg);
                 return;
             }
             if (forceReload) {
@@ -4509,10 +5992,332 @@ else:
             }, 500);
         }
 
+        function rosterNormGender(g) {
+            g = String(g || '').toLowerCase();
+            if (g === 'male' || g === 'm') return 'male';
+            if (g === 'female' || g === 'f') return 'female';
+            return 'unknown';
+        }
+
+        function rosterNormGrade(g) {
+            g = String(g || '').trim();
+            if (!g || g.toLowerCase() === 'unknown') return 'Unknown';
+            return g;
+        }
+
+        function filterMasterRoster(people) {
+            var gender = masterRosterState.gender || 'all';
+            var grade = masterRosterState.grade || 'all';
+            return (people || []).filter(function(p) {
+                if (gender !== 'all' && rosterNormGender(p.gender) !== gender) return false;
+                if (grade !== 'all' && rosterNormGrade(p.grade) !== grade) return false;
+                return true;
+            });
+        }
+
+        function rosterTagSuggest() {
+            var bits = ['Awana Roster'];
+            if (masterRosterState.gender === 'male') bits.push('Male');
+            if (masterRosterState.gender === 'female') bits.push('Female');
+            if (masterRosterState.grade && masterRosterState.grade !== 'all') bits.push(masterRosterState.grade);
+            return bits.join(' ');
+        }
+
+        function renderMasterRoster() {
+            var allPeople = masterRosterState.people || [];
+            var people = filterMasterRoster(allPeople);
+            var allForGender = (allPeople || []).filter(function(p) {
+                return masterRosterState.grade === 'all' || rosterNormGrade(p.grade) === masterRosterState.grade;
+            });
+            var allForGrade = (allPeople || []).filter(function(p) {
+                return masterRosterState.gender === 'all' || rosterNormGender(p.gender) === masterRosterState.gender;
+            });
+            var gMale = allForGender.filter(function(p) { return rosterNormGender(p.gender) === 'male'; }).length;
+            var gFemale = allForGender.filter(function(p) { return rosterNormGender(p.gender) === 'female'; }).length;
+
+            var genderHtml = '';
+            [
+                { key: 'all', label: 'All (' + allForGender.length + ')' },
+                { key: 'male', label: 'Male (' + gMale + ')' },
+                { key: 'female', label: 'Female (' + gFemale + ')' }
+            ].forEach(function(item) {
+                genderHtml += '<button type="button" class="staff-filter' +
+                    (masterRosterState.gender === item.key ? ' active' : '') +
+                    '" data-roster-gender-filter="' + item.key + '">' + esc(item.label) + '</button>';
+            });
+            $('#roster-gender-filters').html(genderHtml);
+
+            var grades = {};
+            allForGrade.forEach(function(p) {
+                var gl = rosterNormGrade(p.grade);
+                grades[gl] = (grades[gl] || 0) + 1;
+            });
+            var gradeKeys = [];
+            if (awanaData && awanaData.grades && awanaData.grades.length) {
+                awanaData.grades.forEach(function(g) {
+                    if (g.label) gradeKeys.push(g.label);
+                });
+            }
+            Object.keys(grades).forEach(function(k) {
+                if (gradeKeys.indexOf(k) < 0) gradeKeys.push(k);
+            });
+            var gradeHtml = '<button type="button" class="staff-filter' +
+                (masterRosterState.grade === 'all' ? ' active' : '') +
+                '" data-roster-grade-filter="all">All grades (' + allForGrade.length + ')</button>';
+            gradeKeys.forEach(function(gl) {
+                var n = grades[gl] || 0;
+                gradeHtml += '<button type="button" class="staff-filter' +
+                    (masterRosterState.grade === gl ? ' active' : '') +
+                    '" data-roster-grade-filter="' + esc(gl) + '">' + esc(gl) + ' (' + n + ')</button>';
+            });
+            $('#roster-grade-filters').html(gradeHtml);
+
+            if (!allPeople.length) {
+                $('#btn-roster-export').hide();
+                $('#roster-view').html('<div class="empty-state">No clubbers on the master roster.</div>');
+                return;
+            }
+            $('#btn-roster-export').show();
+            var ids = collectPeopleIds(people);
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Clubbers: <strong>' +
+                people.length + '</strong>';
+            if (masterRosterState.gender !== 'all' || masterRosterState.grade !== 'all') {
+                html += ' of ' + allPeople.length;
+            }
+            html += '</div>';
+            html += drillActionsHtml({ peopleIds: ids, tagSuggest: rosterTagSuggest() });
+            if (!people.length) {
+                html += '<div class="empty-state">No clubbers match this filter.</div>';
+                $('#roster-view').html(html);
+                return;
+            }
+            var sortKey = masterRosterState.sortKey || 'last';
+            var sortDir = masterRosterState.sortDir || 'asc';
+            people = sortPeopleRows(people, sortKey, sortDir);
+            ids = collectPeopleIds(people);
+            html += '<table class="people-table" data-table-scope="roster"><thead><tr>';
+            html += sortHeaderHtml('Person', 'last', sortKey, sortDir);
+            html += sortHeaderHtml('Age', 'age', sortKey, sortDir);
+            html += sortHeaderHtml('Grade', 'grade', sortKey, sortDir);
+            html += sortHeaderHtml('Gender', 'gender', sortKey, sortDir);
+            html += sortHeaderHtml('Clubs', 'clubs', sortKey, sortDir);
+            html += '</tr></thead><tbody>';
+            people.forEach(function(p) {
+                html += '<tr><td>' + personLink(p.people_id, p.name);
+                if (p.has_allergy) {
+                    html += ' <a href="#" class="allergy-flag" title="Has allergy — open Allergies">A</a>';
+                }
+                html += '</td>';
+                html += '<td>' + esc(p.age === 0 || p.age ? String(p.age) : '') + '</td>';
+                html += '<td>' + esc(p.grade || '') + '</td>';
+                html += '<td>' + esc(p.gender || '') + '</td>';
+                html += '<td>' + esc(p.clubs_label || '') + '</td></tr>';
+            });
+            html += '</tbody></table>';
+            $('#roster-view').html(html);
+        }
+
+        function loadMasterRoster() {
+            showLoading('Loading master roster...', false);
+            $('#roster-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_master_roster' }, function(data) {
+                if (data && data.error) {
+                    $('#btn-roster-export').hide();
+                    $('#roster-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                masterRosterState.people = (data && data.people) || [];
+                masterRosterState.loaded = true;
+                renderMasterRoster();
+            }, { showLoading: true });
+        }
+
+        function renderAllergyTable(people, opts) {
+            opts = opts || {};
+            people = people || [];
+            if (!people.length) {
+                return '<div class="empty-state">No participants with allergy notes on file.</div>';
+            }
+            var ids = collectPeopleIds(people);
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with allergies: <strong>' +
+                people.length + '</strong></div>';
+            html += drillActionsHtml({ peopleIds: ids });
+            html += '<table class="people-table"><thead><tr><th>Person</th>';
+            if (opts.showClubs) html += '<th>Clubs</th>';
+            html += '<th>Allergies</th></tr></thead><tbody>';
+            people.forEach(function(p) {
+                html += '<tr><td>' + personLink(p.people_id, p.name) + '</td>';
+                if (opts.showClubs) html += '<td>' + esc(p.clubs_label || '') + '</td>';
+                html += '<td>' + esc(p.allergy) + '</td></tr>';
+            });
+            html += '</tbody></table>';
+            return html;
+        }
+
+        function renderContactTable(people, opts) {
+            opts = opts || {};
+            people = people || [];
+            if (!people.length) {
+                return '<div class="empty-state">No participants with parent or emergency contact info on file.</div>';
+            }
+            var ids = collectPeopleIds(people);
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with contacts: <strong>' +
+                people.length + '</strong></div>';
+            html += drillActionsHtml({ peopleIds: ids });
+            html += '<table class="people-table"><thead><tr>';
+            html += '<th>Person</th>';
+            if (opts.showClubs) html += '<th>Clubs</th>';
+            html += '<th>Mother</th><th>Father</th><th>Emergency Contact</th><th>Emergency Phone</th>';
+            html += '</tr></thead><tbody>';
+            people.forEach(function(p) {
+                html += '<tr>';
+                html += '<td>' + personLink(p.people_id, p.name) + '</td>';
+                if (opts.showClubs) html += '<td>' + esc(p.clubs_label || '') + '</td>';
+                html += '<td>' + contactNamePhone(p.mother, p.mother_phone) + '</td>';
+                html += '<td>' + contactNamePhone(p.father, p.father_phone) + '</td>';
+                html += '<td>' + esc(p.em_contact || '') + '</td>';
+                html += '<td>' + (p.em_phone
+                    ? '<a href="tel:' + esc(String(p.em_phone).replace(/[^0-9+]/g, '')) + '">' + esc(p.em_phone) + '</a>'
+                    : '') + '</td>';
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            return html;
+        }
+
+        function loadMasterAllergies(force) {
+            if (!force && masterAllergyState.loaded) {
+                $('#roster-allergies-view').html(renderAllergyTable(masterAllergyState.people, { showClubs: true }));
+                return;
+            }
+            showLoading('Loading allergies...', false);
+            $('#roster-allergies-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_master_allergies' }, function(data) {
+                if (data && data.error) {
+                    $('#roster-allergies-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                masterAllergyState.people = (data && data.people) || [];
+                masterAllergyState.loaded = true;
+                $('#roster-allergies-view').html(renderAllergyTable(masterAllergyState.people, { showClubs: true }));
+            }, { showLoading: true });
+        }
+
+        function loadMasterContacts(force) {
+            if (!force && masterContactState.loaded) {
+                $('#roster-contacts-view').html(renderContactTable(masterContactState.people, { showClubs: true }));
+                return;
+            }
+            showLoading('Loading contacts...', false);
+            $('#roster-contacts-view').html('<div class="empty-state">Loading...</div>');
+            ajaxPost({ action: 'get_master_contacts' }, function(data) {
+                if (data && data.error) {
+                    $('#roster-contacts-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                masterContactState.people = (data && data.people) || [];
+                masterContactState.loaded = true;
+                $('#roster-contacts-view').html(renderContactTable(masterContactState.people, { showClubs: true }));
+            }, { showLoading: true });
+        }
+
+        function setRosterSubtab(sub) {
+            var key = sub || 'roster';
+            masterRosterState.subtab = key;
+            $('#roster-subtabs .club-subtab').removeClass('active');
+            $('#roster-subtabs .club-subtab[data-roster-subtab="' + key + '"]').addClass('active');
+            $('#roster-panel-roster, #roster-panel-allergies, #roster-panel-contacts').hide();
+            if (key !== 'roster') $('#btn-roster-export').hide();
+            if (key === 'allergies') {
+                $('#roster-panel-allergies').show();
+                loadMasterAllergies(false);
+            } else if (key === 'contacts') {
+                $('#roster-panel-contacts').show();
+                loadMasterContacts(false);
+            } else {
+                $('#roster-panel-roster').show();
+                if (!masterRosterState.loaded) loadMasterRoster();
+                else renderMasterRoster();
+            }
+        }
+
+        function openRosterTab(opts) {
+            opts = opts || {};
+            currentClubKey = null;
+            currentVolClubKey = null;
+            if (opts.gender) masterRosterState.gender = opts.gender;
+            if (opts.grade) masterRosterState.grade = opts.grade;
+            hideAllMainTabs();
+            $('#tab-roster').addClass('active');
+            $('.dash-tab').removeClass('active');
+            $('.dash-tab[data-tab="roster"]').addClass('active');
+            var clubbers = (awanaData && awanaData.clubbers_org) || {};
+            setHeader('Master Roster', 'Puggles, Cubbies, Sparks, T&T Girls, T&T Boys', clubbers.id || null);
+            applyHero(clubbers);
+            if (opts.forceReload) {
+                masterRosterState.loaded = false;
+                masterAllergyState.loaded = false;
+                masterContactState.loaded = false;
+            }
+            if (!opts.keepSubtab) {
+                masterRosterState.subtab = opts.subtab || 'roster';
+            }
+            setRosterSubtab(masterRosterState.subtab || 'roster');
+        }
+
+        function cfgHint(elId, oid, name) {
+            oid = parseInt(oid, 10) || 0;
+            if (oid > 0 && name) {
+                $('#' + elId).html('Current: <a href="/Org/' + encodeURIComponent(oid) +
+                    '" target="_blank" rel="noopener">' + esc(name) + '</a> (#' + oid + ')');
+            } else if (oid > 0) {
+                $('#' + elId).text('Involvement #' + oid);
+            } else {
+                $('#' + elId).text('0 = use subgroup on Clubbers');
+            }
+        }
+
+        function fillConfigForm() {
+            var s = (awanaData && awanaData.settings) || {};
+            var v = s.values || {};
+            var names = s.org_names || {};
+            $('#cfg-clubbers-org').val(v.clubbers_org || '');
+            $('#cfg-volunteers-org').val(v.volunteers_org || '');
+            $('#cfg-puggles-org').val(v.puggles_org != null ? v.puggles_org : 0);
+            $('#cfg-cubbies-org').val(v.cubbies_org != null ? v.cubbies_org : 0);
+            $('#cfg-sparks-org').val(v.sparks_org != null ? v.sparks_org : 0);
+            $('#cfg-tnt-girls-org').val(v.tnt_girls_org != null ? v.tnt_girls_org : 0);
+            $('#cfg-tnt-boys-org').val(v.tnt_boys_org != null ? v.tnt_boys_org : 0);
+            $('#cfg-inperson-meetings').val(v.inperson_meeting_ids || '');
+            cfgHint('cfg-clubbers-org-name', v.clubbers_org, names.clubbers_org);
+            cfgHint('cfg-volunteers-org-name', v.volunteers_org, names.volunteers_org);
+            cfgHint('cfg-puggles-org-name', v.puggles_org, names.puggles_org);
+            cfgHint('cfg-cubbies-org-name', v.cubbies_org, names.cubbies_org);
+            cfgHint('cfg-sparks-org-name', v.sparks_org, names.sparks_org);
+            cfgHint('cfg-tnt-girls-org-name', v.tnt_girls_org, names.tnt_girls_org);
+            cfgHint('cfg-tnt-boys-org-name', v.tnt_boys_org, names.tnt_boys_org);
+            $('#cfg-status').removeClass('ok err').text('');
+        }
+
+        function openConfigTab() {
+            currentClubKey = null;
+            currentVolClubKey = null;
+            hideAllMainTabs();
+            $('#tab-config').addClass('active');
+            $('.dash-tab').removeClass('active');
+            $('.dash-tab[data-tab="config"]').addClass('active');
+            setHeader('Configuration', 'Admin · involvement mapping', null);
+            applyHero(awanaData && awanaData.clubbers_org);
+            if (!(awanaData && awanaData.show_config_tab)) {
+                $('#tab-config .section').html('<div class="empty-state">Admin role required.</div>');
+                return;
+            }
+            fillConfigForm();
+        }
+
         function openVolunteersTab(forceReload) {
             currentClubKey = null;
-            $('#tab-overview').removeClass('active');
-            $('#tab-club').removeClass('active');
+            hideAllMainTabs();
             $('#tab-volunteers').addClass('active');
             $('.dash-tab').removeClass('active');
             $('.dash-tab[data-tab="volunteers"]').addClass('active');
@@ -4593,8 +6398,101 @@ else:
                 '" value="' + esc(iso || '') + '"' + title + ' />';
         }
 
+        function staffDateCell(p, field, iso, displayDate, opts) {
+            opts = opts || {};
+            var shown = displayDate || iso || '';
+            if (!shown) {
+                return staffDateInput(p, field, iso || '');
+            }
+            var html = '<div class="staff-date-done">';
+            html += '<div class="staff-date-value">' + esc(shown) + '</div>';
+            if (opts.fromMeeting) {
+                html += '<span class="meeting-attend-pill" title="From configured meeting';
+                if (opts.meetingId) html += ' #' + esc(String(opts.meetingId));
+                html += '">meeting</span>';
+            }
+            html += '<div class="staff-date-reveal">';
+            html += '<button type="button" class="staff-date-update">Update date</button>';
+            html += '<div class="staff-date-panel">' + staffDateInput(p, field, iso || '') + '</div>';
+            html += '</div></div>';
+            return html;
+        }
+
+        function personLastKey(p) {
+            var last = String((p && p.last) || '').toLowerCase();
+            if (last) return last;
+            var name = String((p && p.name) || '');
+            var comma = name.indexOf(',');
+            if (comma > 0) return name.slice(0, comma).toLowerCase();
+            var parts = name.trim().split(/\s+/);
+            return (parts.length ? parts[parts.length - 1] : name).toLowerCase();
+        }
+
+        function personFirstKey(p) {
+            var first = String((p && p.first) || '').toLowerCase();
+            if (first) return first;
+            var name = String((p && p.name) || '');
+            var comma = name.indexOf(',');
+            if (comma > 0) return name.slice(comma + 1).trim().toLowerCase();
+            var parts = name.trim().split(/\s+/);
+            return (parts.length > 1 ? parts[0] : '').toLowerCase();
+        }
+
+        function comparePeopleKey(a, b, key) {
+            function s(v) { return String(v == null ? '' : v).toLowerCase(); }
+            function n(v) {
+                var x = parseInt(v, 10);
+                return isNaN(x) ? -1 : x;
+            }
+            if (key === 'last' || key === 'person' || key === 'name') {
+                var c = personLastKey(a).localeCompare(personLastKey(b));
+                if (c !== 0) return c;
+                return personFirstKey(a).localeCompare(personFirstKey(b));
+            }
+            if (key === 'age') return n(a.age) - n(b.age);
+            if (key === 'clubs') return s(a.clubs_label).localeCompare(s(b.clubs_label));
+            if (key === 'grade') return s(a.grade).localeCompare(s(b.grade));
+            if (key === 'gender') return s(a.gender).localeCompare(s(b.gender));
+            if (key === 'app') return s(a.app_date || (a.has_application ? 'On file' : '')).localeCompare(
+                s(b.app_date || (b.has_application ? 'On file' : '')));
+            if (key === 'bg') return s(a.bg_date).localeCompare(s(b.bg_date));
+            if (key === 'video') return s(a.video_date).localeCompare(s(b.video_date));
+            if (key === 'inperson') return s(a.inperson_iso || a.inperson_date).localeCompare(
+                s(b.inperson_iso || b.inperson_date));
+            if (key === 'handbook') return s(a.handbook_iso || a.handbook_date).localeCompare(
+                s(b.handbook_iso || b.handbook_date));
+            if (key === 'allergy') return s(a.allergy).localeCompare(s(b.allergy));
+            return 0;
+        }
+
+        function sortPeopleRows(people, sortKey, sortDir) {
+            var dir = sortDir === 'desc' ? -1 : 1;
+            var rows = (people || []).slice();
+            rows.sort(function(a, b) {
+                var cmp = comparePeopleKey(a, b, sortKey || 'last');
+                if (cmp !== 0) return cmp * dir;
+                var c2 = personLastKey(a).localeCompare(personLastKey(b));
+                if (c2 !== 0) return c2;
+                return personFirstKey(a).localeCompare(personFirstKey(b));
+            });
+            return rows;
+        }
+
+        function sortHeaderHtml(label, key, sortKey, sortDir) {
+            var ind = '';
+            if (sortKey === key) ind = sortDir === 'desc' ? '▼' : '▲';
+            return '<th class="sortable" data-sort="' + esc(key) + '">' + esc(label) +
+                (ind ? '<span class="sort-ind">' + ind + '</span>' : '') + '</th>';
+        }
+
         function staffFilterPeople(people, filter) {
             people = people || [];
+            if (filter === 'minors') {
+                return people.filter(function(p) { return p.is_minor; });
+            }
+            if (filter === 'adults') {
+                return people.filter(function(p) { return !p.is_minor; });
+            }
             if (filter === 'missing-bc') {
                 return people.filter(function(p) { return !p.is_minor && !p.bg_date; });
             }
@@ -4619,6 +6517,8 @@ else:
         function staffFilterBarHtml(filter) {
             var items = [
                 { key: 'all', label: 'All' },
+                { key: 'minors', label: 'All minors' },
+                { key: 'adults', label: 'All adults' },
                 { key: 'missing-app', label: 'Missing application' },
                 { key: 'missing-bc', label: 'Missing background check' },
                 { key: 'missing-video', label: 'Missing video training' },
@@ -4626,16 +6526,23 @@ else:
                 { key: 'missing-inperson-adult', label: 'Adults missing in-person training' },
                 { key: 'missing-handbook', label: 'Adults missing handbook' }
             ];
-            var html = '<div class="staff-filters">';
+            var html = '<div class="staff-filter-bar">';
+            html += '<label for="staff-filter-select">Filter</label>';
+            html += '<select id="staff-filter-select">';
             items.forEach(function(item) {
-                html += '<button type="button" class="staff-filter' + (filter === item.key ? ' active' : '') +
-                    '" data-staff-filter="' + item.key + '">' + esc(item.label) + '</button>';
+                html += '<option value="' + esc(item.key) + '"' +
+                    (filter === item.key ? ' selected' : '') + '>' +
+                    esc(item.label) + '</option>';
             });
+            html += '</select>';
+            html += '<button type="button" class="btn-staff-filter" id="btn-staff-filter-apply">Filter</button>';
             html += '</div>';
             return html;
         }
 
         function staffTagSuggest(filter) {
+            if (filter === 'minors') return 'Awana Minor Volunteers';
+            if (filter === 'adults') return 'Awana Adult Volunteers';
             if (filter === 'missing-app') return 'Awana Missing Application';
             if (filter === 'missing-bc') return 'Awana Missing Background Check';
             if (filter === 'missing-video') return 'Awana Missing Video Training';
@@ -4649,9 +6556,19 @@ else:
             var allPeople = data.people || [];
             if (key === 'staff') {
                 staffRosterState.people = allPeople;
+            } else {
+                volRosterState.people = allPeople;
+                volRosterState.key = key;
             }
             var filter = (key === 'staff') ? (staffRosterState.filter || 'all') : 'all';
+            var sortKey = (key === 'staff')
+                ? (staffRosterState.sortKey || 'last')
+                : (volRosterState.sortKey || 'last');
+            var sortDir = (key === 'staff')
+                ? (staffRosterState.sortDir || 'asc')
+                : (volRosterState.sortDir || 'asc');
             var people = (key === 'staff') ? staffFilterPeople(allPeople, filter) : allPeople;
+            people = sortPeopleRows(people, sortKey, sortDir);
             var title = 'Volunteers';
             if (key === 'overview') title = 'All volunteers';
             else if (key === 'staff') title = 'Volunteer Management';
@@ -4682,7 +6599,9 @@ else:
             html += drillActionsHtml(tagOpts);
             if (!people.length) {
                 var emptyMsg = 'No volunteers match this filter.';
-                if (filter === 'missing-app') emptyMsg = 'No volunteers missing an application.';
+                if (filter === 'minors') emptyMsg = 'No minor volunteers.';
+                else if (filter === 'adults') emptyMsg = 'No adult volunteers.';
+                else if (filter === 'missing-app') emptyMsg = 'No volunteers missing an application.';
                 else if (filter === 'missing-bc') emptyMsg = 'No adults missing a background check.';
                 else if (filter === 'missing-video') emptyMsg = 'No adults missing video training.';
                 else if (filter === 'missing-inperson-minor') emptyMsg = 'No minors missing in-person training.';
@@ -4692,12 +6611,19 @@ else:
                 $('#volunteers-view').html(html);
                 return;
             }
-            html += '<table class="people-table"><thead><tr><th>Person</th>';
+            html += '<table class="people-table" data-table-scope="' +
+                (key === 'staff' ? 'staff' : 'vol') + '"><thead><tr>';
+            html += sortHeaderHtml('Person', 'last', sortKey, sortDir);
             if (key === 'overview' || key === 'staff') {
-                html += '<th>Age</th><th>Clubs</th>';
+                html += sortHeaderHtml('Age', 'age', sortKey, sortDir);
+                html += sortHeaderHtml('Clubs', 'clubs', sortKey, sortDir);
             }
             if (key === 'staff') {
-                html += '<th>Application</th><th>Background Check</th><th>Video Training</th><th>In-Person Training</th><th>Handbook</th>';
+                html += sortHeaderHtml('Application', 'app', sortKey, sortDir);
+                html += sortHeaderHtml('Background Check', 'bg', sortKey, sortDir);
+                html += sortHeaderHtml('Video Training', 'video', sortKey, sortDir);
+                html += sortHeaderHtml('In-Person Training', 'inperson', sortKey, sortDir);
+                html += sortHeaderHtml('Handbook', 'handbook', sortKey, sortDir);
             }
             html += '</tr></thead><tbody>';
             people.forEach(function(p) {
@@ -4715,11 +6641,14 @@ else:
                         html += '<td>' + esc(p.bg_date || '') + '</td>';
                         html += '<td>' + esc(p.video_date || '') + '</td>';
                     }
-                    html += '<td>' + staffDateInput(p, 'inperson', p.inperson_iso) + '</td>';
+                    html += '<td>' + staffDateCell(p, 'inperson', p.inperson_iso, p.inperson_date, {
+                        fromMeeting: !!p.inperson_from_meeting,
+                        meetingId: p.inperson_meeting_id || 0
+                    }) + '</td>';
                     if (p.is_minor) {
                         html += '<td><span class="na-muted">not applicable</span></td>';
                     } else {
-                        html += '<td>' + staffDateInput(p, 'handbook', p.handbook_iso) + '</td>';
+                        html += '<td>' + staffDateCell(p, 'handbook', p.handbook_iso, p.handbook_date) + '</td>';
                     }
                 }
                 html += '</tr>';
@@ -4728,9 +6657,17 @@ else:
             $('#volunteers-view').html(html);
         }
 
+        $(document).on('click', '.staff-date-update', function() {
+            var $btn = $(this);
+            var $panel = $btn.siblings('.staff-date-panel');
+            $panel.addClass('open');
+            $btn.hide();
+            $panel.find('input.staff-ev-date').focus();
+        });
+
         $(document).on('change', '.staff-ev-date', function() {
             var $inp = $(this);
-            var pid = $inp.attr('data-pid');
+            var pid = parseInt($inp.attr('data-pid'), 10) || 0;
             var field = $inp.attr('data-field');
             var dateVal = $inp.val() || '';
             $inp.prop('disabled', true);
@@ -4744,19 +6681,67 @@ else:
                     alert(data.error);
                     return;
                 }
-                if (data && data.iso) $inp.val(data.iso);
-                else if (!dateVal) $inp.val('');
-                $inp.addClass('saved');
-                setTimeout(function() { $inp.removeClass('saved'); }, 1200);
+                var iso = (data && data.iso) ? data.iso : '';
+                var shown = (data && data.date) ? data.date : '';
+                var people = staffRosterState.people || [];
+                for (var i = 0; i < people.length; i++) {
+                    if (parseInt(people[i].people_id, 10) !== pid) continue;
+                    if (field === 'inperson') {
+                        people[i].inperson_iso = iso;
+                        people[i].inperson_date = shown || iso;
+                        people[i].inperson_from_meeting = false;
+                        people[i].inperson_meeting_id = 0;
+                    } else if (field === 'handbook') {
+                        people[i].handbook_iso = iso;
+                        people[i].handbook_date = shown || iso;
+                    }
+                    break;
+                }
+                renderVolunteerRoster('staff', { people: staffRosterState.people || [] });
             }, {
                 showLoading: false,
                 complete: function() { $inp.prop('disabled', false); }
             });
         });
 
-        $(document).on('click', '.staff-filter', function() {
-            staffRosterState.filter = String($(this).attr('data-staff-filter') || 'all');
+        $(document).on('click', '#btn-staff-filter-apply', function() {
+            staffRosterState.filter = String($('#staff-filter-select').val() || 'all');
             renderVolunteerRoster('staff', { people: staffRosterState.people || [] });
+        });
+
+        $(document).on('keydown', '#staff-filter-select', function(e) {
+            if (e.which === 13) {
+                e.preventDefault();
+                $('#btn-staff-filter-apply').click();
+            }
+        });
+
+        $(document).on('click', '.people-table th.sortable', function() {
+            var key = String($(this).attr('data-sort') || 'last');
+            var scope = String($(this).closest('table').attr('data-table-scope') || '');
+            function toggle(state) {
+                if (state.sortKey === key) {
+                    state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    state.sortKey = key;
+                    state.sortDir = 'asc';
+                }
+            }
+            if (scope === 'staff') {
+                toggle(staffRosterState);
+                renderVolunteerRoster('staff', { people: staffRosterState.people || [] });
+            } else if (scope === 'vol') {
+                toggle(volRosterState);
+                renderVolunteerRoster(volRosterState.key || currentVolClubKey || 'overview', {
+                    people: volRosterState.people || []
+                });
+            } else if (scope === 'roster') {
+                toggle(masterRosterState);
+                renderMasterRoster();
+            } else if (scope === 'club-overview') {
+                toggle(clubOverviewState);
+                renderClubOverviewTable();
+            }
         });
 
         $(document).on('click', '.club-subtab[data-vol-club]', function() {
@@ -4777,9 +6762,13 @@ else:
         function exportRosterCsv(filename, kind) {
             kind = kind || 'volunteers';
             if (!currentOrgId) return;
-            if (kind === 'clubbers' && !currentSubgroupId) {
-                alert('Select a club first.');
-                return;
+            if (kind === 'clubbers') {
+                var club = findClub(currentClubKey);
+                var dedicated = club && club.dedicated_org;
+                if (!currentSubgroupId && !dedicated) {
+                    alert('Select a club first.');
+                    return;
+                }
             }
             showLoading('Preparing export...', false);
             clubPost({ action: 'get_club_roster' }, function(data) {
@@ -4810,14 +6799,69 @@ else:
             openClubTab(key);
         });
 
+        $(document).on('click', '[data-roster-gender-filter]', function() {
+            masterRosterState.gender = String($(this).attr('data-roster-gender-filter') || 'all');
+            renderMasterRoster();
+        });
+
+        $(document).on('click', '[data-roster-grade-filter]', function() {
+            masterRosterState.grade = String($(this).attr('data-roster-grade-filter') || 'all');
+            renderMasterRoster();
+        });
+
+        $(document).on('click', '#btn-roster-export', function() {
+            var people = filterMasterRoster(masterRosterState.people || []);
+            var rows = [];
+            (people || []).forEach(function(p) {
+                rows.push([p.people_id, p.name, p.age, p.grade, p.gender, p.email, p.clubs_label, p.emergency, p.parents]);
+            });
+            downloadCsv('Awana-Master-Roster.csv',
+                ['PeopleId', 'Name', 'Age', 'Grade', 'Gender', 'Email', 'Clubs', 'Emergency Contact', 'Parents'],
+                rows);
+        });
+
+        $('#cfg-form').on('submit', function(e) {
+            e.preventDefault();
+            if (!(awanaData && awanaData.show_config_tab)) {
+                alert('Admin role required.');
+                return;
+            }
+            var payload = {
+                action: 'save_settings',
+                clubbers_org: $('#cfg-clubbers-org').val(),
+                volunteers_org: $('#cfg-volunteers-org').val(),
+                puggles_org: $('#cfg-puggles-org').val() || '0',
+                cubbies_org: $('#cfg-cubbies-org').val() || '0',
+                sparks_org: $('#cfg-sparks-org').val() || '0',
+                tnt_girls_org: $('#cfg-tnt-girls-org').val() || '0',
+                tnt_boys_org: $('#cfg-tnt-boys-org').val() || '0',
+                inperson_meeting_ids: $('#cfg-inperson-meetings').val() || ''
+            };
+            $('#btn-cfg-save').prop('disabled', true);
+            $('#cfg-status').removeClass('ok err').text('Saving...');
+            ajaxPost(payload, function(data) {
+                $('#btn-cfg-save').prop('disabled', false);
+                if (data && data.error) {
+                    $('#cfg-status').addClass('err').text(data.error);
+                    return;
+                }
+                $('#cfg-status').addClass('ok').text((data && data.message) || 'Saved.');
+                loadAwanaOverview('', 'config');
+            }, { showLoading: true });
+        });
+
         function renderClubCards(data) {
             var html = '';
             (data.clubs || []).forEach(function(club) {
-                var empty = !club.clubbers_tag_id;
+                var empty = !club.has_source;
                 html += '<div class="club-card' + (empty ? ' empty' : '') + '" data-club="' + esc(club.key) + '">';
                 html += '<div class="club-card-label">' + esc(club.label) + '</div>';
                 if (empty) {
-                    html += '<p class="club-card-meta">No matching subgroup on Clubbers</p>';
+                    if (club.dedicated_org) {
+                        html += '<p class="club-card-meta">Involvement #' + esc(String(club.org_id || '')) + '</p>';
+                    } else {
+                        html += '<p class="club-card-meta">No matching subgroup on Clubbers</p>';
+                    }
                     html += '<div class="club-card-count">—</div>';
                 } else {
                     html += '<div class="club-card-count">' + (club.clubbers_count || 0) + '</div>';
@@ -4837,11 +6881,17 @@ else:
             setHeader('Awana Registration', subtitle, clubbers.id);
             applyHero(clubbers);
 
+            if (data.show_config_tab) {
+                $('.dash-tab[data-tab="config"]').addClass('visible');
+            } else {
+                $('.dash-tab[data-tab="config"]').removeClass('visible');
+            }
+
             var statsHtml = '';
-            statsHtml += '<div class="stat-card"><div class="stat-label">Clubbers</div><div class="stat-value">' + (data.total_members || 0) + '</div></div>';
-            statsHtml += '<div class="stat-card"><div class="stat-label">Volunteers</div><div class="stat-value">' + (data.volunteer_members || 0) + '</div></div>';
-            statsHtml += '<div class="stat-card"><div class="stat-label">Male clubbers</div><div class="stat-value">' + (data.male_count || 0) + '</div></div>';
-            statsHtml += '<div class="stat-card"><div class="stat-label">Female clubbers</div><div class="stat-value">' + (data.female_count || 0) + '</div></div>';
+            statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-gender="all"><div class="stat-label">Clubbers</div><div class="stat-value">' + (data.total_members || 0) + '</div><div class="stat-drill-hint">Open master roster</div></div>';
+            statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="volunteers"><div class="stat-label">Volunteers</div><div class="stat-value">' + (data.volunteer_members || 0) + '</div><div class="stat-drill-hint">Open Volunteers tab</div></div>';
+            statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-gender="male"><div class="stat-label">Male clubbers</div><div class="stat-value">' + (data.male_count || 0) + '</div><div class="stat-drill-hint">Roster · boys</div></div>';
+            statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-gender="female"><div class="stat-label">Female clubbers</div><div class="stat-value">' + (data.female_count || 0) + '</div><div class="stat-drill-hint">Roster · girls</div></div>';
             $('#stats-grid').html(statsHtml);
             $('#gender-drilldown').hide().empty();
             $('#age-section').hide();
@@ -4856,7 +6906,7 @@ else:
                     if (!g.count) return;
                     var pct = maxGrade > 0 ? Math.round((g.count / maxGrade) * 100) : 0;
                     var totalPct = data.total_members > 0 ? Math.round((g.count / data.total_members) * 100) : 0;
-                    gradeHtml += '<div class="chart-bar">';
+                    gradeHtml += '<div class="chart-bar grade-bar-clickable" data-roster-grade="' + esc(g.label) + '">';
                     gradeHtml += '<div class="chart-label">' + esc(g.label) + '</div>';
                     gradeHtml += '<div class="chart-bar-container"><div class="chart-bar-fill" style="width:' + pct + '%;">' + totalPct + '%</div></div>';
                     gradeHtml += '<div class="chart-count">' + g.count + '</div></div>';
@@ -4868,7 +6918,7 @@ else:
                 $('#grade-section').hide();
             }
 
-            if (data.transactions && data.transactions.total > 0) {
+            if (data.show_finance && data.transactions && data.transactions.total > 0) {
                 var money = function(n) {
                     return '$' + (n || 0).toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,');
                 };
@@ -4917,16 +6967,28 @@ else:
             }
         }
 
-        function loadAwanaOverview(thenClub) {
+        function loadAwanaOverview(thenClub, thenTab) {
             showLoading('Loading Awana clubs...', false);
             ajaxPost({ action: 'list_awana' }, function(data) {
                 if (data && data.error) {
                     alert('Error: ' + data.error + (data.traceback ? '\n\n' + data.traceback : ''));
                     return;
                 }
+                masterRosterState.loaded = false;
+                masterRosterState.people = [];
+                masterAllergyState.loaded = false;
+                masterAllergyState.people = [];
+                masterContactState.loaded = false;
+                masterContactState.people = [];
                 renderAwanaOverview(data || {});
                 if (thenClub && clubKeys.indexOf(thenClub) >= 0) {
                     openClubTab(thenClub);
+                } else if (thenTab === 'roster') {
+                    openRosterTab({ forceReload: true });
+                } else if (thenTab === 'volunteers') {
+                    openVolunteersTab(true);
+                } else if (thenTab === 'config') {
+                    openConfigTab();
                 } else {
                     showOverviewTab();
                 }
@@ -4979,6 +7041,18 @@ else:
         $(document).on('click', '#btn-close-age-drill', function() {
             $('#age-drilldown').hide().empty();
             $('.age-bar-clickable').removeClass('active');
+        });
+
+        $(document).on('click', '.stat-card-clickable[data-awana-nav]', function() {
+            var nav = String($(this).attr('data-awana-nav') || '');
+            if (nav === 'volunteers') {
+                openVolunteersTab();
+                return;
+            }
+            if (nav === 'roster') {
+                var gender = String($(this).attr('data-roster-gender') || 'all');
+                openRosterTab({ gender: gender, grade: 'all' });
+            }
         });
 
         $(document).on('click', '.stat-card-clickable[data-gender]', function() {
@@ -5093,6 +7167,13 @@ else:
         }
 
         $(document).on('click', '.grade-bar-clickable', function() {
+            var rosterGrade = String($(this).attr('data-roster-grade') || '');
+            if (rosterGrade) {
+                $('.grade-bar-clickable').removeClass('active');
+                $(this).addClass('active');
+                openRosterTab({ gender: 'all', grade: rosterGrade });
+                return;
+            }
             var grade = String($(this).attr('data-grade') || '');
             if (!currentOrgId || !grade) return;
             $('.grade-bar-clickable').removeClass('active');
@@ -5326,10 +7407,18 @@ else:
             }, { showLoading: true });
         }
 
+        $(document).on('click', '#roster-subtabs .club-subtab', function() {
+            setRosterSubtab(String($(this).attr('data-roster-subtab') || 'roster'));
+        });
+
         $(document).on('click', '.allergy-flag', function(e) {
             e.preventDefault();
             e.stopPropagation();
-            setClubSubtab('allergies', true);
+            if ($('#tab-roster').hasClass('active')) {
+                setRosterSubtab('allergies');
+            } else {
+                setClubSubtab('allergies', true);
+            }
         });
 
         function loadAllergies() {
@@ -5341,21 +7430,7 @@ else:
                     $('#allergies-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
-                var people = (data && data.people) || [];
-                if (!people.length) {
-                    $('#allergies-view').html('<div class="empty-state">No participants with allergy notes on file.</div>');
-                    return;
-                }
-                var ids = collectPeopleIds(people);
-                var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with allergies: <strong>' +
-                    people.length + '</strong></div>';
-                html += drillActionsHtml({ peopleIds: ids });
-                html += '<table class="people-table"><thead><tr><th>Person</th><th>Allergies</th></tr></thead><tbody>';
-                people.forEach(function(p) {
-                    html += '<tr><td>' + personLink(p.people_id, p.name) + '</td><td>' + esc(p.allergy) + '</td></tr>';
-                });
-                html += '</tbody></table>';
-                $('#allergies-view').html(html);
+                $('#allergies-view').html(renderAllergyTable((data && data.people) || []));
             }, { showLoading: true });
         }
 
@@ -5368,29 +7443,7 @@ else:
                     $('#contacts-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
-                var people = (data && data.people) || [];
-                if (!people.length) {
-                    $('#contacts-view').html('<div class="empty-state">No participants with parent or emergency contact info on file.</div>');
-                    return;
-                }
-                var ids = collectPeopleIds(people);
-                var html = '<div class="reg-meta" style="margin-bottom:14px;">Participants with contacts: <strong>' +
-                    people.length + '</strong></div>';
-                html += drillActionsHtml({ peopleIds: ids });
-                html += '<table class="people-table"><thead><tr>';
-                html += '<th>Person</th><th>Mother</th><th>Father</th><th>Emergency Contact</th><th>Emergency Phone</th>';
-                html += '</tr></thead><tbody>';
-                people.forEach(function(p) {
-                    html += '<tr>';
-                    html += '<td>' + personLink(p.people_id, p.name) + '</td>';
-                    html += '<td>' + esc(p.mother || '') + '</td>';
-                    html += '<td>' + esc(p.father || '') + '</td>';
-                    html += '<td>' + esc(p.em_contact || '') + '</td>';
-                    html += '<td>' + esc(p.em_phone || '') + '</td>';
-                    html += '</tr>';
-                });
-                html += '</tbody></table>';
-                $('#contacts-view').html(html);
+                $('#contacts-view').html(renderContactTable((data && data.people) || []));
             }, { showLoading: true });
         }
 
@@ -5408,6 +7461,7 @@ else:
                 regState.question = null;
                 regState.option = null;
                 regState.person = null;
+                regState._fromAudit = false;
                 renderRegistrationSummary(data);
             }, { showLoading: true });
         }
@@ -5477,11 +7531,19 @@ else:
             }
 
             if (!data.questions || data.questions.length === 0) {
-                $('#reg-view').html('<div class="empty-state">' + esc(data.message || 'No registration questions found.') + '</div>');
+                var emptyHtml = '<div class="empty-state">' + esc(data.message || 'No registration questions found.') + '</div>';
+                if (awanaData && awanaData.show_config_tab) {
+                    emptyHtml += '<p style="margin-top:12px;"><button type="button" class="btn-reg-audit" id="btn-reg-audit">Audit family overlap</button></p>';
+                }
+                $('#reg-view').html(emptyHtml);
                 return;
             }
 
-            var html = '<div class="reg-meta" style="margin-bottom:14px;">Completed registrants: <strong>' + data.completed_count + '</strong></div>';
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Completed registrants: <strong>' + data.completed_count + '</strong>';
+            if (awanaData && awanaData.show_config_tab) {
+                html += ' <button type="button" class="btn-reg-audit" id="btn-reg-audit">Audit family overlap</button>';
+            }
+            html += '</div>';
 
             if (data.message) {
                 html += '<div class="empty-state" style="margin-bottom:14px;">' + esc(data.message) + '</div>';
@@ -5612,18 +7674,99 @@ else:
                     $('#reg-view').html('<div class="info-banner">' + esc(data.error) + '</div>');
                     return;
                 }
-                var backNav = regState.option ? 'option' : (regState.question ? 'question' : 'summary');
+                var backNav = regState._fromAudit ? 'audit'
+                    : (regState.option ? 'option' : (regState.question ? 'question' : 'summary'));
                 var html = '<button type="button" class="btn-back" data-nav="' + backNav + '"><i class="fa fa-arrow-left"></i> Back</button>';
                 html += '<h3 style="margin:16px 0 8px;">' + personLink(data.people_id, data.name) + '</h3>';
+                if (data.family_on_registration && data.family_on_registration.length) {
+                    html += '<p class="reg-audit-note">On the same registration: ';
+                    var names = [];
+                    data.family_on_registration.forEach(function(f) {
+                        names.push(personLink(f.people_id, f.name));
+                    });
+                    html += names.join(', ') + '</p>';
+                }
                 html += '<table class="people-table"><thead><tr><th>Question</th><th>Answer</th></tr></thead><tbody>';
                 (data.answers || []).forEach(function(a) {
                     if (a.blank || !a.answer) return;
-                    html += '<tr><td>' + esc(a.label) + '</td><td>' + esc(a.answer) + '</td></tr>';
+                    html += '<tr><td>' + esc(a.label);
+                    if (a.sibling_match) {
+                        html += '<span class="reg-flag">Matches ' + esc(a.sibling_match) + '</span>';
+                    }
+                    html += '</td><td>' + esc(a.answer) + '</td></tr>';
                 });
                 html += '</tbody></table>';
+                if (data.show_audit && data.hidden_answers && data.hidden_answers.length) {
+                    html += '<h3 style="margin:22px 0 8px;">Stored but not asked (skip-to)</h3>';
+                    html += '<p class="reg-audit-note">These answers are on this person\'s registration row, but skip-to logic says they would not have seen the question. That is the usual family-bleed pattern.</p>';
+                    html += '<table class="people-table"><thead><tr><th>Question</th><th>Answer</th></tr></thead><tbody>';
+                    data.hidden_answers.forEach(function(a) {
+                        html += '<tr class="reg-hidden-row"><td>' + esc(a.label);
+                        html += '<span class="reg-flag warn">Not asked</span>';
+                        if (a.sibling_match) {
+                            html += '<span class="reg-flag">Matches ' + esc(a.sibling_match) + '</span>';
+                        }
+                        html += '</td><td>' + esc(a.answer) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
                 $('#reg-view').html(html);
             }, { showLoading: true });
         }
+
+        function renderFamilyAudit(data) {
+            regState.view = 'audit';
+            regState.audit = data;
+            regState._fromAudit = true;
+            renderBreadcrumb();
+            var html = '<button type="button" class="btn-back" data-nav="summary"><i class="fa fa-arrow-left"></i> Back</button>';
+            html += '<h3 style="margin:16px 0 8px;">Family answer audit</h3>';
+            if (!data.has_skip_logic) {
+                html += '<p class="reg-audit-note">This form has no skip-to conditions saved on question options. Club-specific hiding cannot be reconstructed from skip-to. Identical answers below are still worth checking.</p>';
+            } else {
+                html += '<p class="reg-audit-note">Skip-to conditions were replayed the same way TouchPoint hides questions on the form. Stored-but-not-asked rows are the family-bleed suspects.</p>';
+            }
+            html += '<div class="reg-meta" style="margin-bottom:14px;">';
+            html += 'Not asked: <strong>' + (data.skip_hidden_count || 0) + '</strong>';
+            html += ' &nbsp;·&nbsp; Identical with a family member: <strong>' + (data.identical_count || 0) + '</strong>';
+            html += '</div>';
+            function auditTable(title, rows) {
+                var out = '<h3 style="margin:18px 0 8px;">' + esc(title) + '</h3>';
+                if (!rows || !rows.length) {
+                    out += '<div class="empty-state">None found for this club.</div>';
+                    return out;
+                }
+                out += '<table class="people-table"><thead><tr><th>Person</th><th>Question</th><th>Answer</th><th>Also on</th></tr></thead><tbody>';
+                rows.forEach(function(r) {
+                    out += '<tr class="reg-hidden-row">';
+                    out += '<td>' + personLink(r.people_id, r.name);
+                    out += ' <a href="#" class="person-drill" data-pid="' + r.people_id +
+                        '" data-pname="' + encodeURIComponent(r.name) + '">Q&amp;A</a></td>';
+                    out += '<td>' + esc(r.question) + '</td>';
+                    out += '<td>' + esc(r.answer) + '</td>';
+                    out += '<td>' + esc(r.sibling_match || '') + '</td></tr>';
+                });
+                out += '</tbody></table>';
+                return out;
+            }
+            html += auditTable('Stored on this person, but skip-to would not have asked', data.skip_hidden || []);
+            html += auditTable('Same answer as someone else on the same registration (not parents / emergency / hear-about)', data.identical || []);
+            $('#reg-view').html(html);
+        }
+
+        $(document).on('click', '#btn-reg-audit', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            showLoading('Auditing family answers...', true);
+            $('#reg-view').html('<div class="empty-state">Auditing family answers...</div>');
+            clubPost({ action: 'audit_family_answers' }, function(data) {
+                if (data.error) {
+                    $('#reg-view').html('<div class="info-banner">' + esc(data.error) + '</div>');
+                    return;
+                }
+                renderFamilyAudit(data);
+            }, { showLoading: true });
+        });
 
         function loadOptionPeople(o) {
             regState.option = o;
@@ -5662,8 +7805,11 @@ else:
             e.preventDefault();
             var nav = $(this).data('nav');
             if (nav === 'summary') {
+                regState._fromAudit = false;
                 if (regState.summary) renderRegistrationSummary(regState.summary);
                 else loadRegistrationSummary();
+            } else if (nav === 'audit' && regState.audit) {
+                renderFamilyAudit(regState.audit);
             } else if (nav === 'question' && regState.question) {
                 openQuestion(regState.question);
             } else if (nav === 'option' && regState.question && regState.option) {
