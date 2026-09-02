@@ -1,0 +1,232 @@
+<!--
+  Script: WidgetRecentWorshipServiceHTML
+  Purpose: Homepage Sunday attendance widget — three tiles (In Person,
+    Online, Total) with week-over-week percent deltas.
+  Author: Jake Pierson
+  Date: 2026-09-01
+
+  Install: Paste into this widget's HTML Content in Homepage Widgets / Special Content.
+  Python injects the tile grid at <!--TILES--> after RenderTemplate.
+-->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+
+<div class="box topradius fixed-height-widget">
+    <div class="box-title topradius hidden-xs bg-dkblu-gradient">
+        <h5><i class="fa fa-solid fa-chart-simple"></i>&nbsp;&nbsp;{{WidgetName}}</h5>
+    </div>
+    <a class="visible-xs-block" id="{{WidgetId}}-collapse" data-toggle="collapse" href="#{{WidgetId}}-section" aria-expanded="true" aria-controls="{{WidgetId}}-section">
+        <div class="box-title">
+            <h5><i class="fa fa-chevron-circle-right"></i>&nbsp;&nbsp;{{WidgetName}}</h5>
+        </div>
+    </a>
+    <div class="collapse in" id="{{WidgetId}}-section">
+        {{#if error}}
+            <div class="box-content">{{error}}</div>
+        {{else}}
+            <div class="box-content wa-content">
+                <h4 class="wa-date">{{DisplayDate}}</h4>
+                <!--TILES-->
+            </div>
+        {{/if}}
+    </div>
+</div>
+
+<style>
+.topradius {
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+}
+
+.bg-dkblu-gradient {
+    border: 0;
+    background: linear-gradient(60deg, #012B58, #019CFF);
+    color: white;
+}
+
+.bg-dkblu-gradient a {
+    color: white;
+}
+
+.wa-content {
+    padding-bottom: 16px;
+}
+
+.wa-date {
+    margin: 0 0 12px 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: #001429;
+}
+
+.wa-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.wa-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 12px 12px 14px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+    min-height: 132px;
+    text-decoration: none !important;
+    color: inherit;
+    box-sizing: border-box;
+}
+
+a.wa-tile:hover {
+    text-decoration: none !important;
+}
+
+.wa-tile-inperson {
+    border-top: 4px solid #012B58;
+}
+
+.wa-tile-online {
+    border-top: 4px solid #019CFF;
+}
+
+.wa-tile-total {
+    border-top: 4px solid #005C3B;
+}
+
+a.wa-tile-online:hover {
+    box-shadow: 0 0 0 1px #019CFF;
+}
+
+.wa-tile-label {
+    display: table;
+    width: 100%;
+    height: 2.6em;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: #64748b;
+    line-height: 1.3;
+}
+
+.wa-tile-label-text {
+    display: table-cell;
+    vertical-align: middle;
+}
+
+.wa-tile-inperson .wa-tile-label { color: #012B58; }
+.wa-tile-online .wa-tile-label { color: #019CFF; }
+.wa-tile-total .wa-tile-label { color: #005C3B; }
+
+.wa-tile-value {
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1.05;
+    color: #001429;
+    margin: 0;
+}
+
+.wa-wow {
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1.2;
+    min-height: 2.4em;
+}
+
+.wa-wow-hint {
+    font-weight: 600;
+    font-size: 11px;
+    color: #64748b;
+}
+
+.wa-wow-up { color: #005C3B; }
+.wa-wow-down { color: #E52300; }
+.wa-wow-flat { color: #64748b; }
+.wa-wow-na { color: #94a3b8; }
+
+.wa-tile-sub {
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    color: #64748b;
+    width: 100%;
+}
+
+.wa-sub-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    color: #64748b;
+    text-decoration: none;
+}
+
+a.wa-sub-row {
+    color: #012B58;
+    font-weight: 600;
+}
+
+a.wa-sub-row:hover {
+    color: #019CFF;
+    text-decoration: none;
+}
+
+a.wa-sub-add {
+    font-size: 13px;
+}
+
+a.wa-sub-add .wa-add-count,
+.wa-tile-value-add {
+    color: #019CFF;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.wa-tile-value-add {
+    font-size: 22px;
+    line-height: 1.2;
+    padding: 6px 0 2px;
+}
+
+a.wa-tile-add:hover .wa-tile-value-add {
+    text-decoration: underline;
+}
+
+.wa-sub-label {
+    text-align: left;
+}
+
+.wa-sub-count {
+    text-align: right;
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+}
+
+.widget-embed .fixed-height-widget {
+    min-height: 290px !important;
+}
+
+.fixed-height-widget .empty-content {
+    min-height: 290px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+@media (max-width: 640px) {
+    .wa-grid {
+        grid-template-columns: 1fr;
+    }
+    .wa-tile {
+        min-height: 0;
+    }
+    .wa-tile-value {
+        font-size: 28px;
+    }
+}
+</style>

@@ -1,0 +1,381 @@
+# Script: WidgetRecentWorshipServicePython
+# Purpose: Homepage widget — latest Sunday worship attendance as three tiles
+#   (In Person, Online, Total) with week-over-week percent deltas.
+# Author: Jake Pierson
+# Date: 2026-09-01
+#
+# Install: Homepage Widgets → this widget → Python Content
+# SQL Special Content name: WidgetRecentWorshipServiceSQL
+#
+# IronPython notes (TouchPoint embeds IronPython 2.7):
+#   - except Exception (no "as"); no f-strings
+#   - prefer concat / token replace over .format() for HTML
+#   - model, q, Data are injected by TouchPoint
+
+import json
+
+TILES_TOKEN = '<!--TILES-->'
+
+
+def _s(val):
+    if val is None:
+        return ''
+    try:
+        return str(val)
+    except:
+        return ''
+
+
+def _i(val):
+    if val is None:
+        return 0
+    try:
+        from System import DBNull
+        if val is DBNull.Value:
+            return 0
+    except:
+        pass
+    try:
+        s = _s(val).strip()
+        if s == '' or s.lower() == 'none':
+            return 0
+        return int(float(s))
+    except:
+        return 0
+
+
+def _is_null(val):
+    if val is None:
+        return True
+    try:
+        from System import DBNull
+        if val is DBNull.Value:
+            return True
+    except:
+        pass
+    try:
+        s = _s(val).strip().lower()
+        return s in ('', 'none', 'null')
+    except:
+        return False
+
+
+def _is_seq_row(row):
+    """True for QuerySqlJsonArray positional rows; false for DynamicData/dict."""
+    if row is None or isinstance(row, dict):
+        return False
+    if isinstance(row, (str, unicode)):
+        return False
+    try:
+        if hasattr(row, 'Keys'):
+            return False
+    except:
+        pass
+    try:
+        len(row)
+        row[0]
+        return True
+    except:
+        return False
+
+
+def _row_val(row, index, *keys):
+    """Read a QuerySql (named) or QuerySqlJsonArray (positional) row."""
+    if row is None:
+        return None
+    # Positional JSON arrays: use index first (no column names).
+    if _is_seq_row(row) and index is not None:
+        try:
+            if index >= 0 and index < len(row):
+                return row[index]
+        except:
+            pass
+        return None
+    if isinstance(row, dict):
+        lower = {}
+        for k in row:
+            lower[_s(k).lower()] = row[k]
+        for key in keys:
+            lk = key.lower()
+            if lk in lower:
+                return lower[lk]
+        return None
+    try:
+        if hasattr(row, 'Keys'):
+            lower = {}
+            for k in row.Keys:
+                lower[_s(k).lower()] = row[k]
+            for key in keys:
+                lk = key.lower()
+                if lk in lower:
+                    return lower[lk]
+    except:
+        pass
+    for key in keys:
+        try:
+            if hasattr(row, key):
+                return getattr(row, key)
+        except:
+            pass
+        try:
+            v = getattr(row, key, None)
+            if v is not None:
+                return v
+        except:
+            pass
+    return None
+
+
+def _parse_rows(raw):
+    if raw is None:
+        return []
+    data = raw
+    try:
+        if isinstance(raw, (str, unicode)):
+            data = json.loads(raw)
+    except:
+        try:
+            data = json.loads(_s(raw))
+        except:
+            return []
+    if data is None:
+        return []
+    try:
+        return list(data)
+    except:
+        return []
+
+
+def _load_rows(sql):
+    # Prefer QuerySql: named columns. QuerySqlJsonArray is positional-only.
+    try:
+        rows = list(q.QuerySql(sql))
+        if rows:
+            return rows
+    except Exception:
+        pass
+    try:
+        raw = q.QuerySqlJsonArray(sql)
+        rows = _parse_rows(raw)
+        if rows:
+            return rows
+    except Exception:
+        pass
+    return []
+
+
+def _esc(val):
+    s = _s(val)
+    s = s.replace('&', '&amp;')
+    s = s.replace('<', '&lt;')
+    s = s.replace('>', '&gt;')
+    s = s.replace('"', '&quot;')
+    return s
+
+
+def _wow_pct(current, prior):
+    """Percent vs previous calendar Sunday. Undefined when prior is 0."""
+    if prior is None or prior == 0:
+        return '&mdash;', 'wa-wow-na', 'No attendance on the prior Sunday'
+    pct = int(round(100.0 * float(current - prior) / float(prior)))
+    if pct > 0:
+        return '+' + str(pct) + '%', 'wa-wow-up', 'Up from the prior Sunday'
+    if pct < 0:
+        return str(pct) + '%', 'wa-wow-down', 'Down from the prior Sunday'
+    return '0%', 'wa-wow-flat', 'Same as the prior Sunday'
+
+
+def _meeting_meta(meeting_id):
+    """Return (url, needs_count) from a signed MeetingId.
+
+    SQL returns a negative MeetingId when HeadCount is still NULL.
+    Absolute value is the real /Meeting/{id} target.
+    """
+    mid = _i(meeting_id)
+    if mid == 0:
+        return '', False
+    needs = mid < 0
+    return '/Meeting/' + str(abs(mid)), needs
+
+
+def _needs_count(flag, url, signed_needs=False):
+    """True when a meeting exists and HeadCount has not been entered (NULL).
+
+    Prefer the signed MeetingId flag (signed_needs). Fall back to the
+    never-null Nine/Eleven/OnlineNeedsCount column when present.
+    """
+    if not url:
+        return False
+    if signed_needs:
+        return True
+    return _i(flag) == 1
+
+
+ADD_HEAD_COUNT = 'Add Head Count'
+
+
+def _service_line(label, count, url, needs_count):
+    inner = '<span class="wa-sub-label">' + _esc(label) + '</span>'
+    if needs_count:
+        inner += '<span class="wa-sub-count wa-add-count">' + ADD_HEAD_COUNT + '</span>'
+        title = 'Add head count for this meeting'
+        row_cls = 'wa-sub-row wa-sub-add'
+    else:
+        inner += '<span class="wa-sub-count">' + str(count) + '</span>'
+        title = 'Open this meeting'
+        row_cls = 'wa-sub-row'
+    if not url:
+        return '<div class="wa-sub-row">' + inner + '</div>'
+    html = '<a class="' + row_cls + '" href="' + _esc(url)
+    html += '" target="_blank" rel="noopener" title="' + _esc(title) + '">'
+    html += inner + '</a>'
+    return html
+
+
+def _wow_block(current, prior, incomplete=False):
+    if incomplete:
+        text, cls, title = (
+            '&mdash;',
+            'wa-wow-na',
+            'Head count not entered yet',
+        )
+    else:
+        text, cls, title = _wow_pct(current, prior)
+    html = '<div class="wa-wow ' + cls + '" title="' + _esc(title) + '">'
+    if cls == 'wa-wow-na':
+        html += text
+    else:
+        html += _esc(text)
+    html += '<span class="wa-wow-hint"> vs last week</span>'
+    html += '</div>'
+    return html
+
+
+def _tile_open(mod, url, needs_count=False):
+    if url:
+        title = 'Add head count for this meeting' if needs_count else 'Open this meeting'
+        extra = ' wa-tile-add' if needs_count else ''
+        html = '<a class="wa-tile ' + mod + extra + '" href="' + _esc(url)
+        html += '" target="_blank" rel="noopener" title="' + _esc(title) + '">'
+        return html, '</a>'
+    return '<div class="wa-tile ' + mod + '">', '</div>'
+
+
+def _tiles_html(row):
+    nine = _i(_row_val(row, 1, 'NineAMAttendance'))
+    eleven = _i(_row_val(row, 2, 'ElevenAMAttendance'))
+    online = _i(_row_val(row, 3, 'OnlineAttendance'))
+    in_person = _row_val(row, 4, 'InPersonAttendance')
+    total = _row_val(row, 5, 'TotalAttendance')
+    in_person = nine + eleven if in_person is None else _i(in_person)
+    total = in_person + online if total is None else _i(total)
+
+    prior_nine = _i(_row_val(row, 6, 'PriorNineAMAttendance'))
+    prior_eleven = _i(_row_val(row, 7, 'PriorElevenAMAttendance'))
+    prior_online = _i(_row_val(row, 8, 'PriorOnlineAttendance'))
+    prior_in = _row_val(row, 9, 'PriorInPersonAttendance')
+    prior_total = _row_val(row, 10, 'PriorTotalAttendance')
+    prior_in = prior_nine + prior_eleven if prior_in is None else _i(prior_in)
+    prior_total = prior_in + prior_online if prior_total is None else _i(prior_total)
+
+    # Indices 11-13: MeetingId; negative means HeadCount is still NULL.
+    nine_url, nine_signed = _meeting_meta(
+        _row_val(row, 11, 'NineMeetingId'))
+    eleven_url, eleven_signed = _meeting_meta(
+        _row_val(row, 12, 'ElevenMeetingId'))
+    online_url, online_signed = _meeting_meta(
+        _row_val(row, 13, 'OnlineMeetingId'))
+    # Indices 14-16: never-null NeedsCount flags (backup if present).
+    nine_needs = _needs_count(
+        _row_val(row, 14, 'NineNeedsCount'), nine_url, nine_signed)
+    eleven_needs = _needs_count(
+        _row_val(row, 15, 'ElevenNeedsCount'), eleven_url, eleven_signed)
+    online_needs = _needs_count(
+        _row_val(row, 16, 'OnlineNeedsCount'), online_url, online_signed)
+    in_person_incomplete = nine_needs or eleven_needs
+    total_incomplete = in_person_incomplete or online_needs
+
+    html = '<div class="wa-grid">'
+
+    # In Person: two meetings, so the tile is not a single link.
+    # 9:00 / 11:00 subtext each open that meeting (Add count if HeadCount is NULL).
+    open_tag, close_tag = _tile_open('wa-tile-inperson', '')
+    html += open_tag
+    html += '<div class="wa-tile-label"><span class="wa-tile-label-text">In Person</span></div>'
+    html += '<div class="wa-tile-value">' + str(in_person) + '</div>'
+    html += _wow_block(in_person, prior_in, in_person_incomplete)
+    html += '<div class="wa-tile-sub">'
+    html += _service_line('9:00 AM', nine, nine_url, nine_needs)
+    html += _service_line('11:00 AM', eleven, eleven_url, eleven_needs)
+    html += '</div>'
+    html += close_tag
+
+    open_tag, close_tag = _tile_open('wa-tile-online', online_url, online_needs)
+    html += open_tag
+    html += '<div class="wa-tile-label"><span class="wa-tile-label-text">Online</span></div>'
+    if online_needs:
+        html += '<div class="wa-tile-value wa-tile-value-add">' + ADD_HEAD_COUNT + '</div>'
+    else:
+        html += '<div class="wa-tile-value">' + str(online) + '</div>'
+    html += _wow_block(online, prior_online, online_needs)
+    html += close_tag
+
+    # Total is a sum of meetings, so there is no single meeting URL.
+    open_tag, close_tag = _tile_open('wa-tile-total', '')
+    html += open_tag
+    html += '<div class="wa-tile-label"><span class="wa-tile-label-text">Total Attendance</span></div>'
+    html += '<div class="wa-tile-value">' + str(total) + '</div>'
+    html += _wow_block(total, prior_total, total_incomplete)
+    html += close_tag
+
+    html += '</div>'
+    return html
+
+
+def _widget_sql():
+    """Prefer the SQL linked on the homepage widget (Data.SQLContent).
+
+    Fall back to Special Content by name for older installs.
+    """
+    try:
+        body = getattr(Data, 'SQLContent', None)
+        if body:
+            return _s(body)
+    except:
+        pass
+    try:
+        return model.SqlContent('WidgetRecentWorshipServiceSQL')
+    except:
+        return ''
+
+
+def Get():
+    Data.DisplayDate = ''
+
+    sql = _widget_sql()
+    rows = _load_rows(sql)
+    tiles = ''
+
+    if not rows:
+        Data.error = 'No Sunday worship meetings found.'
+    else:
+        row = rows[0]
+        Data.DisplayDate = _s(_row_val(row, 0, 'DisplayDate', 'Date'))
+        Data.NineAMAttendance = _i(_row_val(row, 1, 'NineAMAttendance'))
+        Data.ElevenAMAttendance = _i(_row_val(row, 2, 'ElevenAMAttendance'))
+        Data.OnlineAttendance = _i(_row_val(row, 3, 'OnlineAttendance'))
+        Data.InPersonAttendance = _i(_row_val(row, 4, 'InPersonAttendance'))
+        Data.TotalAttendance = _i(_row_val(row, 5, 'TotalAttendance'))
+        if not Data.InPersonAttendance:
+            Data.InPersonAttendance = Data.NineAMAttendance + Data.ElevenAMAttendance
+        if not Data.TotalAttendance:
+            Data.TotalAttendance = (
+                Data.InPersonAttendance + Data.OnlineAttendance
+            )
+        tiles = _tiles_html(row)
+
+    html = model.RenderTemplate(Data.HTMLContent)
+    print(html.replace(TILES_TOKEN, tiles))
+
+
+Get()

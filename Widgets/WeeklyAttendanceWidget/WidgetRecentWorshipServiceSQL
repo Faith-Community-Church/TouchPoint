@@ -1,0 +1,189 @@
+-- Script: WidgetRecentWorshipServiceSQL
+-- Purpose: Latest Sunday worship HeadCounts plus the previous calendar
+--   Sunday (zeros if no meetings) for the homepage Weekly Attendance widget.
+-- Author: Jake Pierson
+-- Date: 2026-09-01
+--
+-- Install: Special Content (SQL) linked on the homepage widget Data (SQL)
+--   dropdown. Prefer name WidgetRecentWorshipServiceSQL.
+--   Python uses Data.SQLContent, then falls back to that name.
+--
+-- Config: set the involvement IDs and service hours below to match production.
+-- Sunday is DATEFIRST-independent: (WEEKDAY + @@DATEFIRST - 1) % 7 = 0.
+
+DECLARE @OnsiteOrgId INT = 35;
+DECLARE @OnlineOrgId INT = 466;
+DECLARE @NineHour INT = 9;
+DECLARE @ElevenHour INT = 11;
+
+WITH LatestDate AS (
+    SELECT MAX(CAST(m.MeetingDate AS DATE)) AS LatestMeeting
+    FROM dbo.Meetings AS m
+    WHERE m.OrganizationId IN (@OnsiteOrgId, @OnlineOrgId)
+        AND m.MeetingDate IS NOT NULL
+        AND ISNULL(m.DidNotMeet, 0) = 0
+        AND ((DATEPART(WEEKDAY, m.MeetingDate) + @@DATEFIRST - 1) % 7) = 0
+),
+TargetDays AS (
+    SELECT
+        ld.LatestMeeting AS MeetingDay,
+        CAST(1 AS INT) AS IsLatest
+    FROM LatestDate AS ld
+    WHERE ld.LatestMeeting IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        DATEADD(DAY, -7, ld.LatestMeeting) AS MeetingDay,
+        CAST(0 AS INT) AS IsLatest
+    FROM LatestDate AS ld
+    WHERE ld.LatestMeeting IS NOT NULL
+),
+RankedMeetings AS (
+    SELECT
+        m.MeetingId,
+        CAST(m.MeetingDate AS DATE) AS MeetingDay,
+        m.OrganizationId,
+        DATEPART(HOUR, m.MeetingDate) AS MeetingHour,
+        ISNULL(m.HeadCount, 0) AS HeadCount,
+        CASE WHEN m.HeadCount IS NULL THEN 1 ELSE 0 END AS NeedsCount,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                m.OrganizationId,
+                CAST(m.MeetingDate AS DATE),
+                DATEPART(HOUR, m.MeetingDate)
+            ORDER BY m.MeetingDate DESC
+        ) AS RowNum
+    FROM dbo.Meetings AS m
+    INNER JOIN TargetDays AS td
+        ON td.MeetingDay = CAST(m.MeetingDate AS DATE)
+    WHERE m.OrganizationId IN (@OnsiteOrgId, @OnlineOrgId)
+        AND ISNULL(m.DidNotMeet, 0) = 0
+),
+Deduped AS (
+    SELECT
+        rm.MeetingId,
+        rm.MeetingDay,
+        rm.OrganizationId,
+        rm.MeetingHour,
+        rm.HeadCount,
+        rm.NeedsCount
+    FROM RankedMeetings AS rm
+    WHERE rm.RowNum = 1
+),
+ByDay AS (
+    SELECT
+        td.MeetingDay,
+        td.IsLatest,
+        SUM(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @NineHour
+                    THEN d.HeadCount
+                ELSE 0
+            END
+        ) AS NineAMAttendance,
+        SUM(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @ElevenHour
+                    THEN d.HeadCount
+                ELSE 0
+            END
+        ) AS ElevenAMAttendance,
+        SUM(
+            CASE
+                WHEN d.OrganizationId = @OnlineOrgId
+                    THEN d.HeadCount
+                ELSE 0
+            END
+        ) AS OnlineAttendance,
+        MAX(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @NineHour
+                    THEN d.MeetingId
+            END
+        ) AS NineMeetingId,
+        MAX(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @ElevenHour
+                    THEN d.MeetingId
+            END
+        ) AS ElevenMeetingId,
+        MAX(
+            CASE
+                WHEN d.OrganizationId = @OnlineOrgId
+                    THEN d.MeetingId
+            END
+        ) AS OnlineMeetingId,
+        -- Never-null 0/1 flags (NULL columns get dropped by QuerySql DynamicData).
+        CAST(ISNULL(MAX(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @NineHour
+                    THEN d.NeedsCount
+            END
+        ), 0) AS INT) AS NineNeedsCount,
+        CAST(ISNULL(MAX(
+            CASE
+                WHEN d.OrganizationId = @OnsiteOrgId
+                    AND d.MeetingHour = @ElevenHour
+                    THEN d.NeedsCount
+            END
+        ), 0) AS INT) AS ElevenNeedsCount,
+        CAST(ISNULL(MAX(
+            CASE
+                WHEN d.OrganizationId = @OnlineOrgId
+                    THEN d.NeedsCount
+            END
+        ), 0) AS INT) AS OnlineNeedsCount
+    FROM TargetDays AS td
+    LEFT JOIN Deduped AS d
+        ON d.MeetingDay = td.MeetingDay
+    GROUP BY td.MeetingDay, td.IsLatest
+)
+SELECT
+    FORMAT(cur.MeetingDay, 'MMMM dd, yyyy') AS DisplayDate,
+    ISNULL(cur.NineAMAttendance, 0) AS NineAMAttendance,
+    ISNULL(cur.ElevenAMAttendance, 0) AS ElevenAMAttendance,
+    ISNULL(cur.OnlineAttendance, 0) AS OnlineAttendance,
+    ISNULL(cur.NineAMAttendance, 0)
+    + ISNULL(cur.ElevenAMAttendance, 0) AS InPersonAttendance,
+    ISNULL(cur.NineAMAttendance, 0)
+    + ISNULL(cur.ElevenAMAttendance, 0)
+    + ISNULL(cur.OnlineAttendance, 0) AS TotalAttendance,
+    ISNULL(prior.NineAMAttendance, 0) AS PriorNineAMAttendance,
+    ISNULL(prior.ElevenAMAttendance, 0) AS PriorElevenAMAttendance,
+    ISNULL(prior.OnlineAttendance, 0) AS PriorOnlineAttendance,
+    ISNULL(prior.NineAMAttendance, 0)
+    + ISNULL(prior.ElevenAMAttendance, 0) AS PriorInPersonAttendance,
+    ISNULL(prior.NineAMAttendance, 0)
+    + ISNULL(prior.ElevenAMAttendance, 0)
+    + ISNULL(prior.OnlineAttendance, 0) AS PriorTotalAttendance,
+    -- Negative MeetingId = meeting exists but HeadCount is still NULL.
+    -- Python already reads these IDs successfully; packing the flag here
+    -- avoids depending on separate NeedsCount columns surviving QuerySql.
+    CASE
+        WHEN ISNULL(cur.NineMeetingId, 0) = 0 THEN 0
+        WHEN ISNULL(cur.NineNeedsCount, 0) = 1 THEN -cur.NineMeetingId
+        ELSE cur.NineMeetingId
+    END AS NineMeetingId,
+    CASE
+        WHEN ISNULL(cur.ElevenMeetingId, 0) = 0 THEN 0
+        WHEN ISNULL(cur.ElevenNeedsCount, 0) = 1 THEN -cur.ElevenMeetingId
+        ELSE cur.ElevenMeetingId
+    END AS ElevenMeetingId,
+    CASE
+        WHEN ISNULL(cur.OnlineMeetingId, 0) = 0 THEN 0
+        WHEN ISNULL(cur.OnlineNeedsCount, 0) = 1 THEN -cur.OnlineMeetingId
+        ELSE cur.OnlineMeetingId
+    END AS OnlineMeetingId,
+    ISNULL(cur.NineNeedsCount, 0) AS NineNeedsCount,
+    ISNULL(cur.ElevenNeedsCount, 0) AS ElevenNeedsCount,
+    ISNULL(cur.OnlineNeedsCount, 0) AS OnlineNeedsCount
+FROM ByDay AS cur
+LEFT JOIN ByDay AS prior
+    ON prior.IsLatest = 0
+WHERE cur.IsLatest = 1;
