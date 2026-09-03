@@ -1029,18 +1029,20 @@ def _get_option_people(org_id, question_id, option_value):
 
 
 def _get_roster_people(org_id):
-    """All current org members with enrollment (join) date."""
+    """All current org members with enrollment date and gender."""
     sql = """
 SELECT
     pe.PeopleId,
     ISNULL(pe.Name2, LTRIM(RTRIM(ISNULL(pe.FirstName,'') + ' ' + ISNULL(pe.LastName,'')))) AS PersonName,
-    om.EnrollmentDate,
+    ISNULL(g.Description, '') AS GenderName,
     CASE
         WHEN om.EnrollmentDate IS NULL THEN ''
         ELSE CONVERT(varchar(10), om.EnrollmentDate, 101)
-    END AS JoinedDate
+    END AS JoinedDate,
+    ISNULL(CONVERT(varchar(8), om.EnrollmentDate, 112), '99999999') AS JoinedSort
 FROM OrganizationMembers om
 INNER JOIN People pe ON pe.PeopleId = om.PeopleId
+LEFT JOIN lookup.Gender g ON g.Id = pe.GenderId
 WHERE om.OrganizationId = @orgId
 ORDER BY PersonName
 """
@@ -1052,7 +1054,9 @@ ORDER BY PersonName
         people.append({
             'people_id': _i(r.PeopleId),
             'name': _s(r.PersonName),
+            'gender': _s(r.GenderName),
             'joined': _s(r.JoinedDate),
+            'joined_sort': _s(r.JoinedSort),
         })
     return {
         'count': len(people),
@@ -3190,7 +3194,10 @@ else:
     function initDashboard() {
         var scriptUrl = window.location.pathname;
         var currentOrgId = null;
+        var currentDashData = null;
         var currentShowContacts = false;
+        var rosterNameMap = {};        // people_id -> name; populated by loadRoster, used by .roster-qa-btn handler
+        var pendingRosterQA = null;    // { pid, pname } set by .roster-qa-btn; consumed by loadRegistration callback
         var initialOrgId = __INITIAL_ORG_ID__;
         var initialOrgName = __INITIAL_ORG_NAME__;
         var regState = { view: 'summary', question: null, option: null, person: null, summary: null };
@@ -3500,6 +3507,16 @@ else:
                 e.preventDefault();
                 runOrgSearch(true);
             }
+        });
+
+        // Roster tab Q&A button: switch to Registration tab and open person's answers inline.
+        // Uses pendingRosterQA so openPerson() fires only after the registration summary has loaded,
+        // avoiding the setTimeout race condition on slow connections.
+        $(document).on('click', '.roster-qa-btn', function() {
+            var pid = $(this).data('pid');
+            var pname = rosterNameMap[pid] || '';
+            pendingRosterQA = { pid: pid, pname: pname };
+            $('.dash-tab[data-tab="registration"]').trigger('click');
         });
 
         $(document).on('click', '.search-result-item', function() {
@@ -3877,6 +3894,7 @@ else:
                     alert('Error: ' + data.error + (data.traceback ? '\n\n' + data.traceback : ''));
                     return;
                 }
+                currentDashData = data;
 
                 $('#org-name').html(
                     '<a href="/Org/' + esc(String(currentOrgId || orgId)) + '" target="_blank" rel="noopener noreferrer">' +
@@ -4135,16 +4153,76 @@ else:
                     return;
                 }
                 var ids = collectPeopleIds(people);
+                var showQA = currentDashData && currentDashData.is_registration_form;
                 var html = '<div class="reg-meta" style="margin-bottom:14px;">Members: <strong>' +
                     people.length + '</strong></div>';
                 html += drillActionsHtml({ peopleIds: ids });
-                html += '<table class="people-table"><thead><tr><th>Person</th><th>Date Joined</th></tr></thead><tbody>';
-                people.forEach(function(p) {
-                    html += '<tr><td>' + personLink(p.people_id, p.name) + '</td><td>' +
-                        esc(p.joined || '') + '</td></tr>';
-                });
-                html += '</tbody></table>';
+
+                // Sortable table: store data as JS array then render
+                var cols = [
+                    { key: 'name',   label: 'Person',      type: 'str' },
+                    { key: 'gender', label: 'Gender',      type: 'str' },
+                    { key: 'joined_sort', label: 'Date Joined', type: 'str' },
+                ];
+                if (showQA) cols.push({ key: 'qa', label: 'Q&amp;A', type: 'none' });
+
+                var rosterSort = { col: 'name', dir: 1 };
+                var rosterPeople = people;
+                // Populate outer rosterNameMap for use by the delegated .roster-qa-btn click handler
+                rosterNameMap = {};
+                people.forEach(function(p) { rosterNameMap[p.people_id] = p.name; });
+
+                function renderRosterTable() {
+                    var sorted = rosterPeople.slice();
+                    if (rosterSort.col !== 'qa') {
+                        sorted.sort(function(a, b) {
+                            var av = (a[rosterSort.col] || '').toLowerCase();
+                            var bv = (b[rosterSort.col] || '').toLowerCase();
+                            if (av < bv) return -1 * rosterSort.dir;
+                            if (av > bv) return 1 * rosterSort.dir;
+                            return 0;
+                        });
+                    }
+                    var th = '<thead><tr>';
+                    cols.forEach(function(c) {
+                        if (c.type === 'none') {
+                            th += '<th>' + c.label + '</th>';
+                        } else {
+                            var arrow = '';
+                            if (rosterSort.col === c.key) arrow = rosterSort.dir === 1 ? ' ▲' : ' ▼';
+                            th += '<th class="sortable-th" data-sort-key="' + c.key + '" style="cursor:pointer;white-space:nowrap;">' +
+                                  c.label + arrow + '</th>';
+                        }
+                    });
+                    th += '</tr></thead>';
+                    var tb = '<tbody>';
+                    sorted.forEach(function(p) {
+                        tb += '<tr>';
+                        tb += '<td>' + personLink(p.people_id, p.name) + '</td>';
+                        tb += '<td>' + esc(p.gender || '') + '</td>';
+                        tb += '<td>' + esc(p.joined || '') + '</td>';
+                        if (showQA) {
+                            // data-pid only — name looked up from rosterNameMap to avoid attribute quoting issues
+                            tb += '<td><button type="button" class="roster-qa-btn" data-pid="' + p.people_id +
+                                  '" style="background:none;border:none;color:#019cff;' +
+                                  'cursor:pointer;text-decoration:underline;padding:0;">Q&amp;A</button></td>';
+                        }
+                        tb += '</tr>';
+                    });
+                    tb += '</tbody>';
+                    $('#roster-table-wrap').html('<table class="people-table">' + th + tb + '</table>');
+                    // Re-bind sort clicks
+                    $('#roster-table-wrap .sortable-th').on('click', function() {
+                        var k = $(this).data('sort-key');
+                        if (rosterSort.col === k) { rosterSort.dir *= -1; }
+                        else { rosterSort.col = k; rosterSort.dir = 1; }
+                        renderRosterTable();
+                    });
+                }
+
+                html += '<div id="roster-table-wrap"></div>';
                 $('#roster-view').html(html);
+                renderRosterTable();
             }, { showLoading: true });
         }
 
@@ -4226,6 +4304,12 @@ else:
                 regState.option = null;
                 regState.person = null;
                 renderRegistrationSummary(data);
+                // Consume any pending Q&A intent from the Roster tab (avoids setTimeout race)
+                if (pendingRosterQA) {
+                    var intent = pendingRosterQA;
+                    pendingRosterQA = null;
+                    openPerson(intent.pid, intent.pname);
+                }
             }, { showLoading: true });
         }
 
