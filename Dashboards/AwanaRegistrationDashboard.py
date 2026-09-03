@@ -95,11 +95,20 @@ CLUB_ORG_CFG_KEYS = {
 # MeetingIds (comma-separated in Config) that count as in-person training.
 # Present attendance on any of these fills Volunteer Management + Extra Values.
 INPERSON_MEETING_IDS = []
+# Prior-year Awana involvement IDs (comma-separated in Config).
+# Used for "New to Awana" — current clubbers not found on these orgs
+# (OrganizationMembers or EnrollmentTransaction join history).
+PRIOR_AWANA_ORG_IDS = []
 # Application involvements (IsMemberOf any of these = application on file)
 APP_ORG_IDS = (502, 529, 1742, 1780)
 EV_AWANA_HANDBOOK = 'Awana Handbook Signed'
 EV_AWANA_INPERSON = 'Awana In Person Training'
 EV_MINOR_INPERSON = 'Minor_Child_Protection_Training_Date'
+# Registration Form text question (Sparks / T&T Boys / T&T Girls).
+SPECIAL_REQUEST_QUESTION_LABEL = (
+    'Please list any special requests, such as a specific leader or buddy:'
+)
+SPECIAL_REQUEST_CLUB_KEYS = ('sparks', 'tnt-girls', 'tnt-boys')
 BG_REPORT_PMM = 1
 BG_REPORT_MS_TRAINING = 3
 BG_STATUS_COMPLETE = 3
@@ -713,6 +722,9 @@ def _awana_overview_payload():
         'show_config_tab': _user_is_admin(),
         'male_count': 0,
         'female_count': 0,
+        'new_to_awana_count': 0,
+        'prior_awana_configured': len(PRIOR_AWANA_ORG_IDS or []) > 0,
+        'prior_awana_org_ids': _meeting_ids_csv(PRIOR_AWANA_ORG_IDS),
         'grades': [],
         'enrollment_timeline': {},
         'transactions': {
@@ -765,6 +777,11 @@ def _awana_overview_payload():
     result['total_members'] = len(members)
     result['male_count'] = len([m for m in members if m['gender_id'] == 1])
     result['female_count'] = len([m for m in members if m['gender_id'] == 2])
+    if result['prior_awana_configured']:
+        prior = _prior_awana_people_id_set()
+        result['new_to_awana_count'] = len([
+            pid for pid in by_pid.keys() if pid not in prior
+        ])
 
     grade_counts = {}
     grade_sort = {}
@@ -1122,6 +1139,7 @@ def _default_config():
         'tnt_girls_org': 0,
         'tnt_boys_org': 0,
         'inperson_meeting_ids': '',
+        'prior_awana_org_ids': '',
     }
 
 
@@ -1132,12 +1150,14 @@ def _current_config():
     for key, cfg_key in CLUB_ORG_CFG_KEYS.items():
         cfg[cfg_key] = _i(CLUB_ORG_IDS.get(key), 0)
     cfg['inperson_meeting_ids'] = _meeting_ids_csv(INPERSON_MEETING_IDS)
+    cfg['prior_awana_org_ids'] = _meeting_ids_csv(PRIOR_AWANA_ORG_IDS)
     return cfg
 
 
 def _apply_config(cfg):
-    """Refresh module-level org IDs and in-person meeting list."""
+    """Refresh module-level org IDs, in-person meetings, and prior-year orgs."""
     global CLUBBERS_ORG_ID, VOLUNTEERS_ORG_ID, CLUB_ORG_IDS, INPERSON_MEETING_IDS
+    global PRIOR_AWANA_ORG_IDS
     defaults = _default_config()
     if not cfg:
         cfg = defaults
@@ -1151,6 +1171,7 @@ def _apply_config(cfg):
         next_ids[key] = val if val > 0 else 0
     CLUB_ORG_IDS = next_ids
     INPERSON_MEETING_IDS = _parse_meeting_ids(cfg.get('inperson_meeting_ids'))
+    PRIOR_AWANA_ORG_IDS = _parse_meeting_ids(cfg.get('prior_awana_org_ids'))
 
 
 def _load_settings():
@@ -1206,6 +1227,10 @@ WHERE Section = @section AND Id1 = @id1 AND Id2 = '' AND Id3 = '' AND Id4 = ''
         if ak in data:
             cfg['inperson_meeting_ids'] = _meeting_ids_csv(_parse_meeting_ids(data.get(ak)))
             break
+    for ak in ('PriorAwanaOrgIds', 'prior_awana_org_ids', 'PriorAwanaOrgs'):
+        if ak in data:
+            cfg['prior_awana_org_ids'] = _meeting_ids_csv(_parse_meeting_ids(data.get(ak)))
+            break
     return cfg
 
 
@@ -1220,6 +1245,7 @@ def _persist_settings(cfg):
         dd.AddValue('TntGirlsOrg', cfg['tnt_girls_org'])
         dd.AddValue('TntBoysOrg', cfg['tnt_boys_org'])
         dd.AddValue('InPersonMeetingIds', _s(cfg.get('inperson_meeting_ids')))
+        dd.AddValue('PriorAwanaOrgIds', _s(cfg.get('prior_awana_org_ids')))
         model.AddUpdateJsonRecord(dd, JSON_SECTION, SETTINGS_ID1)
         return True, 'Settings saved.'
     except Exception, ex:
@@ -1266,6 +1292,7 @@ def _save_settings_from_request():
         val = _i(_data(cfg_key), 0)
         cfg[cfg_key] = val if val > 0 else 0
     cfg['inperson_meeting_ids'] = _meeting_ids_csv(_parse_meeting_ids(_data('inperson_meeting_ids')))
+    cfg['prior_awana_org_ids'] = _meeting_ids_csv(_parse_meeting_ids(_data('prior_awana_org_ids')))
     ok, msg = _persist_settings(cfg)
     if not ok:
         return {'error': msg}
@@ -2005,7 +2032,9 @@ ORDER BY [Order], Label
 
 
 def _answers_for_registrants(org_id, question_ids, subgroup_id=0):
-    """All answers for completed registrants (most recent per person) for given questions."""
+    """All answers for completed registrants (most recent per person) for given questions.
+    Filters to active clubber members (attend type = Member, not on Volunteers).
+    Used by Registration summary / overview tabs."""
     if not question_ids:
         return []
     tag_id = _i(subgroup_id, 0)
@@ -2372,6 +2401,130 @@ ORDER BY PersonName
     }
 
 
+def _is_special_request_question_label(label):
+    """Match the Special Requests registration question (exact or close label)."""
+    lab = _s(label).strip().lower().rstrip(':').strip()
+    if not lab:
+        return False
+    target = SPECIAL_REQUEST_QUESTION_LABEL.lower().rstrip(':').strip()
+    if lab == target:
+        return True
+    if 'special request' in lab:
+        return True
+    return False
+
+
+def _special_request_label_score(label):
+    """Higher score = closer match to the Special Requests question label."""
+    lab = _s(label).strip().lower().rstrip(':').strip()
+    if not lab:
+        return 0
+    target = SPECIAL_REQUEST_QUESTION_LABEL.lower().rstrip(':').strip()
+    if lab == target:
+        return 100
+    if 'special request' in lab:
+        return 50
+    return 0
+
+
+def _find_special_request_from_summary(summary):
+    """
+    Pick the Special Requests question the same way Registration Questions does:
+    from the overview summary, prefer exact label + most answered.
+    Returns (question_dict or None).
+    """
+    if not summary or summary.get('error') or not summary.get('is_registration_form'):
+        return None
+    best = None
+    best_key = None  # (label_score, answered, is_text)
+    for qitem in summary.get('questions') or []:
+        label_score = _special_request_label_score(qitem.get('label'))
+        if label_score <= 0:
+            continue
+        answered = _i(qitem.get('answered'), 0)
+        is_text = 1 if _s(qitem.get('kind')) == 'text' or _i(qitem.get('type_id'), 0) == QTYPE_TEXT else 0
+        key = (label_score, answered, is_text)
+        if best is None or key > best_key:
+            best = qitem
+            best_key = key
+    return best
+
+
+def _get_special_requests(org_id, subgroup_id=0):
+    """
+    All clubbers in this source with Special Requests answer (blank if none).
+    Unlike allergies, empty answers are included.
+
+    Resolves the question via Registration Questions summary, then loads answers
+    through _get_text_answers — the same path as the working drill-down view.
+    """
+    org_id = _i(org_id, 0)
+    subgroup_id = _i(subgroup_id, 0)
+    roster = _get_club_roster(org_id, subgroup_id, members_only=True)
+    people = roster.get('people') or []
+
+    reg_org_id = org_id
+    reg_subgroup_id = subgroup_id
+    summary = _build_registration_summary(org_id, subgroup_id)
+    qitem = _find_special_request_from_summary(summary)
+
+    # Dedicated club org may not host the form — fall back to Clubbers
+    if not qitem and org_id != CLUBBERS_ORG_ID:
+        reg_org_id = CLUBBERS_ORG_ID
+        reg_subgroup_id = 0
+        summary = _build_registration_summary(CLUBBERS_ORG_ID, 0)
+        qitem = _find_special_request_from_summary(summary)
+
+    answers_by_pid = {}
+    question_label = SPECIAL_REQUEST_QUESTION_LABEL
+    question_id = ''
+    summary_answered = 0
+    text_error = ''
+    if qitem:
+        question_label = _s(qitem.get('label'), SPECIAL_REQUEST_QUESTION_LABEL)
+        question_id = _s(qitem.get('id'))
+        summary_answered = _i(qitem.get('answered'), 0)
+        text_data = _get_text_answers(reg_org_id, question_id, reg_subgroup_id)
+        if text_data.get('error'):
+            text_error = _s(text_data.get('error'))
+        else:
+            for row in text_data.get('answered_people') or []:
+                pid = _i(row.get('people_id'), 0)
+                ans = _s(row.get('answer'))
+                if pid > 0 and ans:
+                    # String keys avoid IronPython int/long dict-key mismatches
+                    answers_by_pid[str(pid)] = ans
+
+    out = []
+    with_request = 0
+    for p in people:
+        pid = _i(p.get('people_id'), 0)
+        req = _s(answers_by_pid.get(str(pid), ''))
+        if req:
+            with_request += 1
+        out.append({
+            'people_id': pid,
+            'name': _s(p.get('name'), '(Unknown)'),
+            'special_request': req,
+        })
+    return {
+        'people': out,
+        'count': len(out),
+        'with_request_count': with_request,
+        'question_label': question_label,
+        'question_found': qitem is not None,
+        'question_id': question_id,
+        'summary_answered': summary_answered,
+        'text_error': text_error,
+        'org_id': org_id,
+        'subgroup_id': subgroup_id,
+        'reg_org_id': reg_org_id,
+        'reg_subgroup_id': reg_subgroup_id,
+        'answer_match_count': len(answers_by_pid),
+        'roster_hit_count': with_request,
+    }
+
+
 def _get_contact_people(org_id, subgroup_id=0):
     """Org members with parent and/or emergency contact data from RecReg stock fields."""
     tag_id = _i(subgroup_id, 0)
@@ -2687,6 +2840,56 @@ ORDER BY PersonName
     }
 
 
+def _prior_awana_people_id_set():
+    """
+    PeopleIds who appear on any configured prior-year Awana involvement —
+    current OrganizationMembers or EnrollmentTransaction join (type 1).
+    """
+    org_ids = PRIOR_AWANA_ORG_IDS or []
+    if not org_ids:
+        return set()
+    in_list = _meeting_ids_sql_in(org_ids)
+    sql = """
+SELECT DISTINCT x.PeopleId
+FROM (
+    SELECT om.PeopleId
+    FROM dbo.OrganizationMembers om
+    WHERE om.OrganizationId IN ({0})
+    UNION
+    SELECT et.PeopleId
+    FROM dbo.EnrollmentTransaction et
+    WHERE et.OrganizationId IN ({0})
+      AND et.TransactionTypeId = 1
+      AND et.PeopleId IS NOT NULL
+) x
+WHERE x.PeopleId IS NOT NULL
+""".format(in_list)
+    out = set()
+    try:
+        for r in q.QuerySql(sql, _dd()):
+            pid = _i(r.PeopleId, 0)
+            if pid > 0:
+                out.add(pid)
+    except:
+        return set()
+    return out
+
+
+def _annotate_new_to_awana(people):
+    """Set is_new_to_awana / new_to_awana on each person dict; return new count."""
+    prior = _prior_awana_people_id_set()
+    configured = len(PRIOR_AWANA_ORG_IDS or []) > 0
+    new_count = 0
+    for person in people or []:
+        pid = _i(person.get('people_id'), 0)
+        is_new = bool(configured and pid > 0 and pid not in prior)
+        person['is_new_to_awana'] = is_new
+        person['new_to_awana'] = 'Yes' if is_new else ''
+        if is_new:
+            new_count += 1
+    return new_count
+
+
 def _get_master_roster():
     """Union of all club sources (Puggles through T&T), distinct PeopleId."""
     by_pid = {}
@@ -2726,9 +2929,13 @@ def _get_master_roster():
                 if person.get('has_allergy'):
                     existing['has_allergy'] = True
     people = sorted(by_pid.values(), key=lambda x: _s(x.get('name')).lower())
+    new_count = _annotate_new_to_awana(people)
     return {
         'people': people,
         'count': len(people),
+        'new_to_awana_count': new_count,
+        'prior_awana_configured': len(PRIOR_AWANA_ORG_IDS or []) > 0,
+        'prior_awana_org_ids': _meeting_ids_csv(PRIOR_AWANA_ORG_IDS),
     }
 
 
@@ -3785,6 +3992,17 @@ if is_ajax:
         except Exception, e:
             _err_out(e)
 
+    elif action == 'get_special_requests':
+        try:
+            org_id = _i(_data('org_id'), 0)
+            denied = _require_org_access(org_id)
+            if denied:
+                _json_out(denied)
+            else:
+                _json_out(_get_special_requests(org_id, _i(_data('subgroup_id'), 0)))
+        except Exception, e:
+            _err_out(e)
+
     elif action == 'get_option_people':
         try:
             org_id = _i(_data('org_id'), 0)
@@ -4050,6 +4268,7 @@ else:
         margin: 0 auto;
         padding: 20px;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        overflow-x: hidden;
     }
     .selector-card {
         background: white;
@@ -4378,30 +4597,26 @@ else:
         background: #012B58;
         color: #F5F4E8;
     }
-    .dash-tab[data-tab="registration"].active,
-    .club-subtab[data-subtab="registration"].active {
+    .dash-tab[data-tab="registration"].active {
         border-color: #012B58;
         background: #012B58;
         color: #F5F4E8;
     }
-    .dash-tab[data-tab="allergies"].active,
-    .club-subtab[data-subtab="allergies"].active,
-    #roster-subtabs .club-subtab[data-roster-subtab="allergies"].active {
+    .dash-tab[data-tab="allergies"].active {
         border-color: #012B58;
         background: #012B58;
         color: #F5F4E8;
     }
-    .dash-tab[data-tab="contacts"].active,
-    .club-subtab[data-subtab="contacts"].active,
-    #roster-subtabs .club-subtab[data-roster-subtab="contacts"].active {
+    .dash-tab[data-tab="contacts"].active {
         border-color: #012B58;
         background: #012B58;
         color: #F5F4E8;
     }
-    .club-subtab[data-subtab="club-overview"].active {
-        border-color: #012B58;
-        background: #012B58;
-        color: #F5F4E8;
+    #club-subtab-special-requests {
+        display: none;
+    }
+    #club-subtab-special-requests.visible {
+        display: inline-flex;
     }
     .dash-tab[data-tab="roster"].active {
         border-color: #012B58;
@@ -4489,13 +4704,16 @@ else:
     .club-subtab.vol-staff {
         margin-left: auto;
         background: #CCEBFF;
-        border-color: #019CFF;
+        color: #012B58;
+    }
+    .club-subtab.vol-staff:hover {
+        background: #ffffff;
         color: #012B58;
     }
     .club-subtab.vol-staff.active {
-        background: #019CFF;
-        color: #ffffff;
-        border-color: #019CFF;
+        background: #ffffff;
+        color: #012B58;
+        box-shadow: 0 1px 3px rgba(0, 20, 41, 0.12);
     }
     .minor-pill {
         display: inline-block;
@@ -4644,18 +4862,41 @@ else:
     .club-subtabs {
         display: flex;
         flex-wrap: wrap;
-        gap: 8px;
-        margin: 0 0 16px 0;
+        align-items: center;
+        gap: 6px;
+        margin: 0 0 16px 16px;
+        padding: 6px;
+        background: #f1f5f9;
+        border-radius: 12px;
     }
     .club-subtab {
-        border: 2px solid #e2e8f0;
-        background: white;
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 8px;
+        border: none;
+        background: transparent;
         color: #475569;
-        padding: 8px 14px;
+        padding: 8px 12px;
         border-radius: 8px;
         font-weight: 600;
         cursor: pointer;
         font-size: 14px;
+        line-height: 1.2;
+    }
+    .club-subtab i {
+        width: 1.1em;
+        text-align: center;
+        flex-shrink: 0;
+    }
+    .club-subtab:hover {
+        background: rgba(255, 255, 255, 0.7);
+        color: #012B58;
+    }
+    .club-subtab.active {
+        background: #ffffff;
+        color: #012B58;
+        box-shadow: 0 1px 3px rgba(0, 20, 41, 0.12);
     }
     .club-cards {
         display: grid;
@@ -5051,6 +5292,11 @@ else:
         width: 100%;
         border-collapse: collapse;
     }
+    .table-scroll {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        max-width: 100%;
+    }
     .people-table th, .people-table td {
         text-align: left;
         padding: 10px 12px;
@@ -5295,6 +5541,145 @@ else:
     @keyframes dash-spin {
         to { transform: rotate(360deg); }
     }
+    @media (max-width: 700px) {
+        .dashboard-container {
+            padding: 12px;
+        }
+        .dashboard-header-body {
+            padding: 16px;
+            gap: 12px;
+        }
+        .dashboard-header h1 {
+            font-size: 22px;
+            margin-bottom: 6px;
+        }
+        .dashboard-header-badge {
+            width: 48px;
+            height: 48px;
+        }
+        .section {
+            padding: 14px;
+        }
+        .section-title {
+            font-size: 17px;
+            margin-bottom: 12px;
+        }
+        .stats-grid {
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .stat-card {
+            padding: 14px;
+        }
+        .stat-value {
+            font-size: 28px;
+            margin: 6px 0;
+        }
+        .club-cards {
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .dash-tabs {
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .dash-tab,
+        .dash-tab-refresh {
+            padding: 10px 12px;
+            min-height: 44px;
+        }
+        .dash-tabs-end {
+            margin-left: 0;
+        }
+        .club-subtabs {
+            margin: 0 0 12px 0;
+        }
+        .club-subtab {
+            padding: 10px 12px;
+            min-height: 44px;
+        }
+        .club-subtab.vol-staff {
+            margin-left: 0;
+        }
+        .staff-filter {
+            padding: 10px 12px;
+            min-height: 44px;
+        }
+        .staff-filter-bar select {
+            min-width: 0;
+            width: 100%;
+            font-size: 16px;
+        }
+        .btn-tag-add,
+        .btn-reg-excel,
+        .btn-reg-audit,
+        .btn-back {
+            min-height: 44px;
+        }
+        .chart-bar {
+            flex-wrap: wrap;
+            align-items: flex-start;
+        }
+        .chart-label,
+        .other-group-toggle .chart-label {
+            width: 100%;
+            flex: 1 0 100%;
+            margin-bottom: 4px;
+        }
+        .chart-bar-container {
+            margin: 0 8px 0 0;
+        }
+        .chart-count {
+            width: auto;
+            min-width: 36px;
+        }
+        .cfg-field {
+            max-width: none;
+        }
+        .cfg-field input[type="number"],
+        .cfg-field input[type="text"],
+        .tag-modal-body input[type="text"],
+        .staff-ev-date {
+            font-size: 16px;
+        }
+        .staff-ev-date {
+            max-width: none;
+            width: 100%;
+        }
+        #roster-view,
+        #roster-allergies-view,
+        #roster-contacts-view,
+        #club-overview-view,
+        #allergies-view,
+        #contacts-view,
+        #special-requests-view,
+        #reg-view,
+        #volunteers-view,
+        #gender-drilldown,
+        #age-drilldown,
+        #grade-drilldown,
+        #marital-drilldown,
+        #finance-drilldown,
+        #subgroup-drilldown,
+        .table-scroll {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            max-width: 100%;
+        }
+        .people-table {
+            width: max-content;
+            min-width: 100%;
+        }
+        .people-table th {
+            white-space: nowrap;
+        }
+        .loading-card {
+            min-width: 0;
+            width: 100%;
+            max-width: 320px;
+            padding: 20px 18px;
+        }
+    }
 </style>
 
 <div class="dashboard-container">
@@ -5369,9 +5754,9 @@ else:
         </div>
 
         <div class="tab-panel active" id="tab-overview">
-            <div class="club-cards" id="club-cards"></div>
             <div class="stats-grid" id="stats-grid"></div>
             <div id="gender-drilldown" style="display:none; margin: 0 0 30px 0;"></div>
+            <div class="club-cards" id="club-cards"></div>
             <div class="section" id="age-section" style="display:none;">
                 <h2 class="section-title" id="distribution-title"><i class="fa fa-chart-bar"></i> Age Distribution</h2>
                 <p class="finance-drill-hint" style="margin-top:-8px;margin-bottom:12px;">Click an age group to view people</p>
@@ -5409,10 +5794,10 @@ else:
 
         <div class="tab-panel" id="tab-roster">
             <div class="reg-toolbar" style="margin-bottom:12px;">
-                <div class="club-subtabs" id="roster-subtabs" style="margin:0;">
-                    <button type="button" class="club-subtab active" data-roster-subtab="roster">Roster</button>
-                    <button type="button" class="club-subtab" data-roster-subtab="allergies">Allergies</button>
-                    <button type="button" class="club-subtab" data-roster-subtab="contacts">Contacts</button>
+                <div class="club-subtabs" id="roster-subtabs">
+                    <button type="button" class="club-subtab active" data-roster-subtab="roster"><i class="fa fa-list"></i> Roster</button>
+                    <button type="button" class="club-subtab" data-roster-subtab="allergies"><i class="fa fa-medkit"></i> Allergies</button>
+                    <button type="button" class="club-subtab" data-roster-subtab="contacts"><i class="fa fa-users"></i> Contacts</button>
                 </div>
                 <div>
                     <button type="button" class="btn-reg-excel" id="btn-roster-export" style="display:none;">
@@ -5426,9 +5811,10 @@ else:
                         <h2 class="section-title" style="margin:0;"><i class="fa fa-list"></i> Master Roster</h2>
                     </div>
                     <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;">
-                        All Puggles, Cubbies, Sparks, T&amp;T Girls, and T&amp;T Boys. Filter by gender or grade, then Add to Tag.
+                        All Puggles, Cubbies, Sparks, T&amp;T Girls, and T&amp;T Boys. Filter by gender, grade, or New to Awana, then Add to Tag.
                         A red A means an allergy is on file — click it to open Allergies.
                     </p>
+                    <div class="staff-filters" id="roster-new-filters"></div>
                     <div class="staff-filters" id="roster-gender-filters"></div>
                     <div class="staff-filters" id="roster-grade-filters"></div>
                     <div id="roster-view"></div>
@@ -5478,11 +5864,12 @@ else:
             <div class="club-org-picker" id="club-org-picker"></div>
             <div id="club-detail" style="display:none;">
                 <div class="reg-toolbar" style="margin-bottom:12px;">
-                    <div class="club-subtabs" id="club-subtabs" style="margin:0;">
-                        <button type="button" class="club-subtab active" data-subtab="club-overview">Overview</button>
-                        <button type="button" class="club-subtab" data-subtab="registration">Registration</button>
-                        <button type="button" class="club-subtab" data-subtab="allergies">Allergies</button>
-                        <button type="button" class="club-subtab" data-subtab="contacts">Contacts</button>
+                    <div class="club-subtabs" id="club-subtabs">
+                        <button type="button" class="club-subtab active" data-subtab="club-overview"><i class="fa fa-th-large"></i> Overview</button>
+                        <button type="button" class="club-subtab" data-subtab="registration"><i class="fa fa-clipboard"></i> Registration</button>
+                        <button type="button" class="club-subtab" data-subtab="allergies"><i class="fa fa-medkit"></i> Allergies</button>
+                        <button type="button" class="club-subtab" data-subtab="contacts"><i class="fa fa-users"></i> Contacts</button>
+                        <button type="button" class="club-subtab" id="club-subtab-special-requests" data-subtab="special-requests"><i class="fa fa-comment"></i> Special Requests</button>
                     </div>
                     <div>
                         <button type="button" class="btn-reg-excel" id="btn-reg-excel" style="display:none;">
@@ -5530,6 +5917,17 @@ else:
                             Next Gen RecReg mother, father, and emergency contact. Parent phones come from the family adult records.
                         </p>
                         <div id="contacts-view"></div>
+                    </div>
+                </div>
+                <div class="tab-panel" id="tab-special-requests">
+                    <div class="section">
+                        <div class="reg-toolbar">
+                            <h2 class="section-title" style="margin:0;"><i class="fa fa-comment"></i> Special Requests</h2>
+                        </div>
+                        <p class="finance-drill-hint" style="margin-top:0;margin-bottom:12px;" id="special-requests-hint">
+                            Registration answer for special requests (leader / buddy). Every clubber is listed, including blank answers.
+                        </p>
+                        <div id="special-requests-view"></div>
                     </div>
                 </div>
             </div>
@@ -5592,6 +5990,18 @@ else:
                             People with no attendance still get a date picker. Update these IDs each year.
                         </p>
                     </div>
+                    <div class="cfg-field">
+                        <label for="cfg-prior-awana-orgs">Prior-year Awana involvements (New to Awana)</label>
+                        <input type="text" id="cfg-prior-awana-orgs" name="prior_awana_org_ids"
+                               placeholder="e.g. 1501, 1502, 1503" />
+                        <p class="cfg-hint">
+                            Comma-separated involvement (Organization) IDs from prior seasons.
+                            Clubbers on this year&apos;s roster who do <strong>not</strong> appear as a
+                            member or join history on any of these are marked <strong>New to Awana</strong>
+                            on the Overview tile and Master Roster. Do not include this year&apos;s
+                            Clubbers / club involvement IDs.
+                        </p>
+                    </div>
                     <button type="submit" class="btn-cfg-save" id="btn-cfg-save">Save settings</button>
                     <p class="cfg-status" id="cfg-status"></p>
                 </form>
@@ -5612,8 +6022,9 @@ else:
         var staffRosterState = { people: [], filter: 'all', sortKey: 'last', sortDir: 'asc' };
         var volRosterState = { people: [], key: 'overview', sortKey: 'last', sortDir: 'asc' };
         var masterRosterState = {
-            people: [], gender: 'all', grade: 'all', loaded: false,
-            sortKey: 'last', sortDir: 'asc', subtab: 'roster'
+            people: [], gender: 'all', grade: 'all', newFilter: 'all', loaded: false,
+            sortKey: 'last', sortDir: 'asc', subtab: 'roster',
+            priorConfigured: false, newCount: 0
         };
         var masterAllergyState = { people: [], loaded: false };
         var masterContactState = { people: [], loaded: false };
@@ -5623,6 +6034,8 @@ else:
         var initialOrgName = __INITIAL_ORG_NAME__;
         var initialClub = __INITIAL_CLUB__;
         var clubKeys = ['puggles', 'cubbies', 'sparks', 'tnt-girls', 'tnt-boys'];
+        var specialRequestClubKeys = { sparks: 1, 'tnt-girls': 1, 'tnt-boys': 1 };
+        var specialRequestsState = { people: [], loaded: false, question_label: '' };
         var regState = { view: 'summary', question: null, option: null, person: null, summary: null, audit: null, _fromAudit: false };
         var gradeDrillState = { label: '', people: [], filter: 'all' };
         var currentXhr = null;
@@ -5949,6 +6362,20 @@ else:
             applyHero(clubbers);
         }
 
+        function clubHasSpecialRequestsTab(key) {
+            return !!(key && specialRequestClubKeys[key]);
+        }
+
+        function syncSpecialRequestsTab() {
+            var show = clubHasSpecialRequestsTab(currentClubKey);
+            var $btn = $('#club-subtab-special-requests');
+            if (show) $btn.addClass('visible');
+            else $btn.removeClass('visible');
+            if (!show && currentSubtab === 'special-requests') {
+                currentSubtab = 'club-overview';
+            }
+        }
+
         function syncClubExportButton() {
             var $btn = $('#btn-reg-excel');
             if (!currentClubKey || !currentOrgId) {
@@ -5958,11 +6385,16 @@ else:
             var label = 'Export Clubbers';
             if (currentSubtab === 'allergies') label = 'Export Allergies';
             else if (currentSubtab === 'contacts') label = 'Export Contacts';
+            else if (currentSubtab === 'special-requests') label = 'Export Special Requests';
             $btn.html('<i class="fa fa-download"></i> ' + label).show();
         }
 
         function setClubSubtab(sub, load) {
+            syncSpecialRequestsTab();
             currentSubtab = sub || 'club-overview';
+            if (currentSubtab === 'special-requests' && !clubHasSpecialRequestsTab(currentClubKey)) {
+                currentSubtab = 'club-overview';
+            }
             $('#club-subtabs .club-subtab').removeClass('active');
             $('#club-subtabs .club-subtab[data-subtab="' + currentSubtab + '"]').addClass('active');
             $('#club-detail .tab-panel').removeClass('active');
@@ -5973,6 +6405,7 @@ else:
             else if (currentSubtab === 'registration') loadRegistrationSummary();
             else if (currentSubtab === 'allergies') loadAllergies();
             else if (currentSubtab === 'contacts') loadContacts();
+            else if (currentSubtab === 'special-requests') loadSpecialRequests();
         }
 
         function clubEmptyHtml(club, label) {
@@ -6009,6 +6442,7 @@ else:
             $('#club-org-picker').removeClass('visible').empty();
             $('#club-empty').hide();
             $('#club-detail').show();
+            specialRequestsState = { people: [], loaded: false, question_label: '' };
             var sub = opts.subtab || currentSubtab || 'club-overview';
             setClubSubtab(sub, true);
         }
@@ -6016,6 +6450,7 @@ else:
         function openClubTab(key, forceReload) {
             currentClubKey = key;
             currentVolClubKey = null;
+            specialRequestsState = { people: [], loaded: false, question_label: '' };
             hideAllMainTabs();
             $('#tab-club').addClass('active');
             $('.dash-tab').removeClass('active');
@@ -6111,15 +6546,20 @@ else:
         function filterMasterRoster(people) {
             var gender = masterRosterState.gender || 'all';
             var grade = masterRosterState.grade || 'all';
+            var newFilter = masterRosterState.newFilter || 'all';
             return (people || []).filter(function(p) {
                 if (gender !== 'all' && rosterNormGender(p.gender) !== gender) return false;
                 if (grade !== 'all' && rosterNormGrade(p.grade) !== grade) return false;
+                if (newFilter === 'new' && !p.is_new_to_awana) return false;
+                if (newFilter === 'returning' && p.is_new_to_awana) return false;
                 return true;
             });
         }
 
         function rosterTagSuggest() {
             var bits = ['Awana Roster'];
+            if (masterRosterState.newFilter === 'new') bits.push('New to Awana');
+            if (masterRosterState.newFilter === 'returning') bits.push('Returning');
             if (masterRosterState.gender === 'male') bits.push('Male');
             if (masterRosterState.gender === 'female') bits.push('Female');
             if (masterRosterState.grade && masterRosterState.grade !== 'all') bits.push(masterRosterState.grade);
@@ -6129,14 +6569,45 @@ else:
         function renderMasterRoster() {
             var allPeople = masterRosterState.people || [];
             var people = filterMasterRoster(allPeople);
+            var priorOk = !!masterRosterState.priorConfigured;
+            var baseForNew = (allPeople || []).filter(function(p) {
+                if (masterRosterState.grade !== 'all' && rosterNormGrade(p.grade) !== masterRosterState.grade) return false;
+                if (masterRosterState.gender !== 'all' && rosterNormGender(p.gender) !== masterRosterState.gender) return false;
+                return true;
+            });
             var allForGender = (allPeople || []).filter(function(p) {
-                return masterRosterState.grade === 'all' || rosterNormGrade(p.grade) === masterRosterState.grade;
+                if (masterRosterState.grade !== 'all' && rosterNormGrade(p.grade) !== masterRosterState.grade) return false;
+                if (masterRosterState.newFilter === 'new' && !p.is_new_to_awana) return false;
+                if (masterRosterState.newFilter === 'returning' && p.is_new_to_awana) return false;
+                return true;
             });
             var allForGrade = (allPeople || []).filter(function(p) {
-                return masterRosterState.gender === 'all' || rosterNormGender(p.gender) === masterRosterState.gender;
+                if (masterRosterState.gender !== 'all' && rosterNormGender(p.gender) !== masterRosterState.gender) return false;
+                if (masterRosterState.newFilter === 'new' && !p.is_new_to_awana) return false;
+                if (masterRosterState.newFilter === 'returning' && p.is_new_to_awana) return false;
+                return true;
             });
             var gMale = allForGender.filter(function(p) { return rosterNormGender(p.gender) === 'male'; }).length;
             var gFemale = allForGender.filter(function(p) { return rosterNormGender(p.gender) === 'female'; }).length;
+            var nNew = baseForNew.filter(function(p) { return !!p.is_new_to_awana; }).length;
+            var nReturning = baseForNew.length - nNew;
+
+            var newHtml = '';
+            if (priorOk) {
+                [
+                    { key: 'all', label: 'All (' + baseForNew.length + ')' },
+                    { key: 'new', label: 'New to Awana (' + nNew + ')' },
+                    { key: 'returning', label: 'Returning (' + nReturning + ')' }
+                ].forEach(function(item) {
+                    newHtml += '<button type="button" class="staff-filter' +
+                        (masterRosterState.newFilter === item.key ? ' active' : '') +
+                        '" data-roster-new-filter="' + item.key + '">' + esc(item.label) + '</button>';
+                });
+            } else {
+                newHtml = '<span class="finance-drill-hint" style="margin:0;">' +
+                    'New to Awana: set prior-year involvement IDs in Config.</span>';
+            }
+            $('#roster-new-filters').html(newHtml);
 
             var genderHtml = '';
             [
@@ -6184,7 +6655,8 @@ else:
             var ids = collectPeopleIds(people);
             var html = '<div class="reg-meta" style="margin-bottom:14px;">Clubbers: <strong>' +
                 people.length + '</strong>';
-            if (masterRosterState.gender !== 'all' || masterRosterState.grade !== 'all') {
+            if (masterRosterState.gender !== 'all' || masterRosterState.grade !== 'all' ||
+                masterRosterState.newFilter !== 'all') {
                 html += ' of ' + allPeople.length;
             }
             html += '</div>';
@@ -6204,6 +6676,7 @@ else:
             html += sortHeaderHtml('Grade', 'grade', sortKey, sortDir);
             html += sortHeaderHtml('Gender', 'gender', sortKey, sortDir);
             html += sortHeaderHtml('Clubs', 'clubs', sortKey, sortDir);
+            html += sortHeaderHtml('New to Awana', 'new_to_awana', sortKey, sortDir);
             html += '</tr></thead><tbody>';
             people.forEach(function(p) {
                 html += '<tr><td>' + personLink(p.people_id, p.name);
@@ -6214,7 +6687,8 @@ else:
                 html += '<td>' + esc(p.age === 0 || p.age ? String(p.age) : '') + '</td>';
                 html += '<td>' + esc(p.grade || '') + '</td>';
                 html += '<td>' + esc(p.gender || '') + '</td>';
-                html += '<td>' + esc(p.clubs_label || '') + '</td></tr>';
+                html += '<td>' + esc(p.clubs_label || '') + '</td>';
+                html += '<td>' + esc(p.is_new_to_awana ? 'Yes' : '') + '</td></tr>';
             });
             html += '</tbody></table>';
             $('#roster-view').html(html);
@@ -6227,12 +6701,16 @@ else:
                 if (data && data.error) {
                     masterRosterState.people = [];
                     masterRosterState.loaded = false;
+                    masterRosterState.priorConfigured = false;
+                    masterRosterState.newCount = 0;
                     syncRosterExportButton();
                     $('#roster-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
                     return;
                 }
                 masterRosterState.people = (data && data.people) || [];
                 masterRosterState.loaded = true;
+                masterRosterState.priorConfigured = !!(data && data.prior_awana_configured);
+                masterRosterState.newCount = (data && data.new_to_awana_count) || 0;
                 renderMasterRoster();
             }, { showLoading: true });
         }
@@ -6393,6 +6871,7 @@ else:
             currentVolClubKey = null;
             if (opts.gender) masterRosterState.gender = opts.gender;
             if (opts.grade) masterRosterState.grade = opts.grade;
+            if (opts.newFilter) masterRosterState.newFilter = opts.newFilter;
             hideAllMainTabs();
             $('#tab-roster').addClass('active');
             $('.dash-tab').removeClass('active');
@@ -6435,6 +6914,7 @@ else:
             $('#cfg-tnt-girls-org').val(v.tnt_girls_org != null ? v.tnt_girls_org : 0);
             $('#cfg-tnt-boys-org').val(v.tnt_boys_org != null ? v.tnt_boys_org : 0);
             $('#cfg-inperson-meetings').val(v.inperson_meeting_ids || '');
+            $('#cfg-prior-awana-orgs').val(v.prior_awana_org_ids || '');
             cfgHint('cfg-clubbers-org-name', v.clubbers_org, names.clubbers_org);
             cfgHint('cfg-volunteers-org-name', v.volunteers_org, names.volunteers_org);
             cfgHint('cfg-puggles-org-name', v.puggles_org, names.puggles_org);
@@ -6474,14 +6954,27 @@ else:
                 volunteers.id);
             applyHero(awanaData && awanaData.clubbers_org);
 
+            var volClubIcon = {
+                overview: 'fa-th-large',
+                puggles: 'fa-child',
+                cubbies: 'fa-cube',
+                sparks: 'fa-star',
+                'tnt-girls': 'fa-female',
+                'tnt-boys': 'fa-male',
+                staff: 'fa-clipboard'
+            };
             var total = (awanaData && awanaData.volunteer_members) || 0;
-            var html = '<button type="button" class="club-subtab" data-vol-club="overview">Overview (' + total + ')</button>';
+            var html = '<button type="button" class="club-subtab" data-vol-club="overview">' +
+                '<i class="fa ' + volClubIcon.overview + '"></i> Overview (' + total + ')</button>';
             ((awanaData && awanaData.clubs) || []).forEach(function(club) {
+                var icon = volClubIcon[club.key] || 'fa-users';
                 html += '<button type="button" class="club-subtab" data-vol-club="' + esc(club.key) + '">' +
+                    '<i class="fa ' + icon + '"></i> ' +
                     esc(club.label) + ' (' + (club.volunteer_count || 0) + ')</button>';
             });
             if (awanaData && awanaData.show_staff_tab) {
-                html += '<button type="button" class="club-subtab vol-staff" data-vol-club="staff">Volunteer Management</button>';
+                html += '<button type="button" class="club-subtab vol-staff" data-vol-club="staff">' +
+                    '<i class="fa ' + volClubIcon.staff + '"></i> Volunteer Management</button>';
             }
             $('#vol-club-subtabs').html(html);
 
@@ -6608,6 +7101,11 @@ else:
             if (key === 'handbook') return s(a.handbook_iso || a.handbook_date).localeCompare(
                 s(b.handbook_iso || b.handbook_date));
             if (key === 'allergy') return s(a.allergy).localeCompare(s(b.allergy));
+            if (key === 'new_to_awana' || key === 'new') {
+                var an = a.is_new_to_awana ? 1 : 0;
+                var bn = b.is_new_to_awana ? 1 : 0;
+                return an - bn;
+            }
             return 0;
         }
 
@@ -7006,6 +7504,11 @@ else:
             renderMasterRoster();
         });
 
+        $(document).on('click', '[data-roster-new-filter]', function() {
+            masterRosterState.newFilter = String($(this).attr('data-roster-new-filter') || 'all');
+            renderMasterRoster();
+        });
+
         $(document).on('click', '#btn-roster-export', function() {
             var key = masterRosterState.subtab || 'roster';
             if (key === 'allergies') {
@@ -7019,10 +7522,14 @@ else:
             var people = filterMasterRoster(masterRosterState.people || []);
             var rows = [];
             (people || []).forEach(function(p) {
-                rows.push([p.people_id, p.name, p.age, p.grade, p.gender, p.email, p.clubs_label, p.emergency, p.parents]);
+                rows.push([
+                    p.people_id, p.name, p.age, p.grade, p.gender, p.email, p.clubs_label,
+                    p.is_new_to_awana ? 'Yes' : '',
+                    p.emergency, p.parents
+                ]);
             });
             downloadCsv('Awana-Master-Roster.csv',
-                ['PeopleId', 'Name', 'Age', 'Grade', 'Gender', 'Email', 'Clubs', 'Emergency Contact', 'Parents'],
+                ['PeopleId', 'Name', 'Age', 'Grade', 'Gender', 'Email', 'Clubs', 'New to Awana', 'Emergency Contact', 'Parents'],
                 rows);
         });
 
@@ -7041,7 +7548,8 @@ else:
                 sparks_org: $('#cfg-sparks-org').val() || '0',
                 tnt_girls_org: $('#cfg-tnt-girls-org').val() || '0',
                 tnt_boys_org: $('#cfg-tnt-boys-org').val() || '0',
-                inperson_meeting_ids: $('#cfg-inperson-meetings').val() || ''
+                inperson_meeting_ids: $('#cfg-inperson-meetings').val() || '',
+                prior_awana_org_ids: $('#cfg-prior-awana-orgs').val() || ''
             };
             $('#btn-cfg-save').prop('disabled', true);
             $('#cfg-status').removeClass('ok err').text('Saving...');
@@ -7100,6 +7608,11 @@ else:
             statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="volunteers"><div class="stat-label">Volunteers</div><div class="stat-value">' + (data.volunteer_members || 0) + '</div><div class="stat-drill-hint">Open Volunteers tab</div></div>';
             statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-gender="male"><div class="stat-label">Male clubbers</div><div class="stat-value">' + (data.male_count || 0) + '</div><div class="stat-drill-hint">Roster · boys</div></div>';
             statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-gender="female"><div class="stat-label">Female clubbers</div><div class="stat-value">' + (data.female_count || 0) + '</div><div class="stat-drill-hint">Roster · girls</div></div>';
+            if (data.prior_awana_configured) {
+                statsHtml += '<div class="stat-card stat-card-clickable" data-awana-nav="roster" data-roster-new="new"><div class="stat-label">New to Awana</div><div class="stat-value">' + (data.new_to_awana_count || 0) + '</div><div class="stat-drill-hint">Roster · new clubbers</div></div>';
+            } else {
+                statsHtml += '<div class="stat-card" title="Set prior-year involvement IDs in Config"><div class="stat-label">New to Awana</div><div class="stat-value">—</div><div class="stat-drill-hint">Configure prior years</div></div>';
+            }
             $('#stats-grid').html(statsHtml);
             $('#gender-drilldown').hide().empty();
             $('#age-section').hide();
@@ -7259,7 +7772,8 @@ else:
             }
             if (nav === 'roster') {
                 var gender = String($(this).attr('data-roster-gender') || 'all');
-                openRosterTab({ gender: gender, grade: 'all' });
+                var newFilter = String($(this).attr('data-roster-new') || 'all');
+                openRosterTab({ gender: gender, grade: 'all', newFilter: newFilter });
             }
         });
 
@@ -7658,6 +8172,84 @@ else:
             }, { showLoading: true });
         }
 
+        function renderSpecialRequestsTable(people, opts) {
+            opts = opts || {};
+            people = people || [];
+            if (!people.length) {
+                return '<div class="empty-state">No clubbers in this club.</div>';
+            }
+            var ids = collectPeopleIds(people);
+            var withReq = opts.withRequestCount;
+            if (typeof withReq !== 'number') {
+                withReq = 0;
+                people.forEach(function(p) {
+                    if (p.special_request) withReq += 1;
+                });
+            }
+            var html = '<div class="reg-meta" style="margin-bottom:14px;">Clubbers: <strong>' +
+                people.length + '</strong>';
+            html += ' · with a request: <strong>' + withReq + '</strong>';
+            html += '</div>';
+            if (opts.questionFound === false) {
+                html += '<div class="info-banner" style="margin-bottom:12px;">' +
+                    'Could not find the Special Requests registration question on this involvement. ' +
+                    'Clubbers are listed with blank answers.</div>';
+            } else if (withReq === 0) {
+                html += '<div class="info-banner" style="margin-bottom:12px;">' +
+                    'Special Requests question found, but no answers on this roster. ' +
+                    'Reg org #' + esc(String(opts.regOrgId || '')) +
+                    (opts.regSubgroupId ? (', subgroup #' + esc(String(opts.regSubgroupId))) : '') +
+                    ' · summary answered: ' + esc(String(opts.summaryAnswered || 0)) +
+                    ' · text answers loaded: ' + esc(String(opts.answerMatchCount || 0)) +
+                    (opts.questionId ? (' · qid: ' + esc(String(opts.questionId))) : '') +
+                    (opts.textError ? (' · error: ' + esc(String(opts.textError))) : '') +
+                    '.</div>';
+            }
+            html += drillActionsHtml({ peopleIds: ids });
+            html += '<table class="people-table"><thead><tr>';
+            html += '<th>Person</th><th>Special Request</th>';
+            html += '</tr></thead><tbody>';
+            people.forEach(function(p) {
+                html += '<tr><td>' + personLink(p.people_id, p.name) + '</td>';
+                html += '<td>' + esc(p.special_request || '') + '</td></tr>';
+            });
+            html += '</tbody></table>';
+            return html;
+        }
+
+        function loadSpecialRequests() {
+            if (!currentOrgId) return;
+            showLoading('Loading special requests...', false);
+            $('#special-requests-view').html('<div class="empty-state">Loading...</div>');
+            clubPost({ action: 'get_special_requests' }, function(data) {
+                if (data && data.error) {
+                    specialRequestsState = { people: [], loaded: false, question_label: '' };
+                    $('#special-requests-view').html('<div class="info-banner">Error: ' + esc(data.error) + '</div>');
+                    return;
+                }
+                specialRequestsState.people = (data && data.people) || [];
+                specialRequestsState.loaded = true;
+                specialRequestsState.question_label = (data && data.question_label) || '';
+                if (specialRequestsState.question_label) {
+                    $('#special-requests-hint').text(specialRequestsState.question_label +
+                        ' Every clubber is listed, including blank answers.');
+                }
+                $('#special-requests-view').html(renderSpecialRequestsTable(
+                    specialRequestsState.people,
+                    {
+                        questionFound: !(data && data.question_found === false),
+                        withRequestCount: (data && data.with_request_count) || 0,
+                        answerMatchCount: (data && data.answer_match_count) || 0,
+                        summaryAnswered: (data && data.summary_answered) || 0,
+                        questionId: data && data.question_id,
+                        textError: data && data.text_error,
+                        regOrgId: data && data.reg_org_id,
+                        regSubgroupId: data && data.reg_subgroup_id
+                    }
+                ));
+            }, { showLoading: true });
+        }
+
         function loadRegistrationSummary() {
             if (!currentOrgId) return;
             showLoading('Loading registration questions...', true);
@@ -7833,6 +8425,22 @@ else:
                         return;
                     }
                     exportContactPeople((data && data.people) || [], name + '-Contacts.csv', false);
+                }, { showLoading: true });
+                return;
+            }
+            if (currentSubtab === 'special-requests') {
+                showLoading('Preparing export...', false);
+                clubPost({ action: 'get_special_requests' }, function(data) {
+                    if (data && data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    var rows = [];
+                    ((data && data.people) || []).forEach(function(p) {
+                        rows.push([p.people_id, p.name, p.special_request || '']);
+                    });
+                    downloadCsv(name + '-Special-Requests.csv',
+                        ['PeopleId', 'Name', 'Special Request'], rows);
                 }, { showLoading: true });
                 return;
             }
